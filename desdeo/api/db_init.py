@@ -133,4 +133,6 @@ nimbus = db_models.Method(
 db.add(nimbus)
 db.commit()
 
+nimbus_id = nimbus.id
+
 db.close()

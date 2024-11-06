@@ -26,6 +26,7 @@ def utopia_problem(
     data_dir: str,
     problem_name: str = "Forest problem",
     holding: int = 1,
+    compensation: float = 0,
 ) -> tuple[Problem, dict]:
     r"""Defines a test forest problem that has TensorConstants and TensorVariables.
 
@@ -71,8 +72,15 @@ def utopia_problem(
         (1 - 0.01 * discounting_factor) ** 17,
     ]
 
-    df = pl.read_csv(Path(f"{data_dir}/alternatives.csv"), dtypes={"unit": pl.Float64}, infer_schema_length=1000)
-    df_key = pl.read_csv(Path(f"{data_dir}/alternatives_key.csv"), dtypes={"unit": pl.Float64})
+    df = pl.read_csv(
+        Path(f"{data_dir}/alternatives.csv"), schema_overrides={"unit": pl.Float64}, infer_schema_length=1000
+    )
+    df_key = pl.read_csv(Path(f"{data_dir}/alternatives_key.csv"), schema_overrides={"unit": pl.Float64})
+
+    # Remove the decision alternatives that are not found in the filter file
+    filter_df = pl.read_csv(Path(f"{data_dir}/filter.csv"), schema_overrides={"unit": pl.Float64})
+    df = df.join(filter_df, on=["holding", "unit", "schedule"])
+    df_key = df_key.join(filter_df, on=["holding", "unit", "schedule"])
 
     # Calculate the total wood volume at the start
     selected_df_v0 = df.filter(pl.col("holding") == holding).select(["unit", "stock_0"]).unique()
@@ -220,7 +228,11 @@ def utopia_problem(
 
         # Constraints
         con = Constraint(
-            name=f"x_con_{i+1}", symbol=f"x_con_{i+1}", cons_type=ConstraintTypeEnum.EQ, func=f"Sum(X_{i+1}) - 1"
+            name=f"x_con_{i+1}",
+            symbol=f"x_con_{i+1}",
+            cons_type=ConstraintTypeEnum.EQ,
+            func=f"Sum(X_{i+1}) - 1",
+            is_twice_differentiable=True,
         )
         constraints.append(con)
 
@@ -249,20 +261,28 @@ def utopia_problem(
 
     # get the remainder value of the forest into decision variable V_end
     v_func = "V_end - " + " - ".join(f_1_func)
-    con = Constraint(name="v_con", symbol="v_con", cons_type=ConstraintTypeEnum.EQ, func=v_func)
+    con = Constraint(
+        name="v_con", symbol="v_con", cons_type=ConstraintTypeEnum.EQ, func=v_func, is_twice_differentiable=True
+    )
     constraints.append(con)
 
     # These are here, so that we can get the harvesting incomes into decision variables P_i
     p1_func = "P_1 - " + " - ".join(p1_func)
-    con = Constraint(name="p1_con", symbol="p1_con", cons_type=ConstraintTypeEnum.EQ, func=p1_func)
+    con = Constraint(
+        name="p1_con", symbol="p1_con", cons_type=ConstraintTypeEnum.EQ, func=p1_func, is_twice_differentiable=True
+    )
     constraints.append(con)
 
     p2_func = "P_2 - " + " - ".join(p2_func)
-    con = Constraint(name="p2_con", symbol="p2_con", cons_type=ConstraintTypeEnum.EQ, func=p2_func)
+    con = Constraint(
+        name="p2_con", symbol="p2_con", cons_type=ConstraintTypeEnum.EQ, func=p2_func, is_twice_differentiable=True
+    )
     constraints.append(con)
 
     p3_func = "P_3 - " + " - ".join(p3_func)
-    con = Constraint(name="p3_con", symbol="p3_con", cons_type=ConstraintTypeEnum.EQ, func=p3_func)
+    con = Constraint(
+        name="p3_con", symbol="p3_con", cons_type=ConstraintTypeEnum.EQ, func=p3_func, is_twice_differentiable=True
+    )
     constraints.append(con)
 
     # print(v_func)
@@ -279,7 +299,9 @@ def utopia_problem(
         c0 = TensorConstant(
             name=f"C0_{i+1}",
             symbol=f"C0_{i+1}",
-            shape=[len(carbon_dict[str(unique_units[i])]["0"])],  # NOTE: vectors have to be of form [2] instead of [2,1] or [1,2]
+            shape=[
+                len(carbon_dict[str(unique_units[i])]["0"])
+            ],  # NOTE: vectors have to be of form [2] instead of [2,1] or [1,2]
             values=carbon_dict[str(unique_units[i])]["0"],
         )
         constants.append(c0)
@@ -287,7 +309,9 @@ def utopia_problem(
         c5 = TensorConstant(
             name=f"C5_{i+1}",
             symbol=f"C5_{i+1}",
-            shape=[len(carbon_dict[str(unique_units[i])]["5"])],  # NOTE: vectors have to be of form [2] instead of [2,1] or [1,2]
+            shape=[
+                len(carbon_dict[str(unique_units[i])]["5"])
+            ],  # NOTE: vectors have to be of form [2] instead of [2,1] or [1,2]
             values=carbon_dict[str(unique_units[i])]["5"],
         )
         constants.append(c5)
@@ -295,7 +319,9 @@ def utopia_problem(
         c10 = TensorConstant(
             name=f"C10_{i+1}",
             symbol=f"C10_{i+1}",
-            shape=[len(carbon_dict[str(unique_units[i])]["10"])],  # NOTE: vectors have to be of form [2] instead of [2,1] or [1,2]
+            shape=[
+                len(carbon_dict[str(unique_units[i])]["10"])
+            ],  # NOTE: vectors have to be of form [2] instead of [2,1] or [1,2]
             values=carbon_dict[str(unique_units[i])]["10"],
         )
         constants.append(c10)
@@ -303,16 +329,18 @@ def utopia_problem(
         c20 = TensorConstant(
             name=f"C20_{i+1}",
             symbol=f"C20_{i+1}",
-            shape=[len(carbon_dict[str(unique_units[i])]["20"])],  # NOTE: vectors have to be of form [2] instead of [2,1] or [1,2]
+            shape=[
+                len(carbon_dict[str(unique_units[i])]["20"])
+            ],  # NOTE: vectors have to be of form [2] instead of [2,1] or [1,2]
             values=carbon_dict[str(unique_units[i])]["20"],
         )
         constants.append(c20)
 
     if Path(f"{data_dir}/dec_vars.json").is_file():
         with Path.open(f"{data_dir}/dec_vars.json", "r") as f:
-            CO2_baseline = json.load(f)
+            CO2_baseline = json.load(f)  # noqa: N806
     else:
-        CO2_baseline = None
+        CO2_baseline = None  # noqa: N806
 
     c1_func = []
     c2_func = []
@@ -334,6 +362,7 @@ def utopia_problem(
 
         # if no baseline given, use the beginning state's volumes
         else:
+            print("Baseline for CO2 not found!")
             c1_func.append(f"((C5_{i+1}@X_{i+1}) - (C0_{i+1}@X_{i+1}))*5")
             c2_func.append(f"((C10_{i+1}@X_{i+1}) - (C0_{i+1}@X_{i+1}))*10")
             c3_func.append(f"((C20_{i+1}@X_{i+1}) - (C0_{i+1}@X_{i+1}))*5")
@@ -344,20 +373,44 @@ def utopia_problem(
 
     # These are here, so that we can get the carbon storage into decision variables C_i
     c1_func = "C_1 - " + " - ".join(c1_func)
-    con = Constraint(name="c1_con", symbol="c1_con", cons_type=ConstraintTypeEnum.EQ, func=c1_func)
+    con = Constraint(
+        name="c1_con", symbol="c1_con", cons_type=ConstraintTypeEnum.EQ, func=c1_func, is_twice_differentiable=True
+    )
     constraints.append(con)
 
     c2_func = "C_2 - " + " - ".join(c2_func)
-    con = Constraint(name="c2_con", symbol="c2_con", cons_type=ConstraintTypeEnum.EQ, func=c2_func)
+    con = Constraint(
+        name="c2_con", symbol="c2_con", cons_type=ConstraintTypeEnum.EQ, func=c2_func, is_twice_differentiable=True
+    )
     constraints.append(con)
 
     c3_func = "C_3 - " + " - ".join(c3_func)
-    con = Constraint(name="c3_con", symbol="c3_con", cons_type=ConstraintTypeEnum.EQ, func=c3_func)
+    con = Constraint(
+        name="c3_con", symbol="c3_con", cons_type=ConstraintTypeEnum.EQ, func=c3_func, is_twice_differentiable=True
+    )
+    constraints.append(con)
+
+    # Add a constraint stating that we cannot go below reference plan in carbon storage
+    co2_func = "- (C_1 + C_2 + C_3 + 1E-3)"
+    con = Constraint(
+        name="cmin_con",
+        symbol="cmin_con",
+        cons_type=ConstraintTypeEnum.LTE,
+        func=co2_func,
+        is_twice_differentiable=True,
+    )
     constraints.append(con)
 
     # form the objective function sums
     f_2_func = " + ".join(f_2_func)
-    f_3_func = f"{discounting[0]} * P_1 + {discounting[1]} * P_2 + {discounting[2]} * P_3"
+    if compensation == 0:
+        f_3_func = f"{discounting[0]} * P_1 + {discounting[1]} * P_2 + {discounting[2]} * P_3"
+    else:
+        f_3_func = (
+            f"{discounting[0]} * (P_1 + {compensation/100}*C_1) + "
+            + f"{discounting[1]} * (P_2 + {compensation/100}*C_2) + "
+            + f"{discounting[2]} * (P_3 + {compensation/100}*C_3)"
+        )
     f_1_func = "V_end + " + f_3_func
     f_4_func = "C_1 + C_2 + C_3"
 
@@ -465,12 +518,12 @@ def utopia_problem(
     )
 
     f_4 = Objective(
-        name="Hiilidioksidin määrä / t",
+        name="Sidottu hiilidioksidi / (v·t)",
         symbol="f_4",
         func=f_4_func,
         maximize=True,
         ideal=math.ceil(ideals["f_4"]),
-        nadir=math.floor(nadirs["f_4"]),
+        nadir=0.0,
         objective_type=ObjectiveTypeEnum.analytical,
         is_linear=True,
         is_convex=False,  # not checked
