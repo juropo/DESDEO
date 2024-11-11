@@ -648,11 +648,9 @@ def share_solutions(
         .filter(ProblemInDB.name == prob_name)
         .subquery()
     )
-
     # Sum in the main query
     max_contribution = db.query(func.sum(subquery.c.f_4_value)).scalar()
-    print(own_contribution)
-    print(total_contribution)
+
     return ShareSolutionResponse(
         own_contribution=own_contribution,
         others_contribution=total_contribution - own_contribution,
