@@ -6,7 +6,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, HTTPException
 from numpy import allclose
 from pydantic import BaseModel, Field, ValidationError
-from sqlalchemy import func, update
+from sqlalchemy import Float, cast, func, update
 from sqlalchemy.orm import Session
 
 from desdeo.api.db import get_db
@@ -615,7 +615,9 @@ def share_solutions(
     db.execute(
         update(SolutionArchive)
         .where(
-            SolutionArchive.problem == problem_id, SolutionArchive.user == user.id, SolutionArchive.method == method_id
+            SolutionArchive.problem == problem_id,
+            SolutionArchive.user == user.index,
+            SolutionArchive.method == method_id,
         )
         .values(shared=False)
     )
@@ -632,21 +634,25 @@ def share_solutions(
 
     # All the problems we want to compare have the same name, so let's find those ids
     prob_name = db.query(ProblemInDB).filter(ProblemInDB.id == problem_id).first().name
-    prob_ids = db.query(ProblemInDB.id).filter(ProblemInDB.name == prob_name).all()
+    prob_ids = [prob.id for prob in db.query(ProblemInDB.id).filter(ProblemInDB.name == prob_name).all()]
     # Sum over all the 4th objective values for the shared solutions of all users
-    total_contribution = (
-        db.query(func.sum(SolutionArchive.objectives[3]))
-        .filter(SolutionArchive.shared, SolutionArchive.id in prob_ids)
-        .scalar()
+    objectives = (
+        db.query(SolutionArchive.objectives).filter(SolutionArchive.id.in_(prob_ids), SolutionArchive.shared).all()
     )
+    total_contribution = sum([obj[4] for obj in objectives])
 
     # Get the sum total of the ideal values of objective f_4 for all the users
-    max_contribution = (
-        db.query(func.sum(ProblemInDB.presumed_ideal["f_4"].astext.cast(float)))
+    # Subquery to extract and cast values
+    subquery = (
+        db.query(func.coalesce(cast(ProblemInDB.presumed_ideal["f_4"].astext, Float), 0).label("f_4_value"))
         .filter(ProblemInDB.name == prob_name)
-        .scalar()
+        .subquery()
     )
 
+    # Sum in the main query
+    max_contribution = db.query(func.sum(subquery.c.f_4_value)).scalar()
+    print(own_contribution)
+    print(total_contribution)
     return ShareSolutionResponse(
         own_contribution=own_contribution,
         others_contribution=total_contribution - own_contribution,

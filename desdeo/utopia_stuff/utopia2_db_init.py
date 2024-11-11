@@ -122,6 +122,7 @@ for name in fo_dict:
         saved=True,
         current=True,
         chosen=False,
+        shared=True,
     )
     db.add(reference_solution)
 
