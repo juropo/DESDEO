@@ -78,6 +78,8 @@ for name in fo_dict:
         kind=ProblemKind.CONTINUOUS,
         obj_kind=ObjectiveKind.ANALYTICAL,
         solver=Solvers.GUROBIPY,
+        presumed_ideal=problem.get_ideal_point(),
+        presumed_nadir=problem.get_nadir_point(),
         value=problem.model_dump(mode="json"),
     )
     db.add(problem_in_db)

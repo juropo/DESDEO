@@ -137,6 +137,7 @@ class SolutionArchive(Base):
     saved: Mapped[bool] = mapped_column(nullable=False)
     current: Mapped[bool] = mapped_column(nullable=False)
     chosen: Mapped[bool] = mapped_column(nullable=False)
+    shared: Mapped[bool] = mapped_column(nullable=True)
 
 
 class Log(Base):

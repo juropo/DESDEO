@@ -6,6 +6,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, HTTPException
 from numpy import allclose
 from pydantic import BaseModel, Field, ValidationError
+from sqlalchemy import func, update
 from sqlalchemy.orm import Session
 
 from desdeo.api.db import get_db
@@ -82,6 +83,21 @@ class NIMBUSIterateRequest(BaseModel):
     num_solutions: int | None = Field(
         description="The number of solutions to be generated in the iteration.", default=1
     )
+
+
+class ShareSolutionRequest(BaseModel):
+    """The request for sharing a solution."""
+
+    problem_id: int = Field(description="The ID of the problem to be solved.")
+    solution: list[float] = Field(description="The solution the user wants to share.")
+
+
+class ShareSolutionResponse(BaseModel):
+    """The response to an ShareSolutionRequest."""
+
+    own_contribution: float = Field(description="User's contribution to the shared goal.")
+    others_contribution: float = Field(description="The other users' total contribution to the shared goal.")
+    max_contribution: float = Field(description="The default value shown for maximum available total contribution.")
 
 
 class NIMBUSIntermediateSolutionRequest(BaseModel):
@@ -567,6 +583,74 @@ def utopia(  # noqa: C901, PLR0912
         map_json=json.loads(utopia_data.map_json),
         description=map_description,
         years=utopia_data.years,
+    )
+
+
+@router.post("/share_solutions")
+def share_solutions(
+    request: ShareSolutionRequest,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> ShareSolutionResponse:
+    """Request to share your current choice with the group and get updated info on others in return.
+
+    Args:
+        request: The request body for saving solutions.
+        user (Annotated[User, Depends(get_current_user)]): The current user.
+        db (Annotated[Session, Depends(get_db)]): The database session.
+
+    Returns:
+        ShareSolutionResponse: Contains information used to draw the group's contribution to the common goal.
+    """
+    # Get the solutions from database.
+    problem_id = request.problem_id
+    method_id = get_nimbus_method_id(db)
+
+    solutions = read_solutions_from_db(db, problem_id, user.index, method_id)
+
+    if not solutions:
+        raise HTTPException(status_code=404, detail="Problem not found in the database.")
+
+    # mark all the user's solutions as not shared
+    db.execute(
+        update(SolutionArchive)
+        .where(
+            SolutionArchive.problem == problem_id, SolutionArchive.user == user.id, SolutionArchive.method == method_id
+        )
+        .values(shared=False)
+    )
+
+    # Find the requested solution and mark it as shared.
+    for sol in solutions:
+        if allclose(request.solution, sol.objectives):
+            sol.shared = True
+            db.commit()
+            own_contribution = sol.objectives[3]
+            break
+    else:
+        raise HTTPException(status_code=404, detail="The chosen solution was not found in the database.")
+
+    # All the problems we want to compare have the same name, so let's find those ids
+    prob_name = db.query(ProblemInDB).filter(ProblemInDB.id == problem_id).first().name
+    prob_ids = db.query(ProblemInDB.id).filter(ProblemInDB.name == prob_name).all()
+    # Sum over all the 4th objective values for the shared solutions of all users
+    total_contribution = (
+        db.query(func.sum(SolutionArchive.objectives[3]))
+        .filter(SolutionArchive.shared, SolutionArchive.id in prob_ids)
+        .scalar()
+    )
+
+    # Get the sum total of the ideal values of objective f_4 for all the users
+    max_contribution = (
+        db.query(func.sum(ProblemInDB.presumed_ideal["f_4"].astext.cast(float)))
+        .filter(ProblemInDB.name == prob_name)
+        .scalar()
+    )
+
+    return ShareSolutionResponse(
+        own_contribution=own_contribution,
+        others_contribution=total_contribution - own_contribution,
+        max_contribution=max_contribution / 3,
     )
 
 
