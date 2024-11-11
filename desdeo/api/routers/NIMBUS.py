@@ -636,10 +636,10 @@ def share_solutions(
     prob_name = db.query(ProblemInDB).filter(ProblemInDB.id == problem_id).first().name
     prob_ids = [prob.id for prob in db.query(ProblemInDB.id).filter(ProblemInDB.name == prob_name).all()]
     # Sum over all the 4th objective values for the shared solutions of all users
-    objectives = (
-        db.query(SolutionArchive.objectives).filter(SolutionArchive.id.in_(prob_ids), SolutionArchive.shared).all()
+    all_users_solutions = (
+        db.query(SolutionArchive).filter(SolutionArchive.id.in_(prob_ids), SolutionArchive.shared).all()
     )
-    total_contribution = sum([obj[4] for obj in objectives])
+    total_contribution = sum([sol.objectives[3] for sol in all_users_solutions])
 
     # Get the sum total of the ideal values of objective f_4 for all the users
     # Subquery to extract and cast values
