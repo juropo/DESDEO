@@ -627,6 +627,7 @@ def share_solutions(
         if allclose(request.solution, sol.objectives):
             sol.shared = True
             db.commit()
+            db.refresh(sol)
             own_contribution = sol.objectives[3]
             break
     else:
@@ -637,7 +638,7 @@ def share_solutions(
     prob_ids = [prob.id for prob in db.query(ProblemInDB.id).filter(ProblemInDB.name == prob_name).all()]
     # Sum over all the 4th objective values for the shared solutions of all users
     all_users_solutions = (
-        db.query(SolutionArchive).filter(SolutionArchive.id.in_(prob_ids), SolutionArchive.shared).all()
+        db.query(SolutionArchive).filter(SolutionArchive.problem.in_(prob_ids), SolutionArchive.shared).all()
     )
     total_contribution = sum([sol.objectives[3] for sol in all_users_solutions])
 

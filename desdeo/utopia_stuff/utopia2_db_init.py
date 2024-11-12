@@ -74,7 +74,7 @@ for name in fo_dict:
     )
     problem_in_db = db_models.Problem(
         owner=user.id,
-        name="Metsänhoitosuunnitelma CO2",
+        name="Vaihe 3",
         kind=ProblemKind.CONTINUOUS,
         obj_kind=ObjectiveKind.ANALYTICAL,
         solver=Solvers.GUROBIPY,
