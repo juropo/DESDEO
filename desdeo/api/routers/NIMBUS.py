@@ -655,7 +655,7 @@ def share_solutions(
     return ShareSolutionResponse(
         own_contribution=own_contribution,
         others_contribution=total_contribution - own_contribution,
-        max_contribution=max_contribution / 3,
+        max_contribution=max_contribution,
     )
 
 
