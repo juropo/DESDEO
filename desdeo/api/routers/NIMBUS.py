@@ -57,6 +57,7 @@ class UtopiaResponse(BaseModel):
     options: dict[str, Any] = Field(description="A dict with given years as keys containing options for each year.")
     description: str = Field(description="Description shown above the map.")
     years: list[str] = Field(description="A list of years for which the maps have been generated.")
+    compensation: float = Field(description="Amount of compensation paid per CO2 ton.")
 
 
 class UtopiaRequest(BaseModel):
@@ -426,7 +427,7 @@ def utopia(  # noqa: C901, PLR0912
     else:
         raise HTTPException(status_code=404, detail="The chosen solution was not found in the database.")
 
-    decision_variables = json.loads(solution.decision_variables)
+    decision_variables = solution.decision_variables
 
     # Get the user's map from the database
     utopia_data = db.query(Utopia).filter(Utopia.problem == request.problem_id, Utopia.user == user.index).first()
@@ -570,12 +571,26 @@ def utopia(  # noqa: C901, PLR0912
             options[year]["series"][0]["nameMap"][stand] = name
 
     # Let's also generate a nice description for the map
-    map_description = (
-        f"Tuotto hakkuista ensimmäisellä ajanjaksolla on {int(decision_variables["P_1"])}€.\n"
-        + f"Tuotto hakkuista toisella ajanjaksolla on {int(decision_variables["P_2"])}€.\n"
-        + f"Tuotto hakkuista kolmannella ajanjaksolla on {int(decision_variables["P_3"])}€.\n"
-        + f"Metsän diskontattu arvo suunnittelujakson lopussa on {int(decision_variables["V_end"])}€."
-    )
+    if not utopia_data.compensation:
+        comp = 0
+        map_description = (
+            f"Tuotto hakkuista ensimmäisellä ajanjaksolla on {int(decision_variables["P_1"])}€.\n"
+            + f"Tuotto hakkuista toisella ajanjaksolla on {int(decision_variables["P_2"])}€.\n"
+            + f"Tuotto hakkuista kolmannella ajanjaksolla on {int(decision_variables["P_3"])}€.\n"
+            + f"Metsän diskontattu arvo suunnittelujakson lopussa on {int(decision_variables["V_end"])}€."
+        )
+    else:
+        comp = utopia_data.compensation
+        map_description = (
+            f"Tuotto hakkuista ensimmäisellä ajanjaksolla on {int(decision_variables["P_1"])}€\n"
+            + f"ja hiilen sidonnasta maksettu korvaus {int(decision_variables["C_1"]*comp)}€.\n"
+            + f"Tuotto hakkuista toisella ajanjaksolla on {int(decision_variables["P_2"])}€\n"
+            + f"ja hiilen sidonnasta maksettu korvaus {int(decision_variables["C_2"]*comp)}€.\n"
+            + f"Tuotto hakkuista kolmannella ajanjaksolla on {int(decision_variables["P_3"])}€\n"
+            + f"ja hiilen sidonnasta maksettu korvaus {int(decision_variables["C_3"]*comp)}€.\n"
+            + f"Maksetut korvaukset yhteensä ovat {int(decision_variables["C_1"]*comp)+int(decision_variables["C_2"]*comp)+int(decision_variables["C_3"]*comp)}€.\n"
+            + f"Metsän diskontattu arvo suunnittelujakson lopussa on {int(decision_variables["V_end"])}€."
+        )
 
     return UtopiaResponse(
         map_name=map_name,
@@ -583,6 +598,7 @@ def utopia(  # noqa: C901, PLR0912
         map_json=json.loads(utopia_data.map_json),
         description=map_description,
         years=utopia_data.years,
+        compensation=comp,
     )
 
 
@@ -810,7 +826,7 @@ def save_results_to_db(
                     problem=problem_id,
                     method=method_id,
                     preference=pref.id if pref is not None else None,
-                    decision_variables=json.dumps(res.optimal_variables),
+                    decision_variables=res.optimal_variables,
                     objectives=list(res.optimal_objectives.values()),
                     saved=False,
                     current=True,

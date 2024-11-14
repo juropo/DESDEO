@@ -27,6 +27,7 @@ def utopia_problem(
     problem_name: str = "Forest problem",
     holding: int = 1,
     compensation: float = 0,
+    discounting_factor:int = 3
 ) -> tuple[Problem, dict]:
     r"""Defines a test forest problem that has TensorConstants and TensorVariables.
 
@@ -65,7 +66,7 @@ def utopia_problem(
     """
     schedule_dict = {}
 
-    discounting_factor = 3  # This can be 1, 2, 3, 4 or 5. It represents %
+      # This can be 1, 2, 3, 4 or 5. It represents %
     discounting = [
         (1 - 0.01 * discounting_factor) ** 2,
         (1 - 0.01 * discounting_factor) ** 7,
@@ -407,9 +408,9 @@ def utopia_problem(
         f_3_func = f"{discounting[0]} * P_1 + {discounting[1]} * P_2 + {discounting[2]} * P_3"
     else:
         f_3_func = (
-            f"{discounting[0]} * (P_1 + {compensation/100}*C_1) + "
-            + f"{discounting[1]} * (P_2 + {compensation/100}*C_2) + "
-            + f"{discounting[2]} * (P_3 + {compensation/100}*C_3)"
+            f"{discounting[0]} * (P_1 + {compensation}*C_1) + "
+            + f"{discounting[1]} * (P_2 + {compensation}*C_2) + "
+            + f"{discounting[2]} * (P_3 + {compensation}*C_3)"
         )
     f_1_func = "V_end + " + f_3_func
     f_4_func = "C_1 + C_2 + C_3"

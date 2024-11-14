@@ -64,7 +64,9 @@ if __name__ == "__main__":
     with open("C:/MyTemp/data/forest_owners.json") as file:  # noqa: PTH123
         fo_dict = json.load(file)
 
+    fo_dict = {"juho": {"simulation_results": "C:/MyTemp/data/alternatives/740-559/alternatives.csv"}}
     reference_dict = {}
+    decisions = []
     for fo in fo_dict:
         objectives, decision_vars = get_chosen_solution(fo)
         if objectives is None:
@@ -74,6 +76,12 @@ if __name__ == "__main__":
             "decisions_vars": decision_vars,
             "simulation_results": fo_dict[fo]["simulation_results"],
         }
+        for d in decision_vars:
+            if d.startswith("X"):
+                decisions.append(decision_vars[d])
 
     with open("reference_solutions.json", "w") as file:
         json.dump(reference_dict, file, indent=4)  # indent=4 makes it nicely formatted
+
+    with open("decision_vars.json", "w") as file:
+        json.dump(decisions, file, indent=4)  # indent=4 makes it nicely formatted

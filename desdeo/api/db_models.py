@@ -163,3 +163,4 @@ class Utopia(Base):
     years: Mapped[list[str]] = mapped_column(ARRAY(String), nullable=False)
     stand_id_field: Mapped[str] = mapped_column(String, nullable=False)
     stand_descriptor = mapped_column(JSONB, nullable=True)
+    compensation: Mapped[float] = mapped_column(nullable=True)

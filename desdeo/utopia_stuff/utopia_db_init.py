@@ -7,7 +7,7 @@ with open("C:/MyTemp/code/users_and_passwords.json") as file:  # noqa: PTH123
     userdict = json.load(file)
 
 db = SessionLocal()
-
+"""
 holding_num = 1
 for name in userdict:
     print(name)
@@ -57,7 +57,7 @@ for name in userdict:
     db.commit()
     holding_num += 1
     if holding_num > 5:  # noqa: PLR2004
-        holding_num = 1
+        holding_num = 1"""
 
 # Actual forest owners start from here
 # The contents of this file are not supposed to be found on github

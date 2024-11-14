@@ -69,62 +69,80 @@ for name in fo_dict:
     db.commit()
     db.refresh(user)
 
-    problem, schedule_dict = problem_CO2(
-        data_dir=fo_dict[name]["data_folder"], problem_name="Metsänhoitosuunnitelma CO2", compensation=30
-    )
-    problem_in_db = db_models.Problem(
-        owner=user.id,
-        name="Vaihe 3",
-        kind=ProblemKind.CONTINUOUS,
-        obj_kind=ObjectiveKind.ANALYTICAL,
-        solver=Solvers.GUROBIPY,
-        presumed_ideal=problem.get_ideal_point(),
-        presumed_nadir=problem.get_nadir_point(),
-        value=problem.model_dump(mode="json"),
-    )
-    db.add(problem_in_db)
-    db.commit()
-    db.refresh(problem_in_db)
+    carbon_prices = [0.0, 15.0, 30.0]
+    discounting_factor = 3
 
-    # The info about the map and decision alternatives now goes into the database
-    with open(fo_dict[name]["mapjson"]) as f:  # noqa: PTH123
-        forest_map = f.read()
-    map_info = db_models.Utopia(
-        problem=problem_in_db.id,
-        user=user.id,
-        map_json=forest_map,
-        schedule_dict=schedule_dict,
-        years=["5", "10", "20"],
-        stand_id_field=fo_dict[name]["stand_id"],
-        stand_descriptor=_generate_descriptions(
-            json.loads(forest_map),
-            fo_dict[name]["stand_id"],
-            fo_dict[name]["stand_descriptor"],
-            fo_dict[name]["holding_descriptor"],
-            fo_dict[name]["extension"],
-        ),
-    )
-    db.add(map_info)
+    for index in range(1, 4):
+        # compensation = carbon_price / 100
+        compensation = carbon_prices[index - 1] * discounting_factor / (1 - (1 + discounting_factor) ^ -100)
 
-    problem_access = db_models.UserProblemAccess(
-        user_id=user.id,
-        problem_access=problem_in_db.id,
-    )
-    db.add(problem_access)
+        problem, schedule_dict = problem_CO2(
+            data_dir=fo_dict[name]["data_folder"],
+            problem_name=f"Vaihe {index}",
+            compensation=compensation,
+            discounting_factor=discounting_factor,
+        )
+        problem_in_db = db_models.Problem(
+            owner=user.id,
+            name=f"Vaihe {index}",
+            kind=ProblemKind.CONTINUOUS,
+            obj_kind=ObjectiveKind.ANALYTICAL,
+            solver=Solvers.GUROBIPY,
+            presumed_ideal=problem.get_ideal_point(),
+            presumed_nadir=problem.get_nadir_point(),
+            value=problem.model_dump(mode="json"),
+        )
+        db.add(problem_in_db)
+        db.commit()
+        db.refresh(problem_in_db)
 
-    # Add the reference solution from previous workshop as the starting value
-    reference_solution = db_models.SolutionArchive(
-        user=user.id,
-        problem=problem_in_db.id,
-        method=nimbus_id,
-        decision_variables=ref_solutions[name]["decisions_vars"],
-        objectives=ref_solutions[name]["objectives"] + [0],
-        saved=True,
-        current=True,
-        chosen=False,
-        shared=True,
-    )
-    db.add(reference_solution)
+        # The info about the map and decision alternatives now goes into the database
+        with open(fo_dict[name]["mapjson"]) as f:  # noqa: PTH123
+            forest_map = f.read()
+        map_info = db_models.Utopia(
+            problem=problem_in_db.id,
+            user=user.id,
+            map_json=forest_map,
+            schedule_dict=schedule_dict,
+            years=["5", "10", "20"],
+            stand_id_field=fo_dict[name]["stand_id"],
+            stand_descriptor=_generate_descriptions(
+                json.loads(forest_map),
+                fo_dict[name]["stand_id"],
+                fo_dict[name]["stand_descriptor"],
+                fo_dict[name]["holding_descriptor"],
+                fo_dict[name]["extension"],
+            ),
+            compensation=compensation,
+        )
+        db.add(map_info)
+
+        problem_access = db_models.UserProblemAccess(
+            user_id=user.id,
+            problem_access=problem_in_db.id,
+        )
+        db.add(problem_access)
+
+        # Add the reference solution from previous workshop as the starting value
+        if isinstance(ref_solutions[name]["decisions_vars"], str):
+            decision_vars = json.loads(ref_solutions[name]["decisions_vars"])
+        else:
+            decision_vars = ref_solutions[name]["decisions_vars"]
+        decision_vars["C_1"] = 0
+        decision_vars["C_2"] = 0
+        decision_vars["C_3"] = 0
+        reference_solution = db_models.SolutionArchive(
+            user=user.id,
+            problem=problem_in_db.id,
+            method=nimbus_id,
+            decision_variables=decision_vars,
+            objectives=ref_solutions[name]["objectives"] + [0],
+            saved=True,
+            current=True,
+            chosen=False,
+            shared=True,
+        )
+        db.add(reference_solution)
 
     db.commit()
 
