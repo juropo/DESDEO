@@ -150,3 +150,7 @@ debug.py
 
 # utopia
 reference_solutions.json
+workshop_all_solutions.csv
+workshop_final_solutions.csv
+workshop_results.csv
+workshop_saved_solutions.csv
