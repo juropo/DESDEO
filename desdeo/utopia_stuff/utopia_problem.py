@@ -21,10 +21,7 @@ from desdeo.tools.utils import available_solvers, payoff_table_method
 
 
 def utopia_problem(
-    simulation_results: str,  # when ran from the same place always, these can be replaced with just the dir name
-    treatment_key: str,
-    problem_name: str = "Forest problem",
-    holding: int = 1,
+    data_dir: str, problem_name: str = "Forest problem", holding: int = 1, separator: str = ","
 ) -> tuple[Problem, dict]:
     r"""Defines a test forest problem that has TensorConstants and TensorVariables.
 
@@ -67,17 +64,36 @@ def utopia_problem(
     ]
 
     # df = pl.read_csv(Path("tests/data/alternatives_290124.csv"), dtypes={"unit": pl.Float64})
-    df = pl.read_csv(Path(simulation_results), dtypes={"unit": pl.Float64})
+    # df = pl.read_csv(Path(simulation_results), dtypes={"unit": pl.Float64})
     # df_key = pl.read_csv(Path("tests/data/alternatives_key_290124.csv"), dtypes={"unit": pl.Float64})
-    df_key = pl.read_csv(Path(treatment_key), dtypes={"unit": pl.Float64})
+    # df_key = pl.read_csv(Path(treatment_key), dtypes={"unit": pl.Float64})
+
+    df = pl.read_csv(
+        Path(f"{data_dir}/alternatives.csv"),
+        schema_overrides={"unit": pl.Float64},
+        infer_schema_length=1000,
+        separator=separator,
+    )
+    unfiltered_df_key = pl.read_csv(
+        Path(f"{data_dir}/alternatives_key.csv"),
+        schema_overrides={"unit": pl.Float64},
+        separator=separator,
+    )
+
+    # Remove the decision alternatives that are not found in the filter file
+    filter_df = pl.read_csv(
+        Path(f"{data_dir}/filter.csv"),
+        schema_overrides={"unit": pl.Float64},
+        separator=separator,
+    )
+    df = df.join(filter_df, on=["holding", "unit", "schedule"])
+    df_key = unfiltered_df_key.join(filter_df, on=["holding", "unit", "schedule"])
 
     # Calculate the total wood volume at the start
-    selected_df_v0 = df.filter(pl.col("holding") == holding).select(["unit", "stock_0"]).unique()
+    selected_df_v0 = df.select(["unit", "stock_0"]).unique()
     wood_volume_0 = int(selected_df_v0["stock_0"].sum())
 
-    selected_df_v = df.filter(pl.col("holding") == holding).select(
-        ["unit", "schedule", f"npv_{discounting_factor}_percent"]
-    )
+    selected_df_v = df.select(["unit", "schedule", f"npv_{discounting_factor}_percent"])
     unique_units = selected_df_v.unique(["unit"], maintain_order=True).get_column("unit")
     selected_df_v.group_by(["unit", "schedule"])
     rows_by_key = selected_df_v.rows_by_key(key=["unit", "schedule"])
@@ -87,7 +103,7 @@ def utopia_problem(
             if (unique_units[i], j) in rows_by_key:
                 v_array[i][j] = rows_by_key[(unique_units[i], j)][0]
 
-    selected_df_w = df.filter(pl.col("holding") == holding).select(["unit", "schedule", "stock_20"])
+    selected_df_w = df.select(["unit", "schedule", "stock_20"])
     selected_df_w.group_by(["unit", "schedule"])
     rows_by_key = selected_df_w.rows_by_key(key=["unit", "schedule"])
     selected_df_key_w = df_key.select(["unit", "schedule", "treatment"])
@@ -118,7 +134,7 @@ def utopia_problem(
                 v_array[i][j] += p_array[i][j]
     """
 
-    selected_df_p1 = df.filter(pl.col("holding") == holding).select(["unit", "schedule", "harvest_value_5"])
+    selected_df_p1 = df.select(["unit", "schedule", "harvest_value_5"])
     selected_df_p1.group_by(["unit", "schedule"])
     rows_by_key = selected_df_p1.rows_by_key(key=["unit", "schedule"])
     p1_array = np.zeros((selected_df_p1["unit"].n_unique(), selected_df_p1["schedule"].n_unique()))
@@ -127,7 +143,7 @@ def utopia_problem(
             if (unique_units[i], j) in rows_by_key:
                 p1_array[i][j] = rows_by_key[(unique_units[i], j)][0] + 1e-6
 
-    selected_df_p2 = df.filter(pl.col("holding") == holding).select(["unit", "schedule", "harvest_value_10"])
+    selected_df_p2 = df.select(["unit", "schedule", "harvest_value_10"])
     selected_df_p2.group_by(["unit", "schedule"])
     rows_by_key = selected_df_p2.rows_by_key(key=["unit", "schedule"])
     p2_array = np.zeros((selected_df_p2["unit"].n_unique(), selected_df_p2["schedule"].n_unique()))
@@ -136,7 +152,7 @@ def utopia_problem(
             if (unique_units[i], j) in rows_by_key:
                 p2_array[i][j] = rows_by_key[(unique_units[i], j)][0] + 1e-6
 
-    selected_df_p3 = df.filter(pl.col("holding") == holding).select(["unit", "schedule", "harvest_value_20"])
+    selected_df_p3 = df.select(["unit", "schedule", "harvest_value_20"])
     selected_df_p3.group_by(["unit", "schedule"])
     rows_by_key = selected_df_p3.rows_by_key(key=["unit", "schedule"])
     p3_array = np.zeros((selected_df_p3["unit"].n_unique(), selected_df_p3["schedule"].n_unique()))
@@ -207,11 +223,7 @@ def utopia_problem(
         variables.append(x)
 
         # Fill out the dict with information about treatments associated with X_{i+1}
-        treatment_list = (
-            df_key.filter((pl.col("holding") == holding) & (pl.col("unit") == unique_units[i]))
-            .get_column("treatment")
-            .to_list()
-        )
+        treatment_list = unfiltered_df_key.filter(pl.col("unit") == unique_units[i]).get_column("treatment").to_list()
         schedule_dict[f"X_{i+1}"] = dict(zip(range(len(treatment_list)), treatment_list, strict=True))
         schedule_dict[f"X_{i+1}"]["unit"] = unique_units[i]
 

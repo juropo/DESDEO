@@ -21,18 +21,20 @@ def reinit_user(username: str):
     problem_in_db = db.query(ProblemInDB).filter(ProblemInDB.owner == user.id).first()
     map_info = db.query(Utopia).filter(Utopia.problem == problem_in_db.id, Utopia.user == user.id)
 
-    with open("C:/MyTemp/data/forest_owners.json") as file:  # noqa: PTH123
+    with open("C:/MyTemp/data/forest_owners_punkaharju.json") as file:  # noqa: PTH123
         fo_dict = json.load(file)
 
     print(fo_dict[username])
 
     problem, schedule_dict = utopia_problem(
-        simulation_results=fo_dict[username]["simulation_results"],
-        treatment_key=fo_dict[username]["treatment_key"],
-        problem_name="Metsänhoitosuunnitelma",
+        data_dir=fo_dict[username]["data_folder"], problem_name="Metsänhoitosuunnitelma", separator=","
     )
 
     problem_in_db.value = problem.model_dump(mode="json")
     map_info.schedule_dict = schedule_dict
 
     db.commit()
+
+
+if __name__ == "__main__":
+    reinit_user("kero")

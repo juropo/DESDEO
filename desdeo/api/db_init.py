@@ -4,9 +4,11 @@ import warnings
 
 import numpy as np
 import polars as pl
+from sqlalchemy import text
 from sqlalchemy_utils import create_database, database_exists, drop_database
 
 from desdeo.api import db_models
+from desdeo.api.config import DBConfig
 from desdeo.api.db import Base, SessionLocal, engine
 from desdeo.api.routers.UserAuth import get_password_hash
 from desdeo.api.schema import Methods, ObjectiveKind, ProblemKind, Solvers, UserPrivileges, UserRole
@@ -25,6 +27,16 @@ if not database_exists(engine.url):
     create_database(engine.url)
 else:
     warnings.warn("Database already exists. Clearing it.", stacklevel=1)
+
+    # Drop all active connections
+    db = SessionLocal()
+    terminate_connections_sql = text("""
+        SELECT pg_terminate_backend(pid)
+        FROM pg_stat_activity
+        WHERE datname = :db_name AND pid <> pg_backend_pid();
+    """)
+    db.execute(terminate_connections_sql, {"db_name": DBConfig.db_database})
+
     # Drop all tables
     Base.metadata.drop_all(bind=engine)
 print("Database tables created.")

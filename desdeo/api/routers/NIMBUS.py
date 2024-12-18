@@ -469,6 +469,8 @@ def utopia(  # noqa: C901, PLR0912
             continue
         # The dict keys get converted to ints to strings when it's loaded from database
         try:
+            print(utopia_data.schedule_dict)
+            print(key)
             treatments = utopia_data.schedule_dict[key][str(decision_variables[key].index(1))]
         except ValueError as e:
             # if the optimization didn't choose any decision alternative, it's safe to assume

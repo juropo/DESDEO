@@ -76,7 +76,7 @@ The json file contents look something like this
   }
 }
 """
-with open("C:/MyTemp/data/forest_owners.json") as file:  # noqa: PTH123
+with open("C:/MyTemp/data/forest_owners_punkaharju.json") as file:  # noqa: PTH123
     fo_dict = json.load(file)
 
 
@@ -84,7 +84,7 @@ def _generate_descriptions(mapjson: dict, sid: str, stand: str, holding: str, ex
     descriptions = {}
     if holding:
         for feat in mapjson["features"]:
-            if feat["properties"][extension]:  # noqa: SIM108
+            if False:  # feat["properties"][extension]:  # noqa: SIM108
                 ext = f".{feat["properties"][extension]}"
             else:
                 ext = ""
@@ -93,7 +93,7 @@ def _generate_descriptions(mapjson: dict, sid: str, stand: str, holding: str, ex
             )
     else:
         for feat in mapjson["features"]:
-            if feat["properties"][extension]:  # noqa: SIM108
+            if False:  # feat["properties"][extension]:  # noqa: SIM108
                 ext = f".{feat["properties"][extension]}"
             else:
                 ext = ""
@@ -114,10 +114,10 @@ for name in fo_dict:
     db.commit()
     db.refresh(user)
 
+    separator = ","
+
     problem, schedule_dict = utopia_problem(
-        simulation_results=fo_dict[name]["simulation_results"],
-        treatment_key=fo_dict[name]["treatment_key"],
-        problem_name="Metsänhoitosuunnitelma",
+        data_dir=fo_dict[name]["data_folder"], problem_name="Metsänhoitosuunnitelma", separator=separator
     )
     problem_in_db = db_models.Problem(
         owner=user.id,
@@ -158,55 +158,5 @@ for name in fo_dict:
     db.add(problem_access)
 
     db.commit()
-
-
-# One extra holding for one user
-user = db.query(db_models.User).filter(db_models.User.username == next(iter(fo_dict))).first()
-problem, schedule_dict = utopia_problem(
-    simulation_results="C:/MyTemp/data/alternatives/asikkala/alternatives.csv",
-    treatment_key="C:/MyTemp/data/alternatives/asikkala/alternatives_key.csv",
-    problem_name="Metsänhoitosuunnitelma Asikkala",
-)
-
-problem_in_db = db_models.Problem(
-    owner=user.id,
-    name="Metsänhoitosuunnitelma Asikkala",
-    kind=ProblemKind.CONTINUOUS,
-    obj_kind=ObjectiveKind.ANALYTICAL,
-    solver=Solvers.GUROBIPY,
-    value=problem.model_dump(mode="json"),
-)
-db.add(problem_in_db)
-db.commit()
-db.refresh(problem_in_db)
-
-with open("C:/MyTemp/data/alternatives/asikkala/holding.geojson") as f:  # noqa: PTH123
-    forest_map = f.read()
-map_info = db_models.Utopia(
-    problem=problem_in_db.id,
-    user=user.id,
-    map_json=forest_map,
-    schedule_dict=schedule_dict,
-    years=["5", "10", "20"],
-    stand_id_field="standid",
-    stand_descriptor=_generate_descriptions(
-        json.loads(forest_map),
-        "standid",
-        "standnumber",
-        None,
-        "standnumberextension",
-    ),
-)
-db.add(map_info)
-
-problem_access = db_models.UserProblemAccess(
-    user_id=user.id,
-    problem_access=problem_in_db.id,
-)
-db.add(problem_access)
-
-db.commit()
-
-# Extra problem ends here
 
 db.close()

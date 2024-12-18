@@ -32,6 +32,7 @@ def get_chosen_solution(username: str):
             SolutionArchive.user == user.id,
             SolutionArchive.problem == problem_in_db.id,
             SolutionArchive.method == nimbus_method.id,
+            SolutionArchive.chosen
         )
         .first()
     )
