@@ -5,8 +5,6 @@ from desdeo.api.db_init import *  # noqa: F403
 # from desdeo.utopia_stuff.utopia_problem import utopia_problem
 from desdeo.utopia_stuff.utopia_problem_CO2 import utopia_problem as problem_CO2
 
-with open("C:/MyTemp/code/users_and_passwords.json") as file:  # noqa: PTH123
-    userdict = json.load(file)
 
 db = SessionLocal()
 
@@ -28,10 +26,10 @@ The json file contents look something like this
   }
 }
 """
-with open("C:/MyTemp/data/forest_owners_ws2.json") as file:  # noqa: PTH123
+with open("C:/MyTemp/data/forest_owners_punkaharju.json") as file:  # noqa: PTH123
     fo_dict = json.load(file)
 
-with open("C:/MyTemp/data/reference_solutions.json") as file:
+with open("C:/MyTemp/data/reference_solutions_punkaharju.json") as file:
     ref_solutions = json.load(file)
 
 
@@ -39,7 +37,7 @@ def _generate_descriptions(mapjson: dict, sid: str, stand: str, holding: str, ex
     descriptions = {}
     if holding:
         for feat in mapjson["features"]:
-            if feat["properties"][extension]:  # noqa: SIM108
+            if False:  # noqa: SIM108
                 ext = f".{feat["properties"][extension]}"
             else:
                 ext = ""
@@ -48,7 +46,7 @@ def _generate_descriptions(mapjson: dict, sid: str, stand: str, holding: str, ex
             )
     else:
         for feat in mapjson["features"]:
-            if feat["properties"][extension]:  # noqa: SIM108
+            if False:  # noqa: SIM108
                 ext = f".{feat["properties"][extension]}"
             else:
                 ext = ""

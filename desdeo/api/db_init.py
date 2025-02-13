@@ -111,30 +111,6 @@ problem_in_db = db_models.Problem(
 )
 db.add(problem_in_db)
 
-problem, schedule_dict = utopia_problem_old(holding=1)
-problem_in_db = db_models.Problem(
-    owner=user.id,
-    name="Test 5",
-    kind=ProblemKind.CONTINUOUS,
-    obj_kind=ObjectiveKind.ANALYTICAL,
-    solver=Solvers.GUROBIPY,
-    value=problem.model_dump(mode="json"),
-)
-db.add(problem_in_db)
-db.commit()
-
-# The info about the map and decision alternatives now goes into the database
-with open("desdeo/utopia_stuff/data/1.json") as f:  # noqa: PTH123
-    forest_map = f.read()
-map_info = db_models.Utopia(
-    problem=problem_in_db.id,
-    user=user.id,
-    map_json=forest_map,
-    schedule_dict=schedule_dict,
-    years=["2025", "2030", "2035"],
-    stand_id_field="standnumbe",
-)
-db.add(map_info)
 
 # I guess we need to have methods in the database as well
 nimbus = db_models.Method(

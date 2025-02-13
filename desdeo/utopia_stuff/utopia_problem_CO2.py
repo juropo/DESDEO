@@ -27,7 +27,7 @@ def utopia_problem(
     problem_name: str = "Forest problem",
     holding: int = 1,
     compensation: float = 0,
-    discounting_factor:int = 3
+    discounting_factor: int = 3,
 ) -> tuple[Problem, dict]:
     r"""Defines a test forest problem that has TensorConstants and TensorVariables.
 
@@ -66,7 +66,7 @@ def utopia_problem(
     """
     schedule_dict = {}
 
-      # This can be 1, 2, 3, 4 or 5. It represents %
+    # This can be 1, 2, 3, 4 or 5. It represents %
     discounting = [
         (1 - 0.01 * discounting_factor) ** 2,
         (1 - 0.01 * discounting_factor) ** 7,
@@ -76,20 +76,28 @@ def utopia_problem(
     df = pl.read_csv(
         Path(f"{data_dir}/alternatives.csv"), schema_overrides={"unit": pl.Float64}, infer_schema_length=1000
     )
-    df_key = pl.read_csv(Path(f"{data_dir}/alternatives_key.csv"), schema_overrides={"unit": pl.Float64})
+    separator = ","
+    unfiltered_df_key = pl.read_csv(
+        Path(f"{data_dir}/alternatives_key.csv"),
+        schema_overrides={"unit": pl.Float64},
+        separator=separator,
+    )
 
     # Remove the decision alternatives that are not found in the filter file
-    filter_df = pl.read_csv(Path(f"{data_dir}/filter.csv"), schema_overrides={"unit": pl.Float64})
+    filter_df = pl.read_csv(
+        Path(f"{data_dir}/filter.csv"),
+        schema_overrides={"unit": pl.Float64},
+        separator=separator,
+    )
+
     df = df.join(filter_df, on=["holding", "unit", "schedule"])
-    df_key = df_key.join(filter_df, on=["holding", "unit", "schedule"])
+    df_key = unfiltered_df_key.join(filter_df, on=["holding", "unit", "schedule"])
 
     # Calculate the total wood volume at the start
-    selected_df_v0 = df.filter(pl.col("holding") == holding).select(["unit", "stock_0"]).unique()
+    selected_df_v0 = df.select(["unit", "stock_0"]).unique()
     wood_volume_0 = int(selected_df_v0["stock_0"].sum())
 
-    selected_df_v = df.filter(pl.col("holding") == holding).select(
-        ["unit", "schedule", f"npv_{discounting_factor}_percent"]
-    )
+    selected_df_v = df.select(["unit", "schedule", f"npv_{discounting_factor}_percent"])
     unique_units = selected_df_v.unique(["unit"], maintain_order=True).get_column("unit")
     selected_df_v.group_by(["unit", "schedule"])
     rows_by_key = selected_df_v.rows_by_key(key=["unit", "schedule"])
@@ -97,9 +105,9 @@ def utopia_problem(
     for i in range(np.shape(v_array)[0]):
         for j in range(np.shape(v_array)[1]):
             if (unique_units[i], j) in rows_by_key:
-                v_array[i][j] = rows_by_key[(unique_units[i], j)][0]
+                v_array[i][j] = rows_by_key[(unique_units[i], j)][0][0]
 
-    selected_df_w = df.filter(pl.col("holding") == holding).select(["unit", "schedule", "stock_20"])
+    selected_df_w = df.select(["unit", "schedule", "stock_20"])
     selected_df_w.group_by(["unit", "schedule"])
     rows_by_key = selected_df_w.rows_by_key(key=["unit", "schedule"])
     selected_df_key_w = df_key.select(["unit", "schedule", "treatment"])
@@ -111,7 +119,7 @@ def utopia_problem(
             if len(rows_by_key_df_key[(unique_units[i], j)]) == 0:
                 continue
             if (unique_units[i], j) in rows_by_key:
-                w_array[i][j] = rows_by_key[(unique_units[i], j)][0]
+                w_array[i][j] = rows_by_key[(unique_units[i], j)][0][0]
 
     """
     selected_df_p = df.filter(pl.col("holding") == holding).select(
@@ -130,32 +138,32 @@ def utopia_problem(
                 v_array[i][j] += p_array[i][j]
     """
 
-    selected_df_p1 = df.filter(pl.col("holding") == holding).select(["unit", "schedule", "harvest_value_5"])
+    selected_df_p1 = df.select(["unit", "schedule", "harvest_value_5"])
     selected_df_p1.group_by(["unit", "schedule"])
     rows_by_key = selected_df_p1.rows_by_key(key=["unit", "schedule"])
     p1_array = np.zeros((selected_df_p1["unit"].n_unique(), selected_df_p1["schedule"].n_unique()))
     for i in range(np.shape(p1_array)[0]):
         for j in range(np.shape(p1_array)[1]):
             if (unique_units[i], j) in rows_by_key:
-                p1_array[i][j] = rows_by_key[(unique_units[i], j)][0] + 1e-6
+                p1_array[i][j] = rows_by_key[(unique_units[i], j)][0][0] + 1e-6
 
-    selected_df_p2 = df.filter(pl.col("holding") == holding).select(["unit", "schedule", "harvest_value_10"])
+    selected_df_p2 = df.select(["unit", "schedule", "harvest_value_10"])
     selected_df_p2.group_by(["unit", "schedule"])
     rows_by_key = selected_df_p2.rows_by_key(key=["unit", "schedule"])
     p2_array = np.zeros((selected_df_p2["unit"].n_unique(), selected_df_p2["schedule"].n_unique()))
     for i in range(np.shape(p2_array)[0]):
         for j in range(np.shape(p2_array)[1]):
             if (unique_units[i], j) in rows_by_key:
-                p2_array[i][j] = rows_by_key[(unique_units[i], j)][0] + 1e-6
+                p2_array[i][j] = rows_by_key[(unique_units[i], j)][0][0] + 1e-6
 
-    selected_df_p3 = df.filter(pl.col("holding") == holding).select(["unit", "schedule", "harvest_value_20"])
+    selected_df_p3 = df.select(["unit", "schedule", "harvest_value_20"])
     selected_df_p3.group_by(["unit", "schedule"])
     rows_by_key = selected_df_p3.rows_by_key(key=["unit", "schedule"])
     p3_array = np.zeros((selected_df_p3["unit"].n_unique(), selected_df_p3["schedule"].n_unique()))
     for i in range(np.shape(p3_array)[0]):
         for j in range(np.shape(p3_array)[1]):
             if (unique_units[i], j) in rows_by_key:
-                p3_array[i][j] = rows_by_key[(unique_units[i], j)][0] + 1e-6
+                p3_array[i][j] = rows_by_key[(unique_units[i], j)][0][0] + 1e-6
 
     constants = []
     variables = []
@@ -219,11 +227,7 @@ def utopia_problem(
         variables.append(x)
 
         # Fill out the dict with information about treatments associated with X_{i+1}
-        treatment_list = (
-            df_key.filter((pl.col("holding") == holding) & (pl.col("unit") == unique_units[i]))
-            .get_column("treatment")
-            .to_list()
-        )
+        treatment_list = unfiltered_df_key.filter(pl.col("unit") == unique_units[i]).get_column("treatment").to_list()
         schedule_dict[f"X_{i+1}"] = dict(zip(range(len(treatment_list)), treatment_list, strict=True))
         schedule_dict[f"X_{i+1}"]["unit"] = unique_units[i]
 
@@ -297,43 +301,47 @@ def utopia_problem(
     for i in range(np.shape(v_array)[0]):
         # store the carbon tons of the stand from each year as TensorConstants whose values are a list
         # of carbon tons with each schedule
+
+        # need to add some code for this to work with the filter file, let's hope this works
+        plans = filter_df.filter(pl.col("unit") == unique_units[i]).select("schedule").to_series().to_list()
+
+        values = [carbon_dict[str(unique_units[i])]["0"][j] for j in plans]
+        values = np.pad(values, (0, x.shape[0] - len(values)), mode="constant", constant_values=0).tolist()
         c0 = TensorConstant(
             name=f"C0_{i+1}",
             symbol=f"C0_{i+1}",
-            shape=[
-                len(carbon_dict[str(unique_units[i])]["0"])
-            ],  # NOTE: vectors have to be of form [2] instead of [2,1] or [1,2]
-            values=carbon_dict[str(unique_units[i])]["0"],
+            shape=x.shape,  # NOTE: vectors have to be of form [2] instead of [2,1] or [1,2]
+            values=values,
         )
         constants.append(c0)
 
+        values = [carbon_dict[str(unique_units[i])]["5"][j] for j in plans]
+        values = np.pad(values, (0, x.shape[0] - len(values)), mode="constant", constant_values=0).tolist()
         c5 = TensorConstant(
             name=f"C5_{i+1}",
             symbol=f"C5_{i+1}",
-            shape=[
-                len(carbon_dict[str(unique_units[i])]["5"])
-            ],  # NOTE: vectors have to be of form [2] instead of [2,1] or [1,2]
-            values=carbon_dict[str(unique_units[i])]["5"],
+            shape=x.shape,  # NOTE: vectors have to be of form [2] instead of [2,1] or [1,2]
+            values=values,
         )
         constants.append(c5)
 
+        values = [carbon_dict[str(unique_units[i])]["10"][j] for j in plans]
+        values = np.pad(values, (0, x.shape[0] - len(values)), mode="constant", constant_values=0).tolist()
         c10 = TensorConstant(
             name=f"C10_{i+1}",
             symbol=f"C10_{i+1}",
-            shape=[
-                len(carbon_dict[str(unique_units[i])]["10"])
-            ],  # NOTE: vectors have to be of form [2] instead of [2,1] or [1,2]
-            values=carbon_dict[str(unique_units[i])]["10"],
+            shape=x.shape,  # NOTE: vectors have to be of form [2] instead of [2,1] or [1,2]
+            values=values,
         )
         constants.append(c10)
 
+        values = [carbon_dict[str(unique_units[i])]["20"][j] for j in plans]
+        values = np.pad(values, (0, x.shape[0] - len(values)), mode="constant", constant_values=0).tolist()
         c20 = TensorConstant(
             name=f"C20_{i+1}",
             symbol=f"C20_{i+1}",
-            shape=[
-                len(carbon_dict[str(unique_units[i])]["20"])
-            ],  # NOTE: vectors have to be of form [2] instead of [2,1] or [1,2]
-            values=carbon_dict[str(unique_units[i])]["20"],
+            shape=x.shape,  # NOTE: vectors have to be of form [2] instead of [2,1] or [1,2]
+            values=values,
         )
         constants.append(c20)
 

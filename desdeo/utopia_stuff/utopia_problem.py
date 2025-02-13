@@ -101,7 +101,7 @@ def utopia_problem(
     for i in range(np.shape(v_array)[0]):
         for j in range(np.shape(v_array)[1]):
             if (unique_units[i], j) in rows_by_key:
-                v_array[i][j] = rows_by_key[(unique_units[i], j)][0]
+                v_array[i][j] = rows_by_key[(unique_units[i], j)][0][0]
 
     selected_df_w = df.select(["unit", "schedule", "stock_20"])
     selected_df_w.group_by(["unit", "schedule"])
@@ -115,7 +115,7 @@ def utopia_problem(
             if len(rows_by_key_df_key[(unique_units[i], j)]) == 0:
                 continue
             if (unique_units[i], j) in rows_by_key:
-                w_array[i][j] = rows_by_key[(unique_units[i], j)][0]
+                w_array[i][j] = rows_by_key[(unique_units[i], j)][0][0]
 
     """
     selected_df_p = df.filter(pl.col("holding") == holding).select(
@@ -141,7 +141,7 @@ def utopia_problem(
     for i in range(np.shape(p1_array)[0]):
         for j in range(np.shape(p1_array)[1]):
             if (unique_units[i], j) in rows_by_key:
-                p1_array[i][j] = rows_by_key[(unique_units[i], j)][0] + 1e-6
+                p1_array[i][j] = rows_by_key[(unique_units[i], j)][0][0] + 1e-6
 
     selected_df_p2 = df.select(["unit", "schedule", "harvest_value_10"])
     selected_df_p2.group_by(["unit", "schedule"])
@@ -150,7 +150,7 @@ def utopia_problem(
     for i in range(np.shape(p2_array)[0]):
         for j in range(np.shape(p2_array)[1]):
             if (unique_units[i], j) in rows_by_key:
-                p2_array[i][j] = rows_by_key[(unique_units[i], j)][0] + 1e-6
+                p2_array[i][j] = rows_by_key[(unique_units[i], j)][0][0] + 1e-6
 
     selected_df_p3 = df.select(["unit", "schedule", "harvest_value_20"])
     selected_df_p3.group_by(["unit", "schedule"])
@@ -159,7 +159,7 @@ def utopia_problem(
     for i in range(np.shape(p3_array)[0]):
         for j in range(np.shape(p3_array)[1]):
             if (unique_units[i], j) in rows_by_key:
-                p3_array[i][j] = rows_by_key[(unique_units[i], j)][0] + 1e-6
+                p3_array[i][j] = rows_by_key[(unique_units[i], j)][0][0] + 1e-6
 
     constants = []
     variables = []

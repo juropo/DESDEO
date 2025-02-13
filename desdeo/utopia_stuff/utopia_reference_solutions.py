@@ -32,7 +32,7 @@ def get_chosen_solution(username: str):
             SolutionArchive.user == user.id,
             SolutionArchive.problem == problem_in_db.id,
             SolutionArchive.method == nimbus_method.id,
-            SolutionArchive.chosen
+            SolutionArchive.chosen,
         )
         .first()
     )
@@ -62,10 +62,10 @@ def get_chosen_solution(username: str):
 
 if __name__ == "__main__":
     # print(get_chosen_solution("Iisakkila"))
-    with open("C:/MyTemp/data/forest_owners.json") as file:  # noqa: PTH123
+    with open("C:/MyTemp/data/forest_owners_punkaharju.json") as file:  # noqa: PTH123
         fo_dict = json.load(file)
 
-    fo_dict = {"juho": {"simulation_results": "C:/MyTemp/data/alternatives/740-559/alternatives.csv"}}
+    # fo_dict = {"juho": {"simulation_results": "C:/MyTemp/data/alternatives/740-559/alternatives.csv"}}
     reference_dict = {}
     decisions = []
     for fo in fo_dict:
@@ -75,7 +75,7 @@ if __name__ == "__main__":
         reference_dict[fo] = {
             "objectives": objectives,
             "decisions_vars": decision_vars,
-            "simulation_results": fo_dict[fo]["simulation_results"],
+            "data_folder": fo_dict[fo]["data_folder"],
         }
         for d in decision_vars:
             if d.startswith("X"):
