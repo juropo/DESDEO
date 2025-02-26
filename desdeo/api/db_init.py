@@ -54,16 +54,7 @@ Base.metadata.create_all(bind=engine)
 
 # Create test users
 db = SessionLocal()
-user = db_models.User(
-    username="test",
-    password_hash=get_password_hash("test"),
-    role=UserRole.ANALYST,
-    privilages=[UserPrivileges.EDIT_USERS, UserPrivileges.CREATE_PROBLEMS],
-    user_group="",
-)
-db.add(user)
-db.commit()
-db.refresh(user)
+
 
 """
 dmUser = db_models.User(
@@ -88,7 +79,6 @@ db.add(dmUser2)
 problem = binh_and_korn()
 
 problem_in_db = db_models.Problem(
-    owner=user.id,
     name="Binh and Korn",
     kind=ProblemKind.CONTINUOUS,
     obj_kind=ObjectiveKind.ANALYTICAL,
@@ -99,7 +89,6 @@ db.add(problem_in_db)
 
 problem = nimbus_test_problem()
 problem_in_db = db_models.Problem(
-    owner=user.id,
     name="Test 4",
     kind=ProblemKind.CONTINUOUS,
     obj_kind=ObjectiveKind.ANALYTICAL,
