@@ -72,7 +72,10 @@ for name in fo_dict:
 
     for index in range(1, 4):
         # compensation = carbon_price / 100
-        compensation = carbon_prices[index - 1] * discounting_factor / (1 - (1 + discounting_factor) ^ -100)
+        compensation = (
+            carbon_prices[index - 1] * discounting_factor / 100 / (1 - (1 + discounting_factor / 100) ** -100)
+        )
+        print(compensation)
 
         problem, schedule_dict = problem_CO2(
             data_dir=fo_dict[name]["data_folder"],
