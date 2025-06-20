@@ -28,6 +28,7 @@ def utopia_problem(
     holding: int = 1,
     compensation: float = 0,
     discounting_factor: int = 3,
+    language="fi",
 ) -> tuple[Problem, dict]:
     r"""Defines a test forest problem that has TensorConstants and TensorVariables.
 
@@ -486,9 +487,10 @@ def utopia_problem(
 
     print(ideals)
     print(nadirs)
+    en = language == "en"
 
     f_1 = Objective(
-        name="Nettonykyarvo / €",
+        name="Net present value / €" if en else "Nettonykyarvo / €",
         symbol="f_1",
         func=f_1_func,
         maximize=True,
@@ -501,7 +503,9 @@ def utopia_problem(
     )
 
     f_2 = Objective(
-        name=f"Puuston tilavuus / m^3\n(alussa {wood_volume_0}m^3)",
+        name=f"Final timber volume / m^3\n(start {wood_volume_0}m^3)"
+        if en
+        else f"Puuston tilavuus / m^3\n(alussa {wood_volume_0}m^3)",
         symbol="f_2",
         func=f_2_func,
         maximize=True,
@@ -514,7 +518,7 @@ def utopia_problem(
     )
 
     f_3 = Objective(
-        name="Hakkuiden tuotto / €",
+        name="Logging revenue / €" if en else "Hakkuiden tuotto / €",
         symbol="f_3",
         func=f_3_func,
         maximize=True,
@@ -527,7 +531,7 @@ def utopia_problem(
     )
 
     f_4 = Objective(
-        name="Sidottu hiilidioksidi / (v·t)",
+        name="Stored CO2 / (year·tonne)" if en else "Sidottu hiilidioksidi / (v·t)",
         symbol="f_4",
         func=f_4_func,
         maximize=True,

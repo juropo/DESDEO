@@ -58,6 +58,7 @@ class UtopiaResponse(BaseModel):
     description: str = Field(description="Description shown above the map.")
     years: list[str] = Field(description="A list of years for which the maps have been generated.")
     compensation: float = Field(description="Amount of compensation paid per CO2 ton.")
+    language: str = Field(description="A string describing the language that should be used, either 'en' or 'fi'")
 
 
 class UtopiaRequest(BaseModel):
@@ -152,6 +153,7 @@ def init_nimbus(
     """
     # Do database stuff here.
     problem_id = init_request.problem_id
+    print(problem_id)
     # The request is supposed to contain method id, but I don't want to deal with frontend code
     init_request.method_id = get_nimbus_method_id(db)
     method_id = init_request.method_id
@@ -416,6 +418,7 @@ def utopia(  # noqa: C901, PLR0912
     Returns:
         The information used to draw the map.
     """
+    print(UtopiaRequest)
     method_id = get_nimbus_method_id(db)
     archived_solutions = read_solutions_from_db(db, request.problem_id, user.index, method_id)
 
@@ -430,25 +433,32 @@ def utopia(  # noqa: C901, PLR0912
     decision_variables = solution.decision_variables
 
     # Get the user's map from the database
-    utopia_data = db.query(Utopia).filter(Utopia.problem == request.problem_id, Utopia.user == user.index).first()
+    utopia_data = db.query(Utopia).filter(Utopia.problem == request.problem_id).first()
 
     # Figure out the treatments from the decision variables and utopia data
-    """description_dict = {
-        0: "Do nothing",
-        1: "Clearcut",
-        2: "Thinning from below",
-        3: "Thinning from above",
-        4: "Even thinning",
-        5: "First thinning",
-    }"""
-    description_dict = {
-        0: "Ei toimenpiteitä",
-        1: "Päätehakkuu",
-        2: "Alaharvennus",
-        3: "Yläharvennus",
-        4: "Tasaharvennus",
-        5: "Ensiharvennus",
-    }
+    en = False
+
+    if utopia_data.language == "en":
+        language = utopia_data.language
+        en = True
+        description_dict = {
+            0: "Do nothing",
+            1: "Clearcut",
+            2: "Thinning from below",
+            3: "Thinning from above",
+            4: "Even thinning",
+            5: "First thinning",
+        }
+    else:
+        language = "fi"
+        description_dict = {
+            0: "Ei toimenpiteitä",
+            1: "Päätehakkuu",
+            2: "Alaharvennus",
+            3: "Yläharvennus",
+            4: "Tasaharvennus",
+            5: "Ensiharvennus",
+        }
 
     def treatment_index(part: str) -> str:
         if "clearcut" in part:
@@ -469,8 +479,8 @@ def utopia(  # noqa: C901, PLR0912
             continue
         # The dict keys get converted to ints to strings when it's loaded from database
         try:
-            print(utopia_data.schedule_dict)
-            print(key)
+            # print(utopia_data.schedule_dict)
+            # print(key)
             treatments = utopia_data.schedule_dict[key][str(decision_variables[key].index(1))]
         except ValueError as e:
             # if the optimization didn't choose any decision alternative, it's safe to assume
@@ -511,7 +521,7 @@ def utopia(  # noqa: C901, PLR0912
                 "type": "piecewise",  # // for different plans
                 "pieces": [],
                 # "text": ["Management plans"],
-                "text": ["Suunnitellut toimenpiteet"],
+                "text": ["Planned actions" if en else "Suunnitellut toimenpiteet"],
                 "calculable": True,
             },
             # // predefined symbols for visumap'circle': 'rect': 'roundRect': 'triangle': 'diamond': 'pin':'arrow':
@@ -575,12 +585,20 @@ def utopia(  # noqa: C901, PLR0912
     # Let's also generate a nice description for the map
     if not utopia_data.compensation:
         comp = 0
-        map_description = (
-            f"Tuotto hakkuista ensimmäisellä ajanjaksolla on {int(decision_variables["P_1"])}€.\n"
-            + f"Tuotto hakkuista toisella ajanjaksolla on {int(decision_variables["P_2"])}€.\n"
-            + f"Tuotto hakkuista kolmannella ajanjaksolla on {int(decision_variables["P_3"])}€.\n"
-            + f"Metsän diskontattu arvo suunnittelujakson lopussa on {int(decision_variables["V_end"])}€."
-        )
+        if en:
+            map_description = (
+                f"Income from harvesting in the 1st time period is {int(decision_variables["P_1"])}€.\n"
+                + f"Income from harvesting in the 2nd time period is {int(decision_variables["P_2"])}€.\n"
+                + f"Income from harvesting in the 3rd time period is {int(decision_variables["P_3"])}€.\n"
+                + f"The discounted value of the forest remaining at the end is {int(decision_variables["V_end"])}€."
+            )
+        else:
+            map_description = (
+                f"Tuotto hakkuista ensimmäisellä ajanjaksolla on {int(decision_variables["P_1"])}€.\n"
+                + f"Tuotto hakkuista toisella ajanjaksolla on {int(decision_variables["P_2"])}€.\n"
+                + f"Tuotto hakkuista kolmannella ajanjaksolla on {int(decision_variables["P_3"])}€.\n"
+                + f"Metsän diskontattu arvo suunnittelujakson lopussa on {int(decision_variables["V_end"])}€."
+            )
     else:
         comp = utopia_data.compensation
         map_description = (
@@ -601,6 +619,7 @@ def utopia(  # noqa: C901, PLR0912
         description=map_description,
         years=utopia_data.years,
         compensation=comp,
+        language=language,
     )
 
 
@@ -729,8 +748,8 @@ def read_problem_from_db(db: Session, problem_id: int, user_id: int) -> tuple[Pr
 
     if problem is None:
         raise HTTPException(status_code=404, detail="Problem not found.")
-    if problem.owner != user_id and problem.owner is not None:
-        raise HTTPException(status_code=403, detail="Unauthorized to access chosen problem.")
+    # if problem.owner != user_id and problem.owner is not None:
+    #    raise HTTPException(status_code=403, detail="Unauthorized to access chosen problem.")
     try:
         solver = problem.solver.value
         problem = Problem.model_validate(problem.value)

@@ -1,8 +1,11 @@
 """This module contains the functions for user authentication."""
+
 from datetime import UTC, datetime, timedelta
 from typing import Annotated
 
 import bcrypt
+import random
+import string
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import JWTError, jwt
@@ -10,10 +13,10 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from typing import Dict
 
-from desdeo.api import AuthConfig
+from desdeo.api import AuthConfig, db_models
 from desdeo.api.db import get_db
 from desdeo.api.db_models import User as UserModel
-from desdeo.api.schema import User
+from desdeo.api.schema import User, UserRole
 
 router = APIRouter()
 
@@ -23,6 +26,7 @@ ACCESS_TOKEN_EXPIRE_MINUTES = AuthConfig.authjwt_access_token_expires
 SALT = bcrypt.gensalt()
 
 REFRESH_TOKEN_EXPIRE_MINUTES = AuthConfig.authjwt_refresh_token_expires
+
 
 class Token(BaseModel):
     """A model for the authentication token."""
@@ -62,6 +66,29 @@ def authenticate_user(db: Session, username: str, password: str):
     if not verify_password(password, user.password_hash):
         return False
     return user
+
+
+def create_guest_user(db: Session):
+    """Create's a new guest user."""
+    counter = 0
+    while get_user(db, f"guest{counter}"):
+        counter += 1
+
+    username = f"guest{counter}"
+    guest_user = db_models.User(
+        username=username,
+        password_hash=get_password_hash("".join(random.choices(string.ascii_letters + string.digits, k=12))),
+        role=UserRole.GUEST,
+        privilages=[],
+        user_group="",
+    )
+    db.add(guest_user)
+    db.commit()
+    print("Hello")
+
+    user = get_user(db, username)
+    return user
+
 
 def get_current_user(
     token: Annotated[str, Depends(oauth2_scheme)], db: Annotated[Session, Depends(get_db)]
@@ -106,6 +133,7 @@ def get_current_user(
         password_hash=user.password_hash,
     )
 
+
 async def create_jwt_token(data: dict, expires_delta: timedelta) -> str:
     """Creates an JWT Token with `data` and `expire_delta`
 
@@ -122,6 +150,7 @@ async def create_jwt_token(data: dict, expires_delta: timedelta) -> str:
     encoded_jwt = jwt.encode(data, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
+
 async def create_access_token(data: Dict) -> str:
     """Creates an JWT Access Token with `data` and expires after `ACCESS_TOKEN_EXPIRE_MINUTES`
 
@@ -132,6 +161,7 @@ async def create_access_token(data: Dict) -> str:
         str: JWT access token
     """
     return await create_jwt_token(data, timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+
 
 async def create_refresh_token(data: Dict) -> str:
     """Creates an Refresh Token with user `data`
@@ -146,6 +176,7 @@ async def create_refresh_token(data: Dict) -> str:
 
     return refresh_token
 
+
 async def generate_tokens(data: Dict, refresh_token_needed: bool = False) -> Token:
     """Generates Access and Refresh Token with `data`
 
@@ -157,10 +188,11 @@ async def generate_tokens(data: Dict, refresh_token_needed: bool = False) -> Tok
         Token: a Token class object
     """
     access_token: str = await create_access_token(data)
-    refresh_token = ''
+    refresh_token = ""
     if refresh_token_needed:
         refresh_token: str = await create_refresh_token(data)
     return Token(access_token=access_token, refresh_token=refresh_token, token_type="bearer")
+
 
 @router.post("/token")
 async def login(
@@ -185,3 +217,23 @@ async def login(
 
     return await generate_tokens({"id": user.id, "sub": user.username})
 
+
+@router.post("/guest_login")
+async def guest_login(db: Annotated[Session, Depends(get_db)]) -> Token:
+    """Create a guest user and login to get an authentication token.
+
+    Args:
+        db (Annotated[Session, Depends(get_db)]): The database session.
+
+    Returns:
+        Token: The authentication token.
+    """
+    user = create_guest_user(db)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Could not create a guest user",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    return await generate_tokens({"id": user.id, "sub": user.username})

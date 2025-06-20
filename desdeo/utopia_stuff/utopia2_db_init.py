@@ -146,6 +146,55 @@ for name in fo_dict:
         db.add(reference_solution)
 
     db.commit()
+# Create an extra problem for a guest user
+name = "leskela"
+compensation = 0
+print("guest")
+
+problem, schedule_dict = problem_CO2(
+    data_dir=fo_dict[name]["data_folder"],
+    problem_name="Forest problem",
+    compensation=compensation,
+    discounting_factor=discounting_factor,
+    language="en",
+)
+problem_in_db = db_models.Problem(
+    owner=None,
+    name="Forest problem",
+    kind=ProblemKind.CONTINUOUS,
+    obj_kind=ObjectiveKind.ANALYTICAL,
+    role_permission=[UserRole.GUEST],
+    solver=Solvers.GUROBIPY,
+    presumed_ideal=problem.get_ideal_point(),
+    presumed_nadir=problem.get_nadir_point(),
+    value=problem.model_dump(mode="json"),
+)
+db.add(problem_in_db)
+db.commit()
+db.refresh(problem_in_db)
+
+# The info about the map and decision alternatives now goes into the database
+with open(fo_dict[name]["mapjson"]) as f:  # noqa: PTH123
+    forest_map = f.read()
+map_info = db_models.Utopia(
+    problem=problem_in_db.id,
+    map_json=forest_map,
+    schedule_dict=schedule_dict,
+    years=["5", "10", "20"],
+    stand_id_field=fo_dict[name]["stand_id"],
+    stand_descriptor=_generate_descriptions(
+        json.loads(forest_map),
+        fo_dict[name]["stand_id"],
+        fo_dict[name]["stand_descriptor"],
+        fo_dict[name]["holding_descriptor"],
+        fo_dict[name]["extension"],
+    ),
+    compensation=compensation,
+    language="en",
+)
+db.add(map_info)
+
+db.commit()
 
 # Extra problem ends here
 
