@@ -154,3 +154,17 @@ workshop_all_solutions.csv
 workshop_final_solutions.csv
 workshop_results.csv
 workshop_saved_solutions.csv
+tsrmoo/figures/pcp_harvest5_harvest25.png
+tsrmoo/figures/pcp_harvest5_npv.png
+tsrmoo/figures/pcp_harvest5_stock.png
+tsrmoo/figures/pcp_harvest25_npv.png
+tsrmoo/figures/pcp_harvest25_stock.png
+tsrmoo/figures/pcp_npv_stock.png
+tsrmoo/figures/scatter_harvest5_harvest25.png
+tsrmoo/figures/scatter_harvest5_npv.png
+tsrmoo/figures/scatter_harvest5_stock.png
+tsrmoo/figures/scatter_harvest25_npv.png
+tsrmoo/figures/scatter_harvest25_stock.png
+tsrmoo/figures/scatter_npv_stock.png
+tsrmoo/figures/something_harvest5_npv.png
+tsrmoo/figures/something_npv_stock.png
