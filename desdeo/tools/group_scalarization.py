@@ -1008,6 +1008,20 @@ def add_group_nimbus_compromise(  # noqa: PLR0913
                     target = np.median(group_classification[_symbol][1])
                     max_expr = f"{weights[_symbol]} * ({_symbol}_min - {target})"
                     max_args.append(max_expr)
+                    con_expr = f"{_symbol}_min - {corrected_current_point[_symbol]} - {
+                        (nadir_point[_symbol] - ideal_point[_symbol]) / 20
+                    }"
+                    constraints.append(
+                        Constraint(
+                            name=f"improvement constraint for {_symbol}",
+                            symbol=f"{_symbol}_lt",
+                            func=con_expr,
+                            cons_type=ConstraintTypeEnum.LTE,
+                            is_linear=problem.is_linear,
+                            is_convex=problem.is_convex,
+                            is_twice_differentiable=problem.is_twice_differentiable,
+                        )
+                    )
                 else:
                     con_expr = f"{_symbol}_min - {corrected_current_point[_symbol]}"
                     constraints.append(
@@ -1280,6 +1294,20 @@ def add_group_nimbus_compromise_diff(  # noqa: PLR0913
                             name=f"Max term linearization for {_symbol}",
                             symbol=f"max_con_{_symbol}",
                             func=max_expr,
+                            cons_type=ConstraintTypeEnum.LTE,
+                            is_linear=problem.is_linear,
+                            is_convex=problem.is_convex,
+                            is_twice_differentiable=problem.is_twice_differentiable,
+                        )
+                    )
+                    con_expr = f"{_symbol}_min - {corrected_current_point[_symbol]} - {
+                        (nadir_point[_symbol] - ideal_point[_symbol]) / 20
+                    }"
+                    constraints.append(
+                        Constraint(
+                            name=f"improvement constraint for {_symbol}",
+                            symbol=f"{_symbol}_lt",
+                            func=con_expr,
                             cons_type=ConstraintTypeEnum.LTE,
                             is_linear=problem.is_linear,
                             is_convex=problem.is_convex,
