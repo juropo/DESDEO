@@ -1,5 +1,5 @@
 [settings]
-# This is ignored if $DESDEO_PRODUCTION env variable is present
+# This can be overridden with $DEBUG env variable
 debug = true
 
 # development configs
@@ -32,7 +32,7 @@ cookie_domain = "" # Not needed for testing
 # authjwt_secret_key = $AUTHJWT_SECRET
 authjwt_algorithm = "HS256"
 authjwt_access_token_expires = 15  # in minutes
-authjwt_refresh_token_expires = 30 # in minutes
+authjwt_refresh_token_expires = 300 # in minutes
 # These are not that sensitive info but read from env regardless
 # cors_origins = $CORS_ORIGINS
 # cookie_domain = $COOKIE_DOMAIN
