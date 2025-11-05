@@ -410,7 +410,7 @@ def add_group_asf_diff(
     if agg_bounds is not None:
         bounds = flip_maximized_objective_values(problem, agg_bounds)
         for obj in problem.objectives:
-            expr = f"({obj.symbol}_min - {bounds[obj.symbol]} - _alpha)"
+            expr = f"({obj.symbol}_min - {bounds[obj.symbol]})"
             constraints.append(
                 Constraint(
                     name=f"Constraint bound for {obj.symbol}",
@@ -563,7 +563,7 @@ def add_group_asf_agg_diff(
     if agg_bounds is not None:
         bounds = flip_maximized_objective_values(problem, agg_bounds)
         for obj in problem.objectives:
-            expr = f"({obj.symbol}_min - {bounds[obj.symbol]} - _alpha)"
+            expr = f"({obj.symbol}_min - {bounds[obj.symbol]})"
             constraints.append(
                 Constraint(
                     name=f"Constraint bound for {obj.symbol}",
@@ -1237,9 +1237,11 @@ def add_group_nimbus_compromise_diff(  # noqa: PLR0913
         match group_classification[_symbol][0]:
             case "improve":
                 # Take the most ambitious target among the group (could be changed to something else as well)
-                target = (
+                """target = (
                     -max(group_classification[_symbol][1]) if obj.maximize else min(group_classification[_symbol][1])
-                )
+                )"""
+                # Take the median target from the group (could be changed to something else as well)
+                target = np.median(group_classification[_symbol][1])
                 if target < corrected_current_point[_symbol]:
                     max_expr = f"{weights[_symbol]} * ({_symbol}_min - {target}) - _alpha"
                     constraints.append(
@@ -1300,7 +1302,7 @@ def add_group_nimbus_compromise_diff(  # noqa: PLR0913
                             is_twice_differentiable=problem.is_twice_differentiable,
                         )
                     )
-                    con_expr = f"{_symbol}_min - {corrected_current_point[_symbol]} - {
+                    """con_expr = f"{_symbol}_min - {corrected_current_point[_symbol]} - {
                         (nadir_point[_symbol] - ideal_point[_symbol]) / 20
                     }"
                     constraints.append(
@@ -1313,7 +1315,7 @@ def add_group_nimbus_compromise_diff(  # noqa: PLR0913
                             is_convex=problem.is_convex,
                             is_twice_differentiable=problem.is_twice_differentiable,
                         )
-                    )
+                    )"""
                 else:
                     con_expr = f"{_symbol}_min - {corrected_current_point[_symbol]}"
                     constraints.append(
@@ -2198,7 +2200,7 @@ def add_group_stom_diff(
     if agg_bounds is not None:
         bounds = flip_maximized_objective_values(problem, agg_bounds)
         for obj in problem.objectives:
-            expr = f"({obj.symbol}_min - {bounds[obj.symbol]} -_alpha)"
+            expr = f"({obj.symbol}_min - {bounds[obj.symbol]})"
             constraints.append(
                 Constraint(
                     name=f"Constraint bound for {obj.symbol}",
@@ -2347,7 +2349,7 @@ def add_group_stom_agg_diff(
     if agg_bounds is not None:
         bounds = flip_maximized_objective_values(problem, agg_bounds)
         for obj in problem.objectives:
-            expr = f"({obj.symbol}_min - {bounds[obj.symbol]} -_alpha)"
+            expr = f"({obj.symbol}_min - {bounds[obj.symbol]})"
             constraints.append(
                 Constraint(
                     name=f"Constraint bound for {obj.symbol}",
