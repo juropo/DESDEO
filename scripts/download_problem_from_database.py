@@ -1,6 +1,10 @@
-"""This module adds a group for a forest problem.
+"""Downloads a desdeo problem from the database and saves it as json.
 
-The forest problem must already exist in the database.
+This script downloads a desdeo problem from the database defined by the environment variables and saves it to a file
+called "utopia_forest.json".
+
+Takes as an argument a path to a json-file that should have the fields owner and problem representing the owner of the
+problem and problem name respectively.
 """
 
 import argparse
@@ -9,22 +13,16 @@ import os
 import sys
 from pathlib import Path
 
-from sqlmodel import create_engine, Session, select
+from sqlmodel import Session, create_engine, select
 
-from desdeo.api.models import Group, ProblemDB, User, UserRole
-
+from desdeo.api.models import ProblemDB, User
 from desdeo.problem import Problem
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "-f", dest="filename", help="Path to file containing group members and their passwords", type=str
-    )
     parser.add_argument("-g", dest="groupfilename", help="Path to file containing info about the problem", type=str)
     args = parser.parse_args(args=None if sys.argv[1:] else ["--help"])
 
-    filename = args.filename
     groupfile = args.groupfilename
 
     # Have these environment variables!
@@ -39,9 +37,6 @@ if __name__ == "__main__":
 
     with Path.open(groupfile) as file:
         groupinfo = json.load(file)
-
-    with Path.open(filename) as file:
-        user_content = json.load(file)
 
     print("Loaded user and group info")
 

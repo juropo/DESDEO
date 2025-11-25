@@ -1,10 +1,12 @@
+"""Downloads the entire database specified by the environment variables to the folder defined by filepath variable."""
+
 import os
 
 import pandas
-from sqlmodel import create_engine
 from sqlalchemy import text
+from sqlmodel import create_engine
 
-filepath = "c:/MyTemp/data/testbackup/"
+filepath = "c:/MyTemp/data/group_nimbus_experiment/"
 
 
 DB_USER = os.getenv("DB_USER")
@@ -39,9 +41,3 @@ for table in tables:
             continue
 
         df.to_csv(f"{filepath}{table}.csv", sep=";", index=False)
-        # conn.commit()
-
-"""    fake_conn = engine.raw_connection()
-    fake_cur = fake_conn.cursor()
-    fake_cur.copy_expert(copy_sql, dbcopy_f)
-    fake_conn.commit()"""
