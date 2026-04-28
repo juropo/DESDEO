@@ -632,12 +632,12 @@ class MathParser:
             )
             raise NotImplementedError(msg)
 
-        def _gurobipy_random_access(*args):
-            msg = (
-                "Tensor random access with 'At' has not been implemented for the Gurobipy parser yet. "
-                "Feel free to contribute!"
-            )
-            raise NotImplementedError(msg)
+        def _gurobipy_random_access(indexed, *indices):
+            # 1-based indexing assumed in JSON format; convert to 0-based for Python/numpy/gp.MVar
+            zero_based = tuple(int(i) - 1 for i in indices)
+            if len(zero_based) == 1:
+                return indexed[zero_based[0]]
+            return indexed[zero_based]
 
         gurobipy_env = {
             # Define the operations for the different operators.
