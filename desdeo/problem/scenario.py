@@ -174,6 +174,8 @@ class ScenarioModel(BaseModel):
         valid_variables = (
             {var.symbol for var in base_problem.variables} if base_problem and base_problem.variables else set()
         )
+        # Pool variables (added to scenarios) are also valid anticipation targets.
+        valid_variables |= {var.symbol for var in data.get("variables", ())}
 
         for node, symbols in v.items():
             if node not in valid_nodes:
@@ -182,7 +184,7 @@ class ScenarioModel(BaseModel):
                 if symbol not in valid_variables:
                     raise ValueError(
                         f"Variable symbol '{symbol}' in anticipation_stop['{node}'] "
-                        "not found in base_problem variables."
+                        "not found in base_problem variables or the variable pool."
                     )
         return v
 
