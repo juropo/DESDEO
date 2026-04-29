@@ -130,24 +130,33 @@ def add_expected_value(
         if per_leaf is None:
             raise ValueError(f"Symbol '{sym}' not found in the combined problem.")
 
-        terms = [["Multiply", weights[leaf], per_leaf[leaf]] for leaf in weights]
-        expected_expr = terms[0] if len(terms) == 1 else ["Add", *terms]
         expected_sym = f"{prefix}{sym}"
         added_symbols[sym] = expected_sym
 
-        # Look up a representative per-leaf element to copy differentiability flags.
-        # A weighted sum inherits differentiability/linearity/convexity from its terms.
-        first_leaf_sym = per_leaf[next(iter(weights))]
+        # Variables and constants are direct values; everything else (objectives,
+        # extra_funcs, scalarization_funcs, constraints) is a computed expression
+        # whose func must be inlined rather than referenced by symbol.
+        _func_bearing = {"objectives", "extra_funcs", "scalarization_funcs", "constraints"}
         elem_lists = {
             "objectives": combined.objectives,
             "scalarization_funcs": combined.scalarization_funcs,
             "extra_funcs": combined.extra_funcs,
             "constraints": combined.constraints,
         }
-        ref_elem = next(
-            (e for e in (elem_lists.get(found_type) or []) if e.symbol == first_leaf_sym),
-            None,
-        )
+        elem_list = elem_lists.get(found_type) or []
+
+        if found_type in _func_bearing:
+            terms = [
+                ["Multiply", weights[leaf],
+                 next((e.func for e in elem_list if e.symbol == per_leaf[leaf]), per_leaf[leaf])]
+                for leaf in weights
+            ]
+        else:
+            terms = [["Multiply", weights[leaf], per_leaf[leaf]] for leaf in weights]
+        expected_expr = terms[0] if len(terms) == 1 else ["Add", *terms]
+
+        first_leaf_sym = per_leaf[next(iter(weights))]
+        ref_elem = next((e for e in elem_list if e.symbol == first_leaf_sym), None)
         is_linear = ref_elem.is_linear if ref_elem is not None else False
         is_convex = ref_elem.is_convex if ref_elem is not None else False
         is_twice_diff = ref_elem.is_twice_differentiable if ref_elem is not None else False
@@ -268,8 +277,9 @@ def add_conditional_value_at_risk(
             "extra_funcs": combined.extra_funcs,
             "constraints": combined.constraints,
         }
+        elem_list = elem_lists.get(found_type) or []
         ref_elem = next(
-            (e for e in (elem_lists.get(found_type) or []) if e.symbol == first_leaf_sym),
+            (e for e in elem_list if e.symbol == first_leaf_sym),
             None,
         )
         is_linear = ref_elem.is_linear if ref_elem is not None else False
@@ -310,7 +320,9 @@ def add_conditional_value_at_risk(
             )
 
             # z_s >= sym_s - eta  ->  sym_s - eta - z_s <= 0
-            constraint_func = ["Add", leaf_sym, ["Negate", var_sym], ["Negate", z_sym]]
+            # Use the func expression of the per-leaf element rather than its symbol.
+            leaf_func = next((e.func for e in elem_list if e.symbol == leaf_sym), leaf_sym)
+            constraint_func = ["Add", leaf_func, ["Negate", var_sym], ["Negate", z_sym]]
 
             new_constraints.append(
                 Constraint(
