@@ -25,7 +25,7 @@ def generate_summer_cabin_electricity_data():  # noqa: C901
     """Generates synthetic hourly electricity load and temperature data for a summer cabin from June 1 to August 31."""
     rng = np.random.default_rng(6969)
 
-    time_index = pd.date_range("2025-06-01", "2025-08-31 23:00", freq="H")
+    time_index = pd.date_range("2025-06-01", "2025-08-31 23:00", freq="h")
 
     # --- Temperature model ---
     def seasonal_temp(ts):
@@ -673,7 +673,7 @@ _M_UNMET = 15.0  # kWh upper bound for big-M constraints (exceeds any single-hou
 _N_OUTAGE_HRS = 4  # hours of grid outage at the start of the affected segment
 
 
-def summer_cabin_battery_problem_split_scenario(  # noqa: C901
+def summer_cabin_battery_problem_split_scenario(
     initial_soc: float = 0.0,
     n_panels_max: int = 50,
 ) -> ScenarioModel:
@@ -712,54 +712,34 @@ def summer_cabin_battery_problem_split_scenario(  # noqa: C901
     base = summer_cabin_battery_problem_split(initial_soc=initial_soc, n_panels_max=n_panels_max)
     H = _N_OUTAGE_HRS
 
-    # ------------------------------------------------------------------ #
-    # Variable pool
-    # indices 0..3   : unmet_s2_1..4
-    # indices 4..7   : unmet_s3_1..4
-    # indices 8..11  : z_s2_1..4
-    # indices 12..15 : z_s3_1..4
-    #
-    # For segment k: unmet at (k-2)*H + (t-1), z at 2*H + (k-2)*H + (t-1)
-    # ------------------------------------------------------------------ #
     var_pool: list[Variable] = []
+    var_idx: dict[str, int] = {}
+
     for k in (2, 3):
         for t in range(1, H + 1):
-            var_pool.append(
-                Variable(
-                    name=f"Unmet demand s{k} t={t} (kWh)",
-                    symbol=f"unmet_s{k}_{t}",
-                    variable_type=VariableTypeEnum.real,
-                    lowerbound=0.0,
-                    upperbound=None,
-                    initial_value=0.0,
-                )
+            v = Variable(
+                name=f"Unmet demand s{k} t={t} (kWh)",
+                symbol=f"unmet_s{k}_{t}",
+                variable_type=VariableTypeEnum.real,
+                lowerbound=0.0,
+                upperbound=None,
+                initial_value=0.0,
             )
+            var_idx[v.symbol] = len(var_pool)
+            var_pool.append(v)
     for k in (2, 3):
         for t in range(1, H + 1):
-            var_pool.append(
-                Variable(
-                    name=f"Demand unserved indicator s{k} t={t}",
-                    symbol=f"z_s{k}_{t}",
-                    variable_type=VariableTypeEnum.binary,
-                    lowerbound=0,
-                    upperbound=1,
-                    initial_value=0,
-                )
+            v = Variable(
+                name=f"Demand unserved indicator s{k} t={t}",
+                symbol=f"z_s{k}_{t}",
+                variable_type=VariableTypeEnum.binary,
+                lowerbound=0,
+                upperbound=1,
+                initial_value=0,
             )
+            var_idx[v.symbol] = len(var_pool)
+            var_pool.append(v)
 
-    def _seg_vars(k: int) -> dict[str, int]:
-        """Variable pool indices for outage variables of segment k."""
-        return {
-            **{f"unmet_s{k}_{t}": (k - 2) * H + (t - 1) for t in range(1, H + 1)},
-            **{f"z_s{k}_{t}": 2 * H + (k - 2) * H + (t - 1) for t in range(1, H + 1)},
-        }
-
-    # ------------------------------------------------------------------ #
-    # Objective pool
-    # index 0: f_3 = Sum(z_s2)          — S2a
-    # index 1: f_3 = Sum(z_s3)          — S1b
-    # index 2: f_3 = Sum(z_s2 + z_s3)   — S2b
-    # ------------------------------------------------------------------ #
     def _f3(segments: tuple[int, ...]) -> Objective:
         z_syms = [f"z_s{k}_{t}" for k in segments for t in range(1, H + 1)]
         return Objective(
@@ -773,115 +753,97 @@ def summer_cabin_battery_problem_split_scenario(  # noqa: C901
             is_twice_differentiable=True,
         )
 
-    _f3_zero = Objective(
-        name="Hours with unserved electricity demand",
-        symbol="f_3",
-        func=["Multiply", 0, "y"],  # always 0 — no outage possible in this scenario
-        unit="h",
-        maximize=False,
-        is_linear=True,
-        is_convex=True,
-        is_twice_differentiable=True,
+    obj_pool: list[Objective] = []
+    obj_idx: dict[str, int] = {}  # scenario name → pool index
+    for scenario_name, segs in [("S2a", (2,)), ("S1b", (3,)), ("S2b", (2, 3))]:
+        obj_idx[scenario_name] = len(obj_pool)
+        obj_pool.append(_f3(segs))
+    obj_idx["S1a"] = len(obj_pool)
+    obj_pool.append(
+        Objective(
+            name="Hours with unserved electricity demand",
+            symbol="f_3",
+            func=["Multiply", 0, "y"],  # always 0 — no outage possible in this scenario
+            unit="h",
+            maximize=False,
+            is_linear=True,
+            is_convex=True,
+            is_twice_differentiable=True,
+        )
     )
-    obj_pool: list[Objective] = [_f3((2,)), _f3((3,)), _f3((2, 3)), _f3_zero]
-    _f3_idx = {(2,): 0, (3,): 1, (2, 3): 2}
 
-    # ------------------------------------------------------------------ #
-    # Constraint pool
-    # indices 0..3   : energy_bal_s2_1..4  (replace — same symbol)
-    # indices 4..7   : energy_bal_s3_1..4  (replace — same symbol)
-    # indices 8..11  : bigm_s2_1..4        (new)
-    # indices 12..15 : bigm_s3_1..4        (new)
-    # indices 16..19 : outage_buy_s2_1..4  (new)
-    # indices 20..23 : outage_sell_s2_1..4 (new)
-    # indices 24..27 : outage_buy_s3_1..4  (new)
-    # indices 28..31 : outage_sell_s3_1..4 (new)
-    #
-    # For segment k: eb at (k-2)*H+(t-1), bigm at 2*H+(k-2)*H+(t-1),
-    #                outage_buy at 4*H+(k-2)*2*H+(t-1),
-    #                outage_sell at 4*H+(k-2)*2*H+H+(t-1)
-    # ------------------------------------------------------------------ #
     con_pool: list[Constraint] = []
-
-    for k in (2, 3):
-        sk = f"s{k}"
-        for t in range(1, H + 1):
-            con_pool.append(
-                Constraint(
-                    name=f"Energy balance s{k} t={t} (with unmet slack)",
-                    symbol=f"energy_bal_{sk}_{t}",
-                    func=[
-                        "Add",
-                        ["At", f"buy_{sk}", t],
-                        ["Negate", ["At", f"sell_{sk}", t]],
-                        ["At", f"d_{sk}", t],
-                        ["Negate", ["At", f"c_{sk}", t]],
-                        ["Multiply", "n", ["At", f"sol_{sk}", t]],
-                        f"unmet_{sk}_{t}",
-                        ["Negate", ["At", f"l_{sk}", t]],
-                    ],
-                    cons_type=ConstraintTypeEnum.EQ,
-                    is_linear=True,
-                    is_convex=True,
-                    is_twice_differentiable=True,
-                )
-            )
+    con_idx: dict[str, int] = {}
 
     for k in (2, 3):
         for t in range(1, H + 1):
-            con_pool.append(
-                Constraint(
-                    name=f"Big-M unmet indicator s{k} t={t}",
-                    symbol=f"bigm_s{k}_{t}",
-                    func=["Add", f"unmet_s{k}_{t}", ["Negate", ["Multiply", _M_UNMET, f"z_s{k}_{t}"]]],
-                    cons_type=ConstraintTypeEnum.LTE,
-                    is_linear=True,
-                    is_convex=True,
-                    is_twice_differentiable=True,
-                )
+            c = Constraint(
+                name=f"Energy balance s{k} t={t} (with unmet slack)",
+                symbol=f"energy_bal_s{k}_{t}",
+                func=[
+                    "Add",
+                    ["At", f"buy_s{k}", t],
+                    ["Negate", ["At", f"sell_s{k}", t]],
+                    ["At", f"d_s{k}", t],
+                    ["Negate", ["At", f"c_s{k}", t]],
+                    ["Multiply", "n", ["At", f"sol_s{k}", t]],
+                    f"unmet_s{k}_{t}",
+                    ["Negate", ["At", f"l_s{k}", t]],
+                ],
+                cons_type=ConstraintTypeEnum.EQ,
+                is_linear=True,
+                is_convex=True,
+                is_twice_differentiable=True,
             )
+            con_idx[c.symbol] = len(con_pool)
+            con_pool.append(c)
 
     for k in (2, 3):
-        sk = f"s{k}"
         for t in range(1, H + 1):
-            con_pool.append(
-                Constraint(
-                    name=f"Outage no-buy s{k} t={t}",
-                    symbol=f"outage_buy_{sk}_{t}",
-                    func=["At", f"buy_{sk}", t],
-                    cons_type=ConstraintTypeEnum.EQ,
-                    is_linear=True,
-                    is_convex=True,
-                    is_twice_differentiable=True,
-                )
+            c = Constraint(
+                name=f"Big-M unmet indicator s{k} t={t}",
+                symbol=f"bigm_s{k}_{t}",
+                func=["Add", f"unmet_s{k}_{t}", ["Negate", ["Multiply", _M_UNMET, f"z_s{k}_{t}"]]],
+                cons_type=ConstraintTypeEnum.LTE,
+                is_linear=True,
+                is_convex=True,
+                is_twice_differentiable=True,
             )
+            con_idx[c.symbol] = len(con_pool)
+            con_pool.append(c)
+
+    for k in (2, 3):
         for t in range(1, H + 1):
-            con_pool.append(
-                Constraint(
-                    name=f"Outage no-sell s{k} t={t}",
-                    symbol=f"outage_sell_{sk}_{t}",
-                    func=["At", f"sell_{sk}", t],
-                    cons_type=ConstraintTypeEnum.EQ,
-                    is_linear=True,
-                    is_convex=True,
-                    is_twice_differentiable=True,
-                )
+            c = Constraint(
+                name=f"Outage no-trade s{k} t={t}",
+                symbol=f"outage_trade_s{k}_{t}",
+                func=["Add", ["At", f"buy_s{k}", t], ["At", f"sell_s{k}", t]],
+                cons_type=ConstraintTypeEnum.EQ,
+                is_linear=True,
+                is_convex=True,
+                is_twice_differentiable=True,
             )
+            con_idx[c.symbol] = len(con_pool)
+            con_pool.append(c)
 
-    def _seg_cons(k: int) -> dict[str, int]:
-        """Constraint pool indices for all outage-related constraints of segment k."""
-        return {
-            **{f"energy_bal_s{k}_{t}": (k - 2) * H + (t - 1) for t in range(1, H + 1)},
-            **{f"bigm_s{k}_{t}": 2 * H + (k - 2) * H + (t - 1) for t in range(1, H + 1)},
-            **{f"outage_buy_s{k}_{t}": 4 * H + (k - 2) * 2 * H + (t - 1) for t in range(1, H + 1)},
-            **{f"outage_sell_s{k}_{t}": 4 * H + (k - 2) * 2 * H + H + (t - 1) for t in range(1, H + 1)},
-        }
+    _outage_segs: dict[str, tuple[int, ...]] = {"S1a": (), "S2a": (2,), "S1b": (3,), "S2b": (2, 3)}
 
-    def _scenario(outage_segs: tuple[int, ...]) -> Scenario:
+    def _scenario(name: str) -> Scenario:
+        segs = _outage_segs[name]
         return Scenario(
-            variables={k: v for d in [_seg_vars(k) for k in outage_segs] for k, v in d.items()},
-            objectives={"f_3": _f3_idx[outage_segs]},
-            constraints={k: v for d in [_seg_cons(k) for k in outage_segs] for k, v in d.items()},
+            variables={
+                sym: var_idx[sym]
+                for k in segs
+                for t in range(1, H + 1)
+                for sym in [f"unmet_s{k}_{t}", f"z_s{k}_{t}"]
+            },
+            objectives={"f_3": obj_idx[name]},
+            constraints={
+                sym: con_idx[sym]
+                for k in segs
+                for t in range(1, H + 1)
+                for sym in [f"energy_bal_s{k}_{t}", f"bigm_s{k}_{t}", f"outage_trade_s{k}_{t}"]
+            },
         )
 
     s1_sched = ["c_s1", "d_s1", "soc_s1", "buy_s1", "sell_s1"]
@@ -894,10 +856,6 @@ def summer_cabin_battery_problem_split_scenario(  # noqa: C901
             "ROOT": ["S1", "S2"],
             "S1": ["S1a", "S1b"],
             "S2": ["S2a", "S2b"],
-            "S1a": [],
-            "S1b": [],
-            "S2a": [],
-            "S2b": [],
         },
         scenario_probabilities={
             "S1": 0.9,
@@ -912,10 +870,10 @@ def summer_cabin_battery_problem_split_scenario(  # noqa: C901
         objectives=tuple(obj_pool),
         constraints=tuple(con_pool),
         scenarios={
-            "S1a": Scenario(objectives={"f_3": 3}),
-            "S1b": _scenario((3,)),
-            "S2a": _scenario((2,)),
-            "S2b": _scenario((2, 3)),
+            "S1a": _scenario("S1a"),
+            "S2a": _scenario("S2a"),
+            "S1b": _scenario("S1b"),
+            "S2b": _scenario("S2b"),
         },
         anticipation_stop={
             "ROOT": ["y", "E", "n", *s1_sched],

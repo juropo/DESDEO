@@ -76,9 +76,19 @@ class ScenarioModel(BaseModel):
     @field_validator("scenario_tree", mode="before")
     @classmethod
     def coerce_list_to_tree(cls, v):
-        """Convert a flat list of scenario names to {'ROOT': [...]}."""
+        """Normalise the scenario tree input.
+
+        - A flat list of names is converted to ``{'ROOT': [...], name: [], ...}``.
+        - A dict may omit leaf nodes (nodes that appear as children but have no
+          own entry).  Missing entries are auto-inserted with an empty child list.
+        """
         if isinstance(v, list):
             return {"ROOT": v, **{name: [] for name in v}}
+        if isinstance(v, dict):
+            all_children = {child for children in v.values() for child in children}
+            missing_leaves = all_children - set(v)
+            if missing_leaves:
+                return {**v, **{name: [] for name in missing_leaves}}
         return v
 
     scenario_probabilities: dict[str, float] = Field(

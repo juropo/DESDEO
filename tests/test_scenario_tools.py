@@ -383,10 +383,22 @@ def test_expected_asf_uses_scenario_probabilities(asf_result):
     ef = next(s for s in problem.scalarization_funcs or [] if s.symbol == "E_asf")
     func = ef.func
     assert func[0] == "Add"
-    terms = {term[2]: term[1] for term in func[1:]}
-    assert terms["s_1_asf"] == pytest.approx(0.2)
-    assert terms["s_2_asf"] == pytest.approx(0.3)
-    assert terms["s_3_asf"] == pytest.approx(0.5)
+    # Each term is ["Multiply", weight, <inlined ASF expression>].
+    # Match by the per-leaf _alpha symbol embedded in the expression.
+    def find_alpha(node):
+        if isinstance(node, str) and node.endswith("_alpha"):
+            return node
+        if isinstance(node, list):
+            for child in node:
+                result = find_alpha(child)
+                if result:
+                    return result
+        return None
+
+    weights_by_leaf = {find_alpha(term[2]).removesuffix("__alpha"): term[1] for term in func[1:]}
+    assert weights_by_leaf["s_1"] == pytest.approx(0.2)
+    assert weights_by_leaf["s_2"] == pytest.approx(0.3)
+    assert weights_by_leaf["s_3"] == pytest.approx(0.5)
 
 
 # ---------------------------------------------------------------------------
