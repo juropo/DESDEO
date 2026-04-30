@@ -607,16 +607,9 @@ class MathParser:
                     a = np.array(a)
                 if isinstance(b, list):
                     b = np.array(b)
-                if len(np.shape(a @ b)) == 1:
-                    return a @ b
-                return (a @ b).sum()
+                return a @ b
 
             return reduce(_matmul, args)
-            msg = (
-                "Matrix multiplication '@' has not been implemented for the Gurobipy parser yet."
-                " Feel free to contribute!"
-            )
-            raise NotImplementedError(msg)
 
         def _gurobipy_summation(summand):
             """Gurobipy matrix summation."""

@@ -440,49 +440,84 @@ def summer_cabin_battery_problem_split(initial_soc: float = 0.0, n_panels_max: i
     )
 
     # --- Per-segment variables and constants ---
-    seg_vars = []    # seg_vars[k-1] = [charge_k, discharge_k, soc_k, buy_k, sell_k]
+    seg_vars = []  # seg_vars[k-1] = [charge_k, discharge_k, soc_k, buy_k, sell_k]
     seg_consts = []  # seg_consts[k-1] = [price_k, load_k, solar_k]
 
     for k in range(1, N_SEG + 1):
         sl = slice((k - 1) * S, k * S)
         sk = f"s{k}"
 
-        seg_vars.append([
-            TensorVariable(
-                name=f"Charging power segment {k} (kW)", symbol=f"c_{sk}", shape=[S],
-                variable_type=VariableTypeEnum.real, lowerbounds=0.0, upperbounds=10.0, initial_values=0.0,
-            ),
-            TensorVariable(
-                name=f"Discharging power segment {k} (kW)", symbol=f"d_{sk}", shape=[S],
-                variable_type=VariableTypeEnum.real, lowerbounds=0.0, upperbounds=10.0, initial_values=0.0,
-            ),
-            TensorVariable(
-                name=f"State of charge segment {k} (kWh)", symbol=f"soc_{sk}", shape=[S],
-                variable_type=VariableTypeEnum.real, lowerbounds=0.0, upperbounds=42.0, initial_values=initial_soc,
-            ),
-            TensorVariable(
-                name=f"Grid purchased segment {k} (kWh/h)", symbol=f"buy_{sk}", shape=[S],
-                variable_type=VariableTypeEnum.real, lowerbounds=0.0, upperbounds=None, initial_values=0.0,
-            ),
-            TensorVariable(
-                name=f"Grid sold segment {k} (kWh/h)", symbol=f"sell_{sk}", shape=[S],
-                variable_type=VariableTypeEnum.real, lowerbounds=0.0, upperbounds=None, initial_values=0.0,
-            ),
-        ])
-        seg_consts.append([
-            TensorConstant(
-                name=f"Spot price segment {k} (EUR/kWh)", symbol=f"p_{sk}",
-                shape=[S], values=prices[sl].tolist(),
-            ),
-            TensorConstant(
-                name=f"Load segment {k} (kWh/h)", symbol=f"l_{sk}",
-                shape=[S], values=loads[sl].tolist(),
-            ),
-            TensorConstant(
-                name=f"Solar per panel segment {k} (kWh/h)", symbol=f"sol_{sk}",
-                shape=[S], values=solar[sl].tolist(),
-            ),
-        ])
+        seg_vars.append(
+            [
+                TensorVariable(
+                    name=f"Charging power segment {k} (kW)",
+                    symbol=f"c_{sk}",
+                    shape=[S],
+                    variable_type=VariableTypeEnum.real,
+                    lowerbounds=0.0,
+                    upperbounds=10.0,
+                    initial_values=0.0,
+                ),
+                TensorVariable(
+                    name=f"Discharging power segment {k} (kW)",
+                    symbol=f"d_{sk}",
+                    shape=[S],
+                    variable_type=VariableTypeEnum.real,
+                    lowerbounds=0.0,
+                    upperbounds=10.0,
+                    initial_values=0.0,
+                ),
+                TensorVariable(
+                    name=f"State of charge segment {k} (kWh)",
+                    symbol=f"soc_{sk}",
+                    shape=[S],
+                    variable_type=VariableTypeEnum.real,
+                    lowerbounds=0.0,
+                    upperbounds=42.0,
+                    initial_values=initial_soc,
+                ),
+                TensorVariable(
+                    name=f"Grid purchased segment {k} (kWh/h)",
+                    symbol=f"buy_{sk}",
+                    shape=[S],
+                    variable_type=VariableTypeEnum.real,
+                    lowerbounds=0.0,
+                    upperbounds=None,
+                    initial_values=0.0,
+                ),
+                TensorVariable(
+                    name=f"Grid sold segment {k} (kWh/h)",
+                    symbol=f"sell_{sk}",
+                    shape=[S],
+                    variable_type=VariableTypeEnum.real,
+                    lowerbounds=0.0,
+                    upperbounds=None,
+                    initial_values=0.0,
+                ),
+            ]
+        )
+        seg_consts.append(
+            [
+                TensorConstant(
+                    name=f"Spot price segment {k} (EUR/kWh)",
+                    symbol=f"p_{sk}",
+                    shape=[S],
+                    values=prices[sl].tolist(),
+                ),
+                TensorConstant(
+                    name=f"Load segment {k} (kWh/h)",
+                    symbol=f"l_{sk}",
+                    shape=[S],
+                    values=loads[sl].tolist(),
+                ),
+                TensorConstant(
+                    name=f"Solar per panel segment {k} (kWh/h)",
+                    symbol=f"sol_{sk}",
+                    shape=[S],
+                    values=solar[sl].tolist(),
+                ),
+            ]
+        )
 
     # --- Constraints ---
     constraints = [
@@ -491,14 +526,18 @@ def summer_cabin_battery_problem_split(initial_soc: float = 0.0, n_panels_max: i
             symbol="cap_ub_con",
             func=["Add", "E", ["Negate", ["Multiply", 42.0, "y"]]],
             cons_type=ConstraintTypeEnum.LTE,
-            is_linear=True, is_convex=True, is_twice_differentiable=True,
+            is_linear=True,
+            is_convex=True,
+            is_twice_differentiable=True,
         ),
         Constraint(
             name="Minimum capacity if installed",
             symbol="cap_lb_con",
             func=["Add", ["Multiply", 14.0, "y"], ["Negate", "E"]],
             cons_type=ConstraintTypeEnum.LTE,
-            is_linear=True, is_convex=True, is_twice_differentiable=True,
+            is_linear=True,
+            is_convex=True,
+            is_twice_differentiable=True,
         ),
     ]
 
@@ -515,23 +554,33 @@ def summer_cabin_battery_problem_split(initial_soc: float = 0.0, n_panels_max: i
         # SOC at t=1: reference initial_soc for segment 1, or last element of previous segment
         prev_soc_term = -initial_soc if k == 1 else ["Negate", ["At", f"soc_s{k - 1}", S]]
 
-        constraints.append(Constraint(
-            name=f"SOC dynamics segment {k} t=1",
-            symbol=f"soc_con_{sk}_1",
-            func=["Add", ["At", soc_sym, 1], prev_soc_term,
-                  ["Negate", ["At", c_sym, 1]], ["At", d_sym, 1]],
-            cons_type=ConstraintTypeEnum.EQ,
-            is_linear=True, is_convex=True, is_twice_differentiable=True,
-        ))
+        constraints.append(
+            Constraint(
+                name=f"SOC dynamics segment {k} t=1",
+                symbol=f"soc_con_{sk}_1",
+                func=["Add", ["At", soc_sym, 1], prev_soc_term, ["Negate", ["At", c_sym, 1]], ["At", d_sym, 1]],
+                cons_type=ConstraintTypeEnum.EQ,
+                is_linear=True,
+                is_convex=True,
+                is_twice_differentiable=True,
+            )
+        )
 
         constraints.extend(
             Constraint(
                 name=f"SOC dynamics segment {k} t={t}",
                 symbol=f"soc_con_{sk}_{t}",
-                func=["Add", ["At", soc_sym, t], ["Negate", ["At", soc_sym, t - 1]],
-                      ["Negate", ["At", c_sym, t]], ["At", d_sym, t]],
+                func=[
+                    "Add",
+                    ["At", soc_sym, t],
+                    ["Negate", ["At", soc_sym, t - 1]],
+                    ["Negate", ["At", c_sym, t]],
+                    ["At", d_sym, t],
+                ],
                 cons_type=ConstraintTypeEnum.EQ,
-                is_linear=True, is_convex=True, is_twice_differentiable=True,
+                is_linear=True,
+                is_convex=True,
+                is_twice_differentiable=True,
             )
             for t in range(2, S + 1)
         )
@@ -542,7 +591,9 @@ def summer_cabin_battery_problem_split(initial_soc: float = 0.0, n_panels_max: i
                 symbol=f"soc_cap_con_{sk}_{t}",
                 func=["Add", ["At", soc_sym, t], ["Negate", "E"]],
                 cons_type=ConstraintTypeEnum.LTE,
-                is_linear=True, is_convex=True, is_twice_differentiable=True,
+                is_linear=True,
+                is_convex=True,
+                is_twice_differentiable=True,
             )
             for t in range(1, S + 1)
         )
@@ -551,13 +602,19 @@ def summer_cabin_battery_problem_split(initial_soc: float = 0.0, n_panels_max: i
             Constraint(
                 name=f"Energy balance segment {k} t={t}",
                 symbol=f"energy_bal_{sk}_{t}",
-                func=["Add",
-                      ["At", buy_sym, t], ["Negate", ["At", sell_sym, t]],
-                      ["At", d_sym, t], ["Negate", ["At", c_sym, t]],
-                      ["Multiply", "n", ["At", sol_sym, t]],
-                      ["Negate", ["At", l_sym, t]]],
+                func=[
+                    "Add",
+                    ["At", buy_sym, t],
+                    ["Negate", ["At", sell_sym, t]],
+                    ["At", d_sym, t],
+                    ["Negate", ["At", c_sym, t]],
+                    ["Multiply", "n", ["At", sol_sym, t]],
+                    ["Negate", ["At", l_sym, t]],
+                ],
                 cons_type=ConstraintTypeEnum.EQ,
-                is_linear=True, is_convex=True, is_twice_differentiable=True,
+                is_linear=True,
+                is_convex=True,
+                is_twice_differentiable=True,
             )
             for t in range(1, S + 1)
         )
@@ -593,7 +650,9 @@ def summer_cabin_battery_problem_split(initial_soc: float = 0.0, n_panels_max: i
                 func=["Add", *f1_terms],
                 unit="EUR",
                 maximize=False,
-                is_linear=True, is_convex=True, is_twice_differentiable=True,
+                is_linear=True,
+                is_convex=True,
+                is_twice_differentiable=True,
             ),
             Objective(
                 name="Total investment cost",
@@ -601,7 +660,9 @@ def summer_cabin_battery_problem_split(initial_soc: float = 0.0, n_panels_max: i
                 func=["Add", ["Multiply", 2000.0, "y"], ["Multiply", 310.0, "E"], ["Multiply", 200.0, "n"]],
                 unit="EUR",
                 maximize=False,
-                is_linear=True, is_convex=True, is_twice_differentiable=True,
+                is_linear=True,
+                is_convex=True,
+                is_twice_differentiable=True,
             ),
         ],
         constraints=constraints,
@@ -663,24 +724,28 @@ def summer_cabin_battery_problem_split_scenario(  # noqa: C901
     var_pool: list[Variable] = []
     for k in (2, 3):
         for t in range(1, H + 1):
-            var_pool.append(Variable(
-                name=f"Unmet demand s{k} t={t} (kWh)",
-                symbol=f"unmet_s{k}_{t}",
-                variable_type=VariableTypeEnum.real,
-                lowerbound=0.0,
-                upperbound=None,
-                initial_value=0.0,
-            ))
+            var_pool.append(
+                Variable(
+                    name=f"Unmet demand s{k} t={t} (kWh)",
+                    symbol=f"unmet_s{k}_{t}",
+                    variable_type=VariableTypeEnum.real,
+                    lowerbound=0.0,
+                    upperbound=None,
+                    initial_value=0.0,
+                )
+            )
     for k in (2, 3):
         for t in range(1, H + 1):
-            var_pool.append(Variable(
-                name=f"Demand unserved indicator s{k} t={t}",
-                symbol=f"z_s{k}_{t}",
-                variable_type=VariableTypeEnum.binary,
-                lowerbound=0,
-                upperbound=1,
-                initial_value=0,
-            ))
+            var_pool.append(
+                Variable(
+                    name=f"Demand unserved indicator s{k} t={t}",
+                    symbol=f"z_s{k}_{t}",
+                    variable_type=VariableTypeEnum.binary,
+                    lowerbound=0,
+                    upperbound=1,
+                    initial_value=0,
+                )
+            )
 
     def _seg_vars(k: int) -> dict[str, int]:
         """Variable pool indices for outage variables of segment k."""
@@ -703,7 +768,9 @@ def summer_cabin_battery_problem_split_scenario(  # noqa: C901
             func=["Add", *z_syms],
             unit="h",
             maximize=False,
-            is_linear=True, is_convex=True, is_twice_differentiable=True,
+            is_linear=True,
+            is_convex=True,
+            is_twice_differentiable=True,
         )
 
     _f3_zero = Objective(
@@ -712,7 +779,9 @@ def summer_cabin_battery_problem_split_scenario(  # noqa: C901
         func=["Multiply", 0, "y"],  # always 0 — no outage possible in this scenario
         unit="h",
         maximize=False,
-        is_linear=True, is_convex=True, is_twice_differentiable=True,
+        is_linear=True,
+        is_convex=True,
+        is_twice_differentiable=True,
     )
     obj_pool: list[Objective] = [_f3((2,)), _f3((3,)), _f3((2, 3)), _f3_zero]
     _f3_idx = {(2,): 0, (3,): 1, (2, 3): 2}
@@ -737,47 +806,67 @@ def summer_cabin_battery_problem_split_scenario(  # noqa: C901
     for k in (2, 3):
         sk = f"s{k}"
         for t in range(1, H + 1):
-            con_pool.append(Constraint(
-                name=f"Energy balance s{k} t={t} (with unmet slack)",
-                symbol=f"energy_bal_{sk}_{t}",
-                func=["Add",
-                      ["At", f"buy_{sk}", t], ["Negate", ["At", f"sell_{sk}", t]],
-                      ["At", f"d_{sk}", t], ["Negate", ["At", f"c_{sk}", t]],
-                      ["Multiply", "n", ["At", f"sol_{sk}", t]],
-                      f"unmet_{sk}_{t}",
-                      ["Negate", ["At", f"l_{sk}", t]]],
-                cons_type=ConstraintTypeEnum.EQ,
-                is_linear=True, is_convex=True, is_twice_differentiable=True,
-            ))
+            con_pool.append(
+                Constraint(
+                    name=f"Energy balance s{k} t={t} (with unmet slack)",
+                    symbol=f"energy_bal_{sk}_{t}",
+                    func=[
+                        "Add",
+                        ["At", f"buy_{sk}", t],
+                        ["Negate", ["At", f"sell_{sk}", t]],
+                        ["At", f"d_{sk}", t],
+                        ["Negate", ["At", f"c_{sk}", t]],
+                        ["Multiply", "n", ["At", f"sol_{sk}", t]],
+                        f"unmet_{sk}_{t}",
+                        ["Negate", ["At", f"l_{sk}", t]],
+                    ],
+                    cons_type=ConstraintTypeEnum.EQ,
+                    is_linear=True,
+                    is_convex=True,
+                    is_twice_differentiable=True,
+                )
+            )
 
     for k in (2, 3):
         for t in range(1, H + 1):
-            con_pool.append(Constraint(
-                name=f"Big-M unmet indicator s{k} t={t}",
-                symbol=f"bigm_s{k}_{t}",
-                func=["Add", f"unmet_s{k}_{t}", ["Negate", ["Multiply", _M_UNMET, f"z_s{k}_{t}"]]],
-                cons_type=ConstraintTypeEnum.LTE,
-                is_linear=True, is_convex=True, is_twice_differentiable=True,
-            ))
+            con_pool.append(
+                Constraint(
+                    name=f"Big-M unmet indicator s{k} t={t}",
+                    symbol=f"bigm_s{k}_{t}",
+                    func=["Add", f"unmet_s{k}_{t}", ["Negate", ["Multiply", _M_UNMET, f"z_s{k}_{t}"]]],
+                    cons_type=ConstraintTypeEnum.LTE,
+                    is_linear=True,
+                    is_convex=True,
+                    is_twice_differentiable=True,
+                )
+            )
 
     for k in (2, 3):
         sk = f"s{k}"
         for t in range(1, H + 1):
-            con_pool.append(Constraint(
-                name=f"Outage no-buy s{k} t={t}",
-                symbol=f"outage_buy_{sk}_{t}",
-                func=["At", f"buy_{sk}", t],
-                cons_type=ConstraintTypeEnum.EQ,
-                is_linear=True, is_convex=True, is_twice_differentiable=True,
-            ))
+            con_pool.append(
+                Constraint(
+                    name=f"Outage no-buy s{k} t={t}",
+                    symbol=f"outage_buy_{sk}_{t}",
+                    func=["At", f"buy_{sk}", t],
+                    cons_type=ConstraintTypeEnum.EQ,
+                    is_linear=True,
+                    is_convex=True,
+                    is_twice_differentiable=True,
+                )
+            )
         for t in range(1, H + 1):
-            con_pool.append(Constraint(
-                name=f"Outage no-sell s{k} t={t}",
-                symbol=f"outage_sell_{sk}_{t}",
-                func=["At", f"sell_{sk}", t],
-                cons_type=ConstraintTypeEnum.EQ,
-                is_linear=True, is_convex=True, is_twice_differentiable=True,
-            ))
+            con_pool.append(
+                Constraint(
+                    name=f"Outage no-sell s{k} t={t}",
+                    symbol=f"outage_sell_{sk}_{t}",
+                    func=["At", f"sell_{sk}", t],
+                    cons_type=ConstraintTypeEnum.EQ,
+                    is_linear=True,
+                    is_convex=True,
+                    is_twice_differentiable=True,
+                )
+            )
 
     def _seg_cons(k: int) -> dict[str, int]:
         """Constraint pool indices for all outage-related constraints of segment k."""
@@ -805,12 +894,18 @@ def summer_cabin_battery_problem_split_scenario(  # noqa: C901
             "ROOT": ["S1", "S2"],
             "S1": ["S1a", "S1b"],
             "S2": ["S2a", "S2b"],
-            "S1a": [], "S1b": [], "S2a": [], "S2b": [],
+            "S1a": [],
+            "S1b": [],
+            "S2a": [],
+            "S2b": [],
         },
         scenario_probabilities={
-            "S1": 0.5, "S2": 0.5,
-            "S1a": 0.25, "S1b": 0.25,
-            "S2a": 0.25, "S2b": 0.25,
+            "S1": 0.9,
+            "S2": 0.1,
+            "S1a": 0.81,
+            "S1b": 0.09,
+            "S2a": 0.09,
+            "S2b": 0.01,
         },
         base_problem=base,
         variables=tuple(var_pool),
