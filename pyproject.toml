@@ -42,6 +42,8 @@ dependencies = [
     "websockets>=15.0.1",
     "coco-experiment>=2.8.2",
     "imodels>=2.0.4",
+    "pulp>=3.3.2",
+    "openpyxl>=3.1.5",
 ]
 
 [project.urls]
