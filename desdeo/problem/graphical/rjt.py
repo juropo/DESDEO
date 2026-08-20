@@ -1,94 +1,87 @@
 r"""`RootedJunctionTree` construction from a `(DiscreteNetwork, DecisionAnnotation)` pair.
 
-Phase 3 of `.claude/desdeo-graphical-models-plan.md`. Implements a *gradual rooted junction
-tree* (RJT) in the sense of Parmentier, Cohen, Leclère, Obozinski & Salmon, "Integer Programming
-on the Junction Tree Polytope for Influence Diagrams" (arXiv:1902.07039, INFORMS J. on
-Optimization 2020) and Herrala, Terho & Oliveira, "Risk-averse decision strategies for influence
-diagrams using rooted junction trees" (arXiv:2401.03734, Operations Research Letters 2025) --
-the paper Phase 6 (risk measures) targets, and the source of the "gradual" terminology this
-module's checklist item uses: a rooted junction tree over node set N is *gradual* if (a) running
-intersection holds (any cluster on the tree-path between two clusters contains their
-intersection), (b) it has exactly one cluster per node of N -- each cluster the unique "root
-cluster" of the single node that owns it -- and (c) a node's information set/CPT-parents are
-contained in *its own* cluster (not merely some ancestor's).
+Phase 3 of `.claude/desdeo-graphical-models-plan.md`. Implements Algorithm 1 ("Create a Minimal
+Gradual RJT Given a Topological Order") of Parmentier, Cohen, Leclère, Obozinski & Salmon,
+"Integer Programming on the Junction Tree Polytope for Influence Diagrams" (arXiv:1902.07039,
+INFORMS J. on Optimization 2020; PDF checked directly, not via a lossy fetch), whose *gradual
+RJT* terminology (Definition 2: "an RJT is gradual if, for every v, the offspring of C_v is
+exactly {v}") is what Phase 6's target paper -- Herrala, Terho & Oliveira, "Risk-averse decision
+strategies for influence diagrams using rooted junction trees" (Operations Research Letters 61
+(2025) 107308, arXiv:2401.03734) -- also uses, unchanged. Concretely, a gradual RJT over node
+set N has exactly one cluster
+per node -- each cluster the unique "root cluster" of the single node that owns it -- running
+intersection holds, and every node's information set/CPT-parents lie in *its own* cluster, not
+merely some ancestor's.
 
-**Caveat on fidelity to the cited papers.** Both papers were only reachable here through lossy,
-AI-paraphrased extraction (the source PDF renders as compressed binary to the available tools),
-and one extracted claim -- "the final/sink node becomes the root" -- turned out to be
-irreconcilable with the CPT-chain-rule equation extracted *from the same source*: computing a
-child's cluster moment as (parent's moment) x (child's own conditional probability) only makes
-sense if the *parent* is closer to the root, so the child's moment can be derived from an
-already-available ancestor moment, not the reverse. Rather than trust either paraphrase over the
-other, this module fixes its own root/orientation convention from that equation and from first
-principles (see "Root and orientation" below), and leans on its own tests -- running
-intersection, information-set containment, gradual node/cluster correspondence -- to verify
-correctness directly, rather than on reproducing a specific external example. The *technique*
-(elimination-order-driven, one-cluster-per-node construction) and the "gradual" property it's
-named for are still taken from these papers; the specific rooting direction is this module's own
-choice, verified rather than assumed.
+**Algorithm 1, translated.** Fix a topological order ⪯ on N (parents before children; a decision
+before -- rather than after -- what it observes would make ⪯ impossible to construct, which is
+exactly the cycle `_topological_order` raises on). Process nodes from ⪯-last to ⪯-first,
+maintaining a working cluster `C'_v` and a *node-level* parent map (not yet a tree over clusters):
 
-**Construction.** Given a topological order ⪯ over N (parents before children, decisions'
-information sets before the decisions that need them, and -- when `decision_order` is set --
-earlier decisions before later ones), process nodes from ⪯-last to ⪯-first. For node v:
-`C_v = fa(v) U (union of (C_w \ {w}) over every G-child w of v)`, where `fa(v) = {v} U parents(v)`
-and every G-child w of v has *already* been processed (children are ⪯-later, hence visited
-earlier in this reverse walk). If `C_v \ {v}` is non-empty, let `u = argmax_⪯(C_v \ {v})`;
-record an (undirected, at this stage) tree edge between u and v.
+    C'_v <- fa(v) union (union of (C'_w \ {w}) over every w with an already-recorded arc (v, w))
+    if C'_v \ {v} is non-empty:
+        u <- the (already-computed) argmax_prec (C'_v \ {v})
+        record arc (u, v)
 
-**Root and orientation.** Edges are collected undirected and only *then* rooted -- deliberately,
-because tying "root" to which side of each edge-adding step happened first (the "u"/"v" roles
-above) breaks down for a node with two or more real dependents: e.g. `A -> B`, `A -> C` (A is
-the CPT-parent of both B and C) makes both B's and C's processing pick `u = A` and try to make A
-*their* child, an artefact of the single-edge-per-step bookkeeping, not a real structural
-conflict -- A legitimately ends up with two children, B and C, once the edge set is rooted and
-oriented by BFS. Root = the node with the smallest ⪯ position (topologically earliest); this
-puts CPT-ancestors and earlier `decision_order` entries near the root and their dependents
-further out, consistent with the chain-rule direction above. Rooting a valid tree at any node
-preserves running intersection (rooting is bookkeeping, not structure), so this choice does not
-need to be "the" canonical one -- it only needs to be deterministic and to make `Cluster.order`
-(BFS visitation order from the root) increase along `decision_order`, which is what
-`tests/test_graphical_rjt.py` checks.
+`fa(v) = {v} union parents(v)`. The subtlety the paper's own proof (Proposition 3/4) spells out
+and this module's tests exercise directly: the union in the first line only ever draws from
+nodes `w` that *themselves*, during their own (earlier) turn, picked `v` as their `u` -- a
+dynamic relationship discovered arc-by-arc as the algorithm runs, not "every node whose family
+happens to mention v" (a static relationship computable up front). Conflating the two was an
+actual bug in an earlier version of this module: it made a common-cause fork (`A -> B`, `A -> C`)
+raise a spurious error, because both B's and C's turns independently tried to claim A as *their
+own* child using the static notion. Implemented per the paper's dynamic one (`_pending_children`
+below, populated only when an arc is actually recorded), the fork case needs no special-casing
+at all: A's turn is a real algorithmic step that later absorbs both, once B's and C's arcs have
+each been recorded as `(A, B)` and `(A, C)`.
 
-**What counts as N here, and why objectives/constraints aren't in it.** N is chance nodes and
-decision nodes only -- nodes with an actual discrete state space, since a cluster's moment
-vector mu_C is indexed by the *joint state* of its members (Phase 0), and `ObjectiveNode`/
-`DiagramConstraint` have no state space of their own. This is also why decisions can't
-parameterise a chance node's CPT in this framework: `DiscreteNetwork.potentials`'s parent
-references are validated against `DiscreteNetwork`'s own variable names only (`network.py`'s
-`_check_structure`), so chance-node families never reference a decision. Decisions only ever
-feed into objectives/constraints, never into CPTs -- an explicit modelling restriction worth
-recording here since it's what keeps `family_of` acyclic without further checking on that front.
+**Why the root is the ⪯-first node, not the last.** The paper's own proof establishes
+`(u in C_v) => (u prec v)` (Proposition 3/4's proof, "we first prove that prec is a topological
+order on G"): every element of a node's own cluster -- other than the node itself -- is
+⪯-earlier than it. Walking from any node up through recorded arcs therefore strictly decreases
+⪯, so the tree's root -- the one node whose turn never produces an arc -- is the global ⪯-minimum
+(topologically earliest). This also matches the compilation need this module exists for
+(Phase 4): a chance node's CPT constraint ties its own moment to its *parents'* (⪯-earlier)
+moment, which only reads naturally if the parents' cluster is the one nearer the root.
 
-Parmentier et al.'s own construction handles multiple utility/value nodes by consolidating them
-into one synthetic node v̄ with arcs (p, v̄) for every value node's parent p (their Section 3.1) --
-forcing a single shared root. DESDEO deliberately keeps objectives *separate* (design decisions
-table: "Multiobjective handled by existing methods"), so that trick isn't available as-is, and
-adding each `ObjectiveNode` as its own real, separately-owned cluster would need the same v̄-style
-consolidation to avoid unrelated objectives conflicting over a shared ancestor. Instead, an
-objective's parents (or a constraint's node set) are folded, as a plain clique requirement, into
-the family of whichever of their own members is ⪯-latest -- routed into an *existing* real
-node's family rather than a synthetic one. Since that anchor node is already ⪯-later than every
-other clique member, this can only add already-valid predecessor relationships, never a new one
-that could introduce a cycle, and (like the A/B/C example above) any resulting multi-claim on a
-shared ancestor is resolved by the same undirected-edges-then-BFS orientation, not a special
-case. This guarantees `RootedJunctionTree.find_containing_cluster` succeeds for every
+**What counts as N here, and why objectives/constraints aren't in it.** Parmentier et al.'s own
+N is *every* diagram vertex, including utility/value vertices (their `V^r`) -- their MEU
+objective sums `<r_v, mu_v>` over each one independently (Eq. 11a), with no special-casing needed
+for more than one, since each just gets its own ordinary cluster via `fa(v) = {v} union
+parents(v)` like any other vertex. (Herrala et al.'s own "Algorithm 1", confusingly numbered the
+same, is a *different*, optional single-value-node preprocessing step, needed for their CVaR
+reformulation specifically, not for building a base gradual RJT -- Phase 6's problem, not this
+one's.) DESDEO's `ObjectiveNode` doesn't carry a state count the way a value vertex's domain
+does -- it's a `Potential` over `parents` directly, with no domain of its own -- so it can't
+become a first-class member of N without inventing a cardinality that isn't part of its schema.
+Instead, an `ObjectiveNode`'s parents (or a `DiagramConstraint`'s node set) are folded, as a
+plain clique requirement, into the family of whichever of their own members is ⪯-latest --
+routed into an *existing* real node's family. Since that anchor node is already ⪯-later than
+every other clique member, this can only add already-valid predecessor relationships, never a
+cycle, and it guarantees `RootedJunctionTree.find_containing_cluster` succeeds for every
 objective/constraint without needing them to own a cluster of their own -- see
-`_extend_family_for_clique`.
+`_extend_family_for_clique`. This is also why decisions can't parameterise a chance node's CPT in
+this framework: `DiscreteNetwork.potentials`'s parent references validate against
+`DiscreteNetwork`'s own variable names only (`network.py`'s `_check_structure`), so a chance
+node's family never references a decision -- decisions only ever feed objectives/constraints.
 
 This module does not import pyAgrum (see the package-level dependency rule in the plan's
 cross-cutting section): pyAgrum's `JunctionTreeGenerator` does accept an elimination
 partial-order and could seed a triangulation (confirmed interactively -- it produces a correct,
 connected join tree given the right partial order), but it triangulates on *node count*, not
 joint state-space size, and offers no direct way to fold in objective/constraint cliques or to
-get the one-cluster-per-node "gradual" property. Implementing the closed-form algorithm directly
-is both simpler and more faithful to the cited papers -- the "otherwise implement directly"
-branch of the Phase 3 checklist.
+get the one-cluster-per-node "gradual" property. Implementing Algorithm 1 directly ended up both
+simpler and exactly what the papers specify -- the "otherwise implement directly" branch of the
+Phase 3 checklist.
 
-**Limitation.** The induced graph over N (chance/decision nodes, plus any dependency implied by
-`decision_order` and by folded-in objective/constraint cliques) must be a single connected
-component; a diagram whose chance/decision nodes split into independent pieces raises
-`ValueError` rather than returning a forest. Revisit if a real use case needs it -- most diagrams
-with actual decisions/objectives to jointly optimise are connected by construction.
+**Limitation.** Per the paper's own proof ("if G is not connected, the algorithm is equivalent to
+its separate application on each of the connected components, which each yield a tree"), a
+diagram whose chance/decision nodes (plus any dependency implied by `decision_order` and by
+folded-in objective/constraint cliques) split into more than one component would produce a
+*forest*, not a single RJT. This module raises `ValueError` in that case instead of returning
+one -- most diagrams with actual decisions/objectives to jointly optimise are connected by
+construction, and `RootedJunctionTree.root` being a single node is a simplifying assumption worth
+keeping until a real use case needs otherwise.
 """
 
 import hashlib
@@ -135,9 +128,9 @@ class Cluster(BaseModel):
     """`nodes` shared with the parent cluster; `[]` for the root cluster."""
     order: int
     """BFS visitation order from the root: `0` at the root, strictly increasing along any path
-    away from it (a node is always visited after its tree-parent). See "Root and orientation" in
-    the module docstring for why this -- not a global elimination sequence number -- is what's
-    guaranteed to move monotonically along `decision_order`."""
+    away from it (a node is always visited after its tree-parent). Since the root is the
+    ⪯-earliest node (see the module docstring) and `decision_order` only ever makes an earlier
+    decision ⪯-earlier than a later one, this moves monotonically along `decision_order` too."""
     state_space_size: int
     """Product of the cardinalities of `nodes`: the length mu_C would have under the Phase 0
     mixed-radix flattening. Drives `RootedJunctionTree.max_cluster_size`."""
@@ -295,80 +288,54 @@ def clear_rjt_cache() -> None:
     _CACHE.clear()
 
 
-def _build_cluster_contents(
+def _run_algorithm_1(
     nodes: list[str], family: dict[str, set[str]], order_index: dict[str, int]
-) -> tuple[dict[str, set[str]], set[frozenset[str]]]:
-    """The content-propagation half of the construction.
+) -> tuple[dict[str, set[str]], dict[str, str]]:
+    """Algorithm 1 itself: cluster contents plus the node-level parent map, in one reverse pass.
 
-    Returns `cluster_nodes` plus an undirected edge set. Root/orientation is deliberately *not*
-    decided here -- see the module docstring.
+    `parent_of[v] = u` means arc `(u, v)` was recorded during `v`'s own turn -- `u` becomes
+    `v`'s tree-parent once cluster-level arcs are formed (Algorithm 1's step 10). Each node
+    records at most one arc, during its *own* turn, so `parent_of` can never receive conflicting
+    writes -- see the module docstring for why an earlier, non-conforming implementation of this
+    same idea (unioning from every node whose family happened to mention `v`, rather than only
+    from nodes that actually recorded an arc to `v`) could and did conflict.
     """
-    children: dict[str, set[str]] = {node: set() for node in nodes}
-    for parent_node, fam in family.items():
-        for member in fam:
-            if member != parent_node:
-                children[member].add(parent_node)
-
     reverse_order = sorted(nodes, key=lambda node: order_index[node], reverse=True)
 
+    pending_children: dict[str, list[str]] = {node: [] for node in nodes}
     cluster_nodes: dict[str, set[str]] = {}
-    edges: set[frozenset[str]] = set()
+    parent_of: dict[str, str] = {}
+
     for v in reverse_order:
         content = set(family[v])
-        for w in children[v]:
+        for w in pending_children[v]:
             content |= cluster_nodes[w] - {w}
         cluster_nodes[v] = content
 
         rest = content - {v}
         if rest:
             u = max(rest, key=lambda node: order_index[node])
-            edges.add(frozenset((u, v)))
+            parent_of[v] = u
+            pending_children[u].append(v)
 
-    return cluster_nodes, edges
+    return cluster_nodes, parent_of
 
 
-def _root_and_orient(
-    nodes: list[str], edges: set[frozenset[str]], order_index: dict[str, int]
-) -> tuple[str, dict[str, str | None], dict[str, int]]:
-    """Pick a deterministic root and BFS-orient `edges` from it.
+def _assign_bfs_order(nodes: list[str], root: str, parent_of: dict[str, str]) -> dict[str, int]:
+    """`0` at `root`, strictly increasing outward -- see `Cluster.order`'s docstring."""
+    children: dict[str, list[str]] = {node: [] for node in nodes}
+    for child, parent in parent_of.items():
+        children[parent].append(child)
 
-    Raises `ValueError` if `edges` (however it was produced) doesn't span `nodes` as a single
-    connected, acyclic component -- the general connectivity/cycle check the module docstring's
-    "Limitation" paragraph describes, done directly on the edge set rather than assumed.
-    """
-    adjacency: dict[str, set[str]] = {node: set() for node in nodes}
-    for edge in edges:
-        a, b = tuple(edge)
-        adjacency[a].add(b)
-        adjacency[b].add(a)
-
-    root = min(nodes, key=lambda node: order_index[node])
-
-    parent_of: dict[str, str | None] = {root: None}
     bfs_order: dict[str, int] = {root: 0}
     queue: deque[str] = deque([root])
-    visited = {root}
     while queue:
         current = queue.popleft()
-        for neighbour in sorted(adjacency[current]):
-            if neighbour not in visited:
-                visited.add(neighbour)
-                parent_of[neighbour] = current
-                bfs_order[neighbour] = len(visited) - 1
-                queue.append(neighbour)
+        for child in sorted(children[current]):
+            bfs_order[child] = len(bfs_order)
+            queue.append(child)
 
-    unreachable = set(nodes) - visited
-    if unreachable or len(edges) != len(nodes) - 1:
-        msg = (
-            f"Rooted junction tree construction did not produce a single connected tree over "
-            f"{len(nodes)} node(s): {len(edges)} edge(s) found, {len(unreachable)} node(s) "
-            f"unreachable from the root ({sorted(unreachable)}). The diagram's chance/decision "
-            "nodes (plus any objective/constraint clique requirements) must form a single "
-            "connected component -- see the module docstring's Limitation paragraph."
-        )
-        raise ValueError(msg)
-
-    return root, parent_of, bfs_order
+    return bfs_order
 
 
 def build_rooted_junction_tree(
@@ -449,12 +416,23 @@ def build_rooted_junction_tree(
     for constraint in annotation.constraints:
         _extend_family_for_clique(family, [n for n in constraint.nodes if n in node_set], order_index)
 
-    cluster_nodes, edges = _build_cluster_contents(nodes, family, order_index)
-    root, parent_of, bfs_order = _root_and_orient(nodes, edges, order_index)
+    cluster_nodes, parent_of = _run_algorithm_1(nodes, family, order_index)
+
+    roots = [node for node in nodes if node not in parent_of]
+    if len(roots) != 1:
+        msg = (
+            f"Rooted junction tree construction found {len(roots)} root(s) ({sorted(roots)}) "
+            f"instead of one over {len(nodes)} node(s); the diagram's chance/decision nodes "
+            "(plus any objective/constraint clique requirements) must form a single connected "
+            "component -- see the module docstring's Limitation paragraph."
+        )
+        raise ValueError(msg)
+    root = roots[0]
+    bfs_order = _assign_bfs_order(nodes, root, parent_of)
 
     clusters: dict[str, Cluster] = {}
     for v in nodes:
-        parent = parent_of[v]
+        parent = parent_of.get(v)
         separator = sorted(cluster_nodes[v] & cluster_nodes[parent]) if parent is not None else []
         state_space_size = 1
         for member in cluster_nodes[v]:
