@@ -746,6 +746,7 @@ dependencies = [
     { name = "numpy" },
     { name = "plotly" },
     { name = "polars" },
+    { name = "pyagrum" },
     { name = "pyarrow" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
@@ -874,6 +875,7 @@ requires-dist = [
     { name = "numpy", specifier = ">=2.2.0,<2.4" },
     { name = "plotly", specifier = ">=6.0" },
     { name = "polars", specifier = ">=1.41" },
+    { name = "pyagrum", specifier = ">=3.1.1" },
     { name = "pyarrow", specifier = ">=20.0.0" },
     { name = "pydantic", specifier = ">=2.9" },
     { name = "pydantic-settings", specifier = ">=2.9" },
@@ -2963,6 +2965,24 @@ wheels = [
 ]
 
 [[package]]
+name = "pyagrum"
+version = "3.1.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "matplotlib" },
+    { name = "numpy" },
+    { name = "pydot" },
+    { name = "scikit-learn" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a6/ac/890e273132678aee6b8f84fac409efd04665aac615445739c738fdba415c/pyagrum-3.1.1-cp310-abi3-macosx_10_15_x86_64.whl", hash = "sha256:9299eb8bb128ee334e6efacf83e9ca3e5f49f6d09257b9ed0bee63e972ca83f0", size = 3797787, upload-time = "2026-08-19T17:42:35.704Z" },
+    { url = "https://files.pythonhosted.org/packages/59/44/bcd383d9a98fec61e70637df26242169e2cb88e11b0ebfb61f53487cc616/pyagrum-3.1.1-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:ac6e5fdfe9ea41a1d66bc001e790955a33885155f3c10865faafcbb4f9e0cd93", size = 3399648, upload-time = "2026-08-19T17:42:37.945Z" },
+    { url = "https://files.pythonhosted.org/packages/ed/bb/1be82316e6b979f2c70e09710ad17320b109cc7bf556b28724a228bcbd16/pyagrum-3.1.1-cp310-abi3-manylinux2014_aarch64.whl", hash = "sha256:1468242656fbee9011815ba67023bb88bf07aba93c6cc1a098dd259262fdb1b1", size = 4682752, upload-time = "2026-08-19T17:42:39.699Z" },
+    { url = "https://files.pythonhosted.org/packages/02/51/9207df53ab55779bbee6ff3eadfc833a855079b9e69de0e38bdff9ee9864/pyagrum-3.1.1-cp310-abi3-manylinux2014_x86_64.whl", hash = "sha256:e09799abde542fe4e4b9f9d1bfecd0914b6e3fd5f5587c46a9511150f6c91b60", size = 5421514, upload-time = "2026-08-19T17:42:41.478Z" },
+    { url = "https://files.pythonhosted.org/packages/16/5b/b586b90e520928437577092a3601d3ca2c82b05070baad91cf8b1d3b2747/pyagrum-3.1.1-cp310-abi3-win_amd64.whl", hash = "sha256:c405dd4bb97c7546caf0e43d342a88f9e55a9ca7c0e711526a76702319d46399", size = 3518760, upload-time = "2026-08-19T17:42:43.122Z" },
+]
+
+[[package]]
 name = "pyarrow"
 version = "24.0.0"
 source = { registry = "https://pypi.org/simple" }
@@ -3081,6 +3101,18 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/07/60/1d1e59c9c90d54591469ada7d268251f71c24bdb765f1a8a832cee8c6653/pydantic_settings-2.14.1.tar.gz", hash = "sha256:e874d3bec7e787b0c9958277956ed9b4dd5de6a80e162188fdaff7c5e26fd5fa", size = 235551, upload-time = "2026-05-08T13:40:06.542Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/ae/8d/f1af3832f5e6eb13ba94ee809e72b8ecb5eef226d27ee0bef7d963d943c7/pydantic_settings-2.14.1-py3-none-any.whl", hash = "sha256:6e3c7edfd8277687cdc598f56e5cff0e9bfff0910a3749deaa8d4401c3a2b9de", size = 60964, upload-time = "2026-05-08T13:40:04.958Z" },
+]
+
+[[package]]
+name = "pydot"
+version = "4.0.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pyparsing" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/50/35/b17cb89ff865484c6a20ef46bf9d95a5f07328292578de0b295f4a6beec2/pydot-4.0.1.tar.gz", hash = "sha256:c2148f681c4a33e08bf0e26a9e5f8e4099a82e0e2a068098f32ce86577364ad5", size = 162594, upload-time = "2025-06-17T20:09:56.454Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/7e/32/a7125fb28c4261a627f999d5fb4afff25b523800faed2c30979949d6facd/pydot-4.0.1-py3-none-any.whl", hash = "sha256:869c0efadd2708c0be1f916eb669f3d664ca684bc57ffb7ecc08e70d5e93fee6", size = 37087, upload-time = "2025-06-17T20:09:55.25Z" },
 ]
 
 [[package]]

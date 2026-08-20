@@ -1,0 +1,129 @@
+<script lang="ts">
+	/**
+	 * Table view of a `NetworkModel`, shown alongside the canvas. Per the plan: "beyond a dozen
+	 * nodes, the table is what people read" — sortable by column, one row per node, parent/child
+	 * counts and full state lists that would be cut off in the canvas at anything but 'expanded'
+	 * detail.
+	 */
+	import * as Table from '$lib/components/ui/table';
+	import { Badge } from '$lib/components/ui/badge';
+	import type { NetworkModel, NetworkNodeModel } from './types';
+	import { NODE_KIND_STYLE } from './node-style';
+
+	interface Props {
+		model: NetworkModel;
+		/** Currently hovered/selected node id, for row <-> canvas cross-highlighting. */
+		highlightedId?: string | null;
+		onRowHover?: (id: string | null) => void;
+		onRowSelect?: (id: string) => void;
+	}
+
+	let { model, highlightedId = null, onRowHover, onRowSelect }: Props = $props();
+
+	type SortKey = 'label' | 'kind' | 'parents' | 'children';
+	let sortKey = $state<SortKey>('label');
+	let sortAsc = $state(true);
+
+	function counts(nodeId: string) {
+		let parents = 0;
+		let children = 0;
+		for (const edge of model.edges) {
+			if (edge.target === nodeId) parents++;
+			if (edge.source === nodeId) children++;
+		}
+		return { parents, children };
+	}
+
+	let rows = $derived.by(() => {
+		const withCounts = model.nodes.map((node) => ({ node, ...counts(node.id) }));
+		const dir = sortAsc ? 1 : -1;
+		return withCounts.sort((a, b) => {
+			switch (sortKey) {
+				case 'kind':
+					return dir * a.node.kind.localeCompare(b.node.kind);
+				case 'parents':
+					return dir * (a.parents - b.parents);
+				case 'children':
+					return dir * (a.children - b.children);
+				default:
+					return dir * a.node.label.localeCompare(b.node.label);
+			}
+		});
+	});
+
+	function setSort(key: SortKey) {
+		if (sortKey === key) {
+			sortAsc = !sortAsc;
+		} else {
+			sortKey = key;
+			sortAsc = true;
+		}
+	}
+
+	function stateSummary(node: NetworkNodeModel): string {
+		if (!node.states || node.states.length === 0) return '—';
+		return node.states.join(', ');
+	}
+</script>
+
+<div class="border-border overflow-auto rounded-md border">
+	<Table.Root>
+		<Table.Header>
+			<Table.Row>
+				<Table.Head class="cursor-pointer select-none" onclick={() => setSort('label')}>
+					Node {sortKey === 'label' ? (sortAsc ? '▲' : '▼') : ''}
+				</Table.Head>
+				<Table.Head class="cursor-pointer select-none" onclick={() => setSort('kind')}>
+					Kind {sortKey === 'kind' ? (sortAsc ? '▲' : '▼') : ''}
+				</Table.Head>
+				<Table.Head
+					class="cursor-pointer text-right select-none"
+					onclick={() => setSort('parents')}
+				>
+					Parents {sortKey === 'parents' ? (sortAsc ? '▲' : '▼') : ''}
+				</Table.Head>
+				<Table.Head
+					class="cursor-pointer text-right select-none"
+					onclick={() => setSort('children')}
+				>
+					Children {sortKey === 'children' ? (sortAsc ? '▲' : '▼') : ''}
+				</Table.Head>
+				<Table.Head>States</Table.Head>
+			</Table.Row>
+		</Table.Header>
+		<Table.Body>
+			{#each rows as row (row.node.id)}
+				<Table.Row
+					class="cursor-pointer {highlightedId === row.node.id ? 'bg-accent/60' : ''}"
+					onmouseenter={() => onRowHover?.(row.node.id)}
+					onmouseleave={() => onRowHover?.(null)}
+					onclick={() => onRowSelect?.(row.node.id)}
+				>
+					<Table.Cell class="font-medium" title={row.node.description}>{row.node.label}</Table.Cell>
+					<Table.Cell>
+						<Badge
+							variant="outline"
+							style="border-color: {NODE_KIND_STYLE[row.node.kind]
+								.colorVar}; color: {NODE_KIND_STYLE[row.node.kind].colorVar};"
+						>
+							{NODE_KIND_STYLE[row.node.kind].label}
+						</Badge>
+					</Table.Cell>
+					<Table.Cell class="text-right tabular-nums">{row.parents}</Table.Cell>
+					<Table.Cell class="text-right tabular-nums">{row.children}</Table.Cell>
+					<Table.Cell
+						class="text-muted-foreground max-w-72 truncate"
+						title={stateSummary(row.node)}
+					>
+						{stateSummary(row.node)}
+					</Table.Cell>
+				</Table.Row>
+			{/each}
+			{#if rows.length === 0}
+				<Table.Row>
+					<Table.Cell colspan={5} class="text-muted-foreground text-center">No nodes.</Table.Cell>
+				</Table.Row>
+			{/if}
+		</Table.Body>
+	</Table.Root>
+</div>
