@@ -11,12 +11,58 @@ This module does not import pyAgrum — see the package-level dependency rule in
 cross-cutting section.
 """
 
+import heapq
 from enum import StrEnum
 from itertools import product
 from typing import Self
 
 import numpy as np
 from pydantic import BaseModel, ConfigDict, model_validator
+
+
+def kahn_topological_order(
+    nodes: list[str], predecessors: dict[str, set[str]], priority: dict[str, int] | None = None
+) -> list[str]:
+    """Kahn's algorithm: as much of a topological order over `nodes` as `predecessors` allows.
+
+    Shared by `DiscreteNetwork._has_cycle` (this module, Phase 1 -- just wants a yes/no cycle
+    check) and `rooted_junction_tree._topological_order` (Phase 3 -- wants the actual order plus
+    a detailed error naming the cyclic nodes), so the two don't independently reimplement the
+    same graph walk and risk diverging on edge-case handling (e.g. self-loops, disconnected
+    nodes).
+
+    Args:
+        nodes: every node to order; `predecessors` may omit nodes with no predecessors.
+        predecessors: `predecessors[node]` is the set of nodes that must come before `node`.
+        priority: tiebreaker for nodes that become ready at the same time, ascending (lower
+            first); declaration order (`nodes`'s own order) if omitted, for reproducible output.
+
+    Returns:
+        list[str]: as many nodes as could be topologically ordered. If shorter than `nodes`, the
+            nodes missing from the result participate in a cycle among `predecessors` --
+            `set(nodes) - set(result)` names them.
+    """
+    if priority is None:
+        priority = {node: i for i, node in enumerate(nodes)}
+
+    remaining = {node: set(predecessors.get(node, ())) for node in nodes}
+    successors: dict[str, list[str]] = {node: [] for node in nodes}
+    for node, preds in remaining.items():
+        for pred in preds:
+            successors[pred].append(node)
+
+    ready = [(priority[node], node) for node in nodes if not remaining[node]]
+    heapq.heapify(ready)
+    order: list[str] = []
+    while ready:
+        _, node = heapq.heappop(ready)
+        order.append(node)
+        for successor in successors[node]:
+            remaining[successor].discard(node)
+            if not remaining[successor]:
+                heapq.heappush(ready, (priority[successor], successor))
+
+    return order
 
 
 class DiscreteVariableKind(StrEnum):
@@ -216,24 +262,13 @@ class DiscreteNetwork(BaseModel):
 
     @staticmethod
     def _has_cycle(names: set[str], arcs: list[tuple[str, str]]) -> bool:
-        """Kahn's algorithm; cheap enough at construction time and independent of pyAgrum."""
-        children: dict[str, list[str]] = {name: [] for name in names}
-        indegree: dict[str, int] = dict.fromkeys(names, 0)
+        """`kahn_topological_order`; cheap enough at construction time and independent of pyAgrum."""
+        predecessors: dict[str, set[str]] = {name: set() for name in names}
         for parent, child in arcs:
-            children[parent].append(child)
-            indegree[child] += 1
+            predecessors[child].add(parent)
 
-        queue = [name for name, degree in indegree.items() if degree == 0]
-        visited = 0
-        while queue:
-            node = queue.pop()
-            visited += 1
-            for child in children[node]:
-                indegree[child] -= 1
-                if indegree[child] == 0:
-                    queue.append(child)
-
-        return visited != len(names)
+        order = kahn_topological_order(sorted(names), predecessors)
+        return len(order) != len(names)
 
     def joint_state_count(self) -> int:
         """Total number of joint states over all variables (product of all cardinalities)."""

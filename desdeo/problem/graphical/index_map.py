@@ -24,9 +24,17 @@ of `cardinalities`/`digits` is the most significant (slowest-varying) axis.
 from collections.abc import Sequence
 from math import prod
 
+import numpy as np
+
 
 def mixed_radix_encode(digits: Sequence[int], cardinalities: Sequence[int]) -> int:
     """Encode a joint state into a flat 0-based index under a mixed-radix (row-major) scheme.
+
+    A thin, validated wrapper around `numpy.ravel_multi_index` (default `order="C"`, i.e.
+    row-major, matching this module's own "first entry is most significant" convention) -- the
+    validation here exists to give a clearer, module-specific error message than NumPy's own for
+    the two failure modes this package actually triggers (mismatched lengths, an out-of-range
+    digit) before delegating the actual encoding.
 
     Args:
         digits: one 0-based state index per variable, most significant (e.g. separator)
@@ -44,18 +52,19 @@ def mixed_radix_encode(digits: Sequence[int], cardinalities: Sequence[int]) -> i
         msg = f"digits and cardinalities must have the same length, got {len(digits)} and {len(cardinalities)}."
         raise ValueError(msg)
 
-    flat_index = 0
     for digit, cardinality in zip(digits, cardinalities, strict=True):
         if not 0 <= digit < cardinality:
             msg = f"digit {digit} out of range for cardinality {cardinality}."
             raise ValueError(msg)
-        flat_index = flat_index * cardinality + digit
 
-    return flat_index
+    return int(np.ravel_multi_index(tuple(digits), tuple(cardinalities)))
 
 
 def mixed_radix_decode(flat_index: int, cardinalities: Sequence[int]) -> tuple[int, ...]:
     """Decode a flat 0-based index back into a joint state (inverse of `mixed_radix_encode`).
+
+    A thin, validated wrapper around `numpy.unravel_index` -- see `mixed_radix_encode`'s
+    docstring for why the bounds check happens here rather than being left to NumPy's own.
 
     Args:
         flat_index: the flat 0-based index to decode.
@@ -73,12 +82,7 @@ def mixed_radix_decode(flat_index: int, cardinalities: Sequence[int]) -> tuple[i
         msg = f"flat_index {flat_index} out of range for state space of size {size}."
         raise ValueError(msg)
 
-    digits = [0] * len(cardinalities)
-    remainder = flat_index
-    for i in range(len(cardinalities) - 1, -1, -1):
-        remainder, digits[i] = divmod(remainder, cardinalities[i])
-
-    return tuple(digits)
+    return tuple(int(digit) for digit in np.unravel_index(flat_index, tuple(cardinalities)))
 
 
 def separator_block_range(separator_state: int, block_size: int) -> tuple[int, int]:

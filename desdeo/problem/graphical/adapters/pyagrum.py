@@ -10,6 +10,8 @@ dependency rule in the plan's cross-cutting section. pyAgrum is an ordinary hard
 table in `.claude/desdeo-graphical-models-plan.md`.
 """
 
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -22,21 +24,98 @@ from desdeo.problem.graphical.network import (
     Potential,
 )
 
-_KIND_FROM_PYAGRUM = {
-    gum.VarType_LABELIZED: DiscreteVariableKind.labelized,
-    gum.VarType_RANGE: DiscreteVariableKind.range,
-    gum.VarType_INTEGER: DiscreteVariableKind.integer,
-    gum.VarType_DISCRETIZED: DiscreteVariableKind.discretized,
-    gum.VarType_NUMERICAL: DiscreteVariableKind.numerical,
+
+@dataclass(frozen=True)
+class _VariableKindAdapter:
+    """Everything needed to convert one `DiscreteVariableKind` to/from a pyAgrum variable.
+
+    One registry entry per kind (`_VARIABLE_KIND_ADAPTERS` below) replaces what used to be three
+    independent kind-dispatch points here (a `gum.VarType_*` lookup dict plus two separate
+    `match` statements) -- adding a kind now means adding one entry instead of remembering to
+    update three, and a kind missing from the registry now fails with an explicit `KeyError`/
+    `ValueError` at the lookup site instead of a `match` silently falling through. (This can't
+    also absorb `DiscreteVariable._check_kind_fields`'s validation in `network.py` -- that module
+    is the one that must *not* import pyAgrum, per this package's dependency rule -- so this
+    registry only covers pyAgrum-specific conversion, one of the two things kind-dispatch is
+    used for in this package.)
+    """
+
+    pyagrum_type: int
+    """The `gum.VarType_*` constant this kind mirrors."""
+    from_pyagrum: Callable[[gum.DiscreteVariable], dict]
+    """Given a pyAgrum variable already known to be this kind, the kind-specific `DiscreteVariable`
+    constructor kwargs beyond the common ones (`name`/`description`/`kind`/`labels`)."""
+    to_pyagrum: Callable[[DiscreteVariable], gum.DiscreteVariable]
+    """Given a `DiscreteVariable` of this kind, build the equivalent pyAgrum variable."""
+
+
+def _labelized_to_pyagrum(variable: DiscreteVariable) -> gum.DiscreteVariable:
+    pyagrum_var = gum.LabelizedVariable(variable.name, variable.description, 0)
+    for label in variable.labels:
+        pyagrum_var.addLabel(label)
+    return pyagrum_var
+
+
+def _range_to_pyagrum(variable: DiscreteVariable) -> gum.DiscreteVariable:
+    return gum.RangeVariable(variable.name, variable.description, variable.lower_bound, variable.upper_bound)
+
+
+def _integer_to_pyagrum(variable: DiscreteVariable) -> gum.DiscreteVariable:
+    return gum.IntegerVariable(variable.name, variable.description, variable.integer_values)
+
+
+def _discretized_to_pyagrum(variable: DiscreteVariable) -> gum.DiscreteVariable:
+    pyagrum_var = gum.DiscretizedVariable(variable.name, variable.description)
+    for tick in variable.ticks:
+        pyagrum_var.addTick(tick)
+    return pyagrum_var
+
+
+def _numerical_to_pyagrum(variable: DiscreteVariable) -> gum.DiscreteVariable:
+    return gum.NumericalDiscreteVariable(variable.name, variable.description, variable.numerical_values)
+
+
+_VARIABLE_KIND_ADAPTERS: dict[DiscreteVariableKind, _VariableKindAdapter] = {
+    DiscreteVariableKind.labelized: _VariableKindAdapter(
+        pyagrum_type=gum.VarType_LABELIZED,
+        from_pyagrum=lambda _variable: {},
+        to_pyagrum=_labelized_to_pyagrum,
+    ),
+    DiscreteVariableKind.range: _VariableKindAdapter(
+        pyagrum_type=gum.VarType_RANGE,
+        from_pyagrum=lambda variable: {
+            "lower_bound": variable.asRangeVar().minVal(),
+            "upper_bound": variable.asRangeVar().maxVal(),
+        },
+        to_pyagrum=_range_to_pyagrum,
+    ),
+    DiscreteVariableKind.integer: _VariableKindAdapter(
+        pyagrum_type=gum.VarType_INTEGER,
+        from_pyagrum=lambda variable: {"integer_values": list(variable.asIntegerVar().integerDomain())},
+        to_pyagrum=_integer_to_pyagrum,
+    ),
+    DiscreteVariableKind.discretized: _VariableKindAdapter(
+        pyagrum_type=gum.VarType_DISCRETIZED,
+        from_pyagrum=lambda variable: {"ticks": list(variable.asDiscretizedVar().ticks())},
+        to_pyagrum=_discretized_to_pyagrum,
+    ),
+    DiscreteVariableKind.numerical: _VariableKindAdapter(
+        pyagrum_type=gum.VarType_NUMERICAL,
+        from_pyagrum=lambda variable: {"numerical_values": list(variable.asNumericalDiscreteVar().numericalDomain())},
+        to_pyagrum=_numerical_to_pyagrum,
+    ),
 }
+
+_KIND_FROM_PYAGRUM = {adapter.pyagrum_type: kind for kind, adapter in _VARIABLE_KIND_ADAPTERS.items()}
 
 
 def _variable_from_pyagrum(variable: gum.DiscreteVariable) -> DiscreteVariable:
     """Convert one pyAgrum discrete variable to a `DiscreteVariable`, dispatching on `varType()`.
 
-    `asRangeVar`/`asIntegerVar`/`asDiscretizedVar`/`asNumericalDiscreteVar` downcast a
-    base-typed `DiscreteVariable` reference (what `BayesNet.variable()` returns) to the concrete
-    subclass so its kind-specific accessors become available.
+    `asRangeVar`/`asIntegerVar`/`asDiscretizedVar`/`asNumericalDiscreteVar` (called from within
+    `_VARIABLE_KIND_ADAPTERS`'s `from_pyagrum` entries) downcast a base-typed `DiscreteVariable`
+    reference (what `BayesNet.variable()` returns) to the concrete subclass so its kind-specific
+    accessors become available.
     """
     kind = _KIND_FROM_PYAGRUM.get(variable.varType())
     if kind is None:
@@ -49,42 +128,17 @@ def _variable_from_pyagrum(variable: gum.DiscreteVariable) -> DiscreteVariable:
         "kind": kind,
         "labels": list(variable.labels()),
     }
-    match kind:
-        case DiscreteVariableKind.range:
-            range_var = variable.asRangeVar()
-            return DiscreteVariable(**common, lower_bound=range_var.minVal(), upper_bound=range_var.maxVal())
-        case DiscreteVariableKind.integer:
-            integer_var = variable.asIntegerVar()
-            return DiscreteVariable(**common, integer_values=list(integer_var.integerDomain()))
-        case DiscreteVariableKind.discretized:
-            discretized_var = variable.asDiscretizedVar()
-            return DiscreteVariable(**common, ticks=list(discretized_var.ticks()))
-        case DiscreteVariableKind.numerical:
-            numerical_var = variable.asNumericalDiscreteVar()
-            return DiscreteVariable(**common, numerical_values=list(numerical_var.numericalDomain()))
-        case DiscreteVariableKind.labelized:
-            return DiscreteVariable(**common)
+    extra = _VARIABLE_KIND_ADAPTERS[kind].from_pyagrum(variable)
+    return DiscreteVariable(**common, **extra)
 
 
 def _variable_to_pyagrum(variable: DiscreteVariable) -> gum.DiscreteVariable:
     """Convert one `DiscreteVariable` to the pyAgrum subclass its `kind` mirrors."""
-    match variable.kind:
-        case DiscreteVariableKind.labelized:
-            pyagrum_var = gum.LabelizedVariable(variable.name, variable.description, 0)
-            for label in variable.labels:
-                pyagrum_var.addLabel(label)
-            return pyagrum_var
-        case DiscreteVariableKind.range:
-            return gum.RangeVariable(variable.name, variable.description, variable.lower_bound, variable.upper_bound)
-        case DiscreteVariableKind.integer:
-            return gum.IntegerVariable(variable.name, variable.description, variable.integer_values)
-        case DiscreteVariableKind.discretized:
-            pyagrum_var = gum.DiscretizedVariable(variable.name, variable.description)
-            for tick in variable.ticks:
-                pyagrum_var.addTick(tick)
-            return pyagrum_var
-        case DiscreteVariableKind.numerical:
-            return gum.NumericalDiscreteVariable(variable.name, variable.description, variable.numerical_values)
+    adapter = _VARIABLE_KIND_ADAPTERS.get(variable.kind)
+    if adapter is None:
+        msg = f"No pyAgrum adapter registered for DiscreteVariableKind '{variable.kind}'."
+        raise ValueError(msg)
+    return adapter.to_pyagrum(variable)
 
 
 def _potential_from_pyagrum(tensor: gum.Tensor) -> Potential:

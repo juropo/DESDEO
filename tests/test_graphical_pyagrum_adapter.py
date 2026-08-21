@@ -10,6 +10,7 @@ from pathlib import Path
 import numpy as np
 import pyagrum as gum
 import pytest
+from fixtures import diverse_kind_network as _diverse_kind_network
 
 from desdeo.problem.graphical import DiscreteNetwork, DiscreteVariable, DiscreteVariableKind, Potential
 from desdeo.problem.graphical.adapters.pyagrum import (
@@ -89,37 +90,9 @@ def test_round_trip_is_a_fixed_point():
 
 
 # ── Variable kind fidelity ──────────────────────────────────────────────────────────────────
-
-
-def _diverse_kind_network() -> DiscreteNetwork:
-    """One independent root node per `DiscreteVariableKind`, so none constrain each other."""
-    variables = [
-        DiscreteVariable(name="A", kind=DiscreteVariableKind.labelized, labels=["yes", "no"]),
-        DiscreteVariable(
-            name="B", kind=DiscreteVariableKind.range, labels=["2", "3", "4"], lower_bound=2, upper_bound=4
-        ),
-        DiscreteVariable(name="C", kind=DiscreteVariableKind.integer, labels=["1", "5", "9"], integer_values=[1, 5, 9]),
-        DiscreteVariable(
-            name="D",
-            kind=DiscreteVariableKind.discretized,
-            labels=["[0;1[", "[1;2.5]"],
-            ticks=[0.0, 1.0, 2.5],
-        ),
-        DiscreteVariable(
-            name="E",
-            kind=DiscreteVariableKind.numerical,
-            labels=["0.1", "0.2", "0.5"],
-            numerical_values=[0.1, 0.2, 0.5],
-        ),
-    ]
-    potentials = {
-        "A": Potential(variables=["A"], shape=[2], values=[0.3, 0.7]),
-        "B": Potential(variables=["B"], shape=[3], values=[0.2, 0.3, 0.5]),
-        "C": Potential(variables=["C"], shape=[3], values=[0.2, 0.3, 0.5]),
-        "D": Potential(variables=["D"], shape=[2], values=[0.4, 0.6]),
-        "E": Potential(variables=["E"], shape=[3], values=[0.2, 0.3, 0.5]),
-    }
-    return DiscreteNetwork(name="diverse_kinds", variables=variables, arcs=[], potentials=potentials)
+#
+# `_diverse_kind_network` is `tests/fixtures/graphical.py`'s `diverse_kind_network`, imported
+# above under its old private name so call sites didn't need touching.
 
 
 def test_round_trip_preserves_every_variable_kind():

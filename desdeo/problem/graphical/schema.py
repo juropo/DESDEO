@@ -21,6 +21,7 @@ cross-cutting section. It does import from `problem.schema`; that dependency run
 (nothing in `problem/schema.py` imports `problem/graphical`).
 """
 
+from collections import Counter
 from enum import StrEnum
 from typing import Self
 
@@ -31,6 +32,41 @@ from desdeo.problem.schema import ConstraintTypeEnum
 
 CURRENT_SCHEMA_VERSION = 1
 """Bumped on breaking changes to `DecisionAnnotation`'s schema."""
+
+
+def _check_unique_symbols(context: str, symbols: list[str]) -> None:
+    """Raise `ValueError` naming each symbol occurring more than once in `symbols`.
+
+    Mirrors `Problem.check_for_non_unique_symbols`'s `Counter`-based approach (`problem/schema.py`)
+    rather than a plain `len(symbols) != len(set(symbols))` check, so the error names each
+    colliding symbol and how many times it occurs. Shared by `_check_internal_structure`'s
+    per-group and cross-group uniqueness checks below.
+    """
+    counts = Counter(symbols)
+    duplicates = {symbol: count for symbol, count in counts.items() if count > 1}
+    if not duplicates:
+        return
+    msg = f"Symbols must be unique {context}."
+    for symbol, count in duplicates.items():
+        msg += f" Symbol '{symbol}' occurs {count} times."
+    raise ValueError(msg)
+
+
+def _check_references_known(
+    owner_label: str, owner_symbol: str, field_label: str, refs: list[str], known: set[str]
+) -> None:
+    """Raise `ValueError` naming any of `refs` not present in `known`.
+
+    Shared by `validate_against`'s `information_set`/`parents`/`nodes` cross-reference checks --
+    same "collect unknown references, raise if any" shape each time, varying only in whose
+    reference it is, the field's name (folded into `field_label`, e.g. `"parents reference"`,
+    to keep each check's grammar -- singular vs. plural subject -- exactly as before), and what
+    it's checked against.
+    """
+    unknown = [ref for ref in refs if ref not in known]
+    if unknown:
+        msg = f"{owner_label} '{owner_symbol}': {field_label} unknown node(s) {unknown}."
+        raise ValueError(msg)
 
 
 class DecisionNode(BaseModel):
@@ -230,14 +266,10 @@ class DecisionAnnotation(BaseModel):
             ("constraints", constraint_symbols),
             ("risk_measures", risk_symbols),
         ):
-            if len(symbols) != len(set(symbols)):
-                msg = f"Duplicate symbols within {label}: {symbols}."
-                raise ValueError(msg)
+            _check_unique_symbols(f"within {label}", symbols)
 
         all_symbols = decision_symbols + objective_symbols + constraint_symbols + risk_symbols
-        if len(all_symbols) != len(set(all_symbols)):
-            msg = f"Symbols must be unique across decisions/objectives/constraints/risk_measures, got: {all_symbols}."
-            raise ValueError(msg)
+        _check_unique_symbols("across decisions/objectives/constraints/risk_measures", all_symbols)
 
         if len(objective_symbols) == 0:
             msg = "DecisionAnnotation must have at least one objective."
@@ -290,16 +322,12 @@ class DecisionAnnotation(BaseModel):
 
         observable = set(chance_cardinality) | set(decision_cardinality)
         for decision in self.decisions:
-            unknown = [ref for ref in decision.information_set if ref not in observable]
-            if unknown:
-                msg = f"Decision '{decision.symbol}': information_set references unknown node(s) {unknown}."
-                raise ValueError(msg)
+            _check_references_known(
+                "Decision", decision.symbol, "information_set references", decision.information_set, observable
+            )
 
         for objective in self.objectives:
-            unknown = [ref for ref in objective.parents if ref not in observable]
-            if unknown:
-                msg = f"Objective '{objective.symbol}': parents reference unknown node(s) {unknown}."
-                raise ValueError(msg)
+            _check_references_known("Objective", objective.symbol, "parents reference", objective.parents, observable)
 
             cardinalities = {**chance_cardinality, **decision_cardinality}
             expected_shape = [cardinalities[parent] for parent in objective.parents]
@@ -312,7 +340,4 @@ class DecisionAnnotation(BaseModel):
 
         referenceable = observable | objective_symbols
         for constraint in self.constraints:
-            unknown = [ref for ref in constraint.nodes if ref not in referenceable]
-            if unknown:
-                msg = f"Constraint '{constraint.symbol}': nodes reference unknown node(s) {unknown}."
-                raise ValueError(msg)
+            _check_references_known("Constraint", constraint.symbol, "nodes reference", constraint.nodes, referenceable)

@@ -12,25 +12,15 @@ from desdeo.api.models import GraphicalModelMetaData, ProblemDB, ProblemMetaData
 from desdeo.problem.graphical import (
     DecisionAnnotation,
     DiscreteNetwork,
-    DiscreteVariable,
     ObjectiveNode,
     Potential,
     RootedJunctionTree,
     build_rooted_junction_tree,
 )
+from tests.fixtures import two_node_chain_network as _network
 
-
-def _network() -> DiscreteNetwork:
-    a = DiscreteVariable(name="A", labels=["low", "high"])
-    b = DiscreteVariable(name="B", labels=["low", "high"])
-    return DiscreteNetwork(
-        variables=[a, b],
-        arcs=[("A", "B")],
-        potentials={
-            "A": Potential(variables=["A"], shape=[2], values=[0.4, 0.6]),
-            "B": Potential(variables=["B", "A"], shape=[2, 2], values=[[0.9, 0.1], [0.2, 0.8]]),
-        },
-    )
+# `_network` is `tests/fixtures/graphical.py`'s `two_node_chain_network` (A -> B, two binary
+# chance nodes), imported above under its old private name so call sites didn't need touching.
 
 
 def _annotation() -> DecisionAnnotation:

@@ -3,7 +3,7 @@ r"""`RootedJunctionTree` construction from a `(DiscreteNetwork, DecisionAnnotati
 Phase 3 of `.claude/desdeo-graphical-models-plan.md`. Implements Algorithm 1 ("Create a Minimal
 Gradual RJT Given a Topological Order") of Parmentier, Cohen, Leclère, Obozinski & Salmon,
 "Integer Programming on the Junction Tree Polytope for Influence Diagrams" (arXiv:1902.07039,
-INFORMS J. on Optimization 2020; PDF checked directly, not via a lossy fetch), whose *gradual
+INFORMS J. on Optimization 2020), whose *gradual
 RJT* terminology (Definition 2: "an RJT is gradual if, for every v, the offspring of C_v is
 exactly {v}") is what Phase 6's target paper -- Herrala, Terho & Oliveira, "Risk-averse decision
 strategies for influence diagrams using rooted junction trees" (Operations Research Letters 61
@@ -85,17 +85,16 @@ keeping until a real use case needs otherwise.
 """
 
 import hashlib
-import heapq
 import json
 import warnings
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Iterable
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
-from desdeo.problem.graphical.annotation import DecisionAnnotation
-from desdeo.problem.graphical.network import DiscreteNetwork
+from desdeo.problem.graphical.network import DiscreteNetwork, kahn_topological_order
+from desdeo.problem.graphical.schema import DecisionAnnotation
 
 
 class ClusterSizeWarning(UserWarning):
@@ -128,9 +127,15 @@ class Cluster(BaseModel):
     """`nodes` shared with the parent cluster; `[]` for the root cluster."""
     order: int
     """BFS visitation order from the root: `0` at the root, strictly increasing along any path
-    away from it (a node is always visited after its tree-parent). Since the root is the
-    ⪯-earliest node (see the module docstring) and `decision_order` only ever makes an earlier
-    decision ⪯-earlier than a later one, this moves monotonically along `decision_order` too."""
+    away from it (a node is always visited after its tree-parent). This is tree-depth ordering,
+    *not* a restatement of ⪯: a ⪯-earlier decision (e.g. an earlier one per `decision_order`) is
+    **not** guaranteed to have a smaller `order` than a ⪯-later one -- BFS order also depends on
+    how many hops each node's path to the root takes, which differs once decisions have
+    differently sized information sets (an earlier decision with a larger information set can
+    end up *deeper* than a later decision with a smaller one). What the paper's proof does
+    guarantee (`(u in C_v) => (u prec v)`, see the module docstring) is narrower: a node's own
+    tree-parent is always ⪯-earlier than it, so walking from any cluster toward the root strictly
+    decreases ⪯ -- just not in lockstep with BFS depth."""
     state_space_size: int
     """Product of the cardinalities of `nodes`: the length mu_C would have under the Phase 0
     mixed-radix flattening. Drives `RootedJunctionTree.max_cluster_size`."""
@@ -214,31 +219,42 @@ def _extend_family_for_clique(family: dict[str, set[str]], members: list[str], o
     family[anchor] |= member_set
 
 
+def _resolve_clique_members(
+    members: list[str], node_set: set[str], objective_parents: dict[str, list[str]]
+) -> list[str]:
+    """`members` filtered to `node_set`, with objective symbols expanded to their own parents.
+
+    Any `ObjectiveNode` symbol among `members` is expanded to *that objective's own parents*
+    instead of being dropped. `DiagramConstraint.nodes` may legally reference an objective symbol
+    directly (e.g. "a tail
+    constraint on F's own distribution" --
+    `test_validate_against_constraint_may_reference_objective_node`), but an `ObjectiveNode` has
+    no cardinality and can never own a cluster (see the module docstring), so folding it in
+    verbatim would silently record no requirement at all. Since an objective's value is a
+    function of its own `parents`' joint state, the clique this constraint actually needs is
+    over those parents -- so that's what gets folded instead. `ObjectiveNode.parents` can only
+    reference chance/decision nodes (never another objective, per its own schema), so this
+    expansion never needs to recurse.
+    """
+    resolved: set[str] = set()
+    for member in members:
+        if member in node_set:
+            resolved.add(member)
+        elif member in objective_parents:
+            resolved.update(p for p in objective_parents[member] if p in node_set)
+    return list(resolved)
+
+
 def _topological_order(
     nodes: list[str], predecessors: dict[str, set[str]], declared_index: dict[str, int]
 ) -> list[str]:
-    """Kahn's algorithm, breaking ties by declaration order for reproducible output.
+    """`kahn_topological_order`, breaking ties by declaration order for reproducible output.
 
     Reproducibility matters here specifically because the resulting order feeds a cache key
     (`build_rooted_junction_tree`'s cache is keyed on a hash of the *inputs*, but two runs over
     the same inputs must produce the same RJT for the cache to be sound, not just fast).
     """
-    remaining = {node: set(predecessors[node]) for node in nodes}
-    successors: dict[str, list[str]] = {node: [] for node in nodes}
-    for node, preds in predecessors.items():
-        for pred in preds:
-            successors[pred].append(node)
-
-    ready = [(declared_index[node], node) for node in nodes if not remaining[node]]
-    heapq.heapify(ready)
-    order: list[str] = []
-    while ready:
-        _, node = heapq.heappop(ready)
-        order.append(node)
-        for successor in successors[node]:
-            remaining[successor].discard(node)
-            if not remaining[successor]:
-                heapq.heappush(ready, (declared_index[successor], successor))
+    order = kahn_topological_order(nodes, predecessors, priority=declared_index)
 
     if len(order) != len(nodes):
         cyclic = sorted(set(nodes) - set(order))
@@ -249,6 +265,8 @@ def _topological_order(
             "observing a node that decision_order says is only revealed after it."
         )
         raise ValueError(msg)
+
+    return order
 
     return order
 
@@ -278,14 +296,37 @@ def _structure_hash(network: DiscreteNetwork, annotation: DecisionAnnotation) ->
     return hashlib.sha256(encoded).hexdigest()
 
 
-_CACHE: dict[str, RootedJunctionTree] = {}
-"""Keyed on `_structure_hash`. Module-level and process-local -- fine for a library cache; a
+_CACHE_MAX_SIZE = 128
+"""Cap on `_CACHE`'s size before its least-recently-used entry is evicted. Without a bound, a
+long-running process (e.g. the API server) building many distinct network/annotation structures
+over its lifetime would grow `_CACHE` -- including each tree's full cluster node sets -- without
+limit."""
+
+_CACHE: OrderedDict[str, RootedJunctionTree] = OrderedDict()
+"""Keyed on `_structure_hash`, in least-to-most-recently-used order (see `_cache_get`/
+`_cache_put`). Module-level and process-local -- fine for a bounded library cache; a
 persisted/multi-process cache is the API layer's concern (see `GraphicalModelMetaData`)."""
 
 
 def clear_rjt_cache() -> None:
     """Drop every cached `RootedJunctionTree`. Mainly for tests."""
     _CACHE.clear()
+
+
+def _cache_get(key: str) -> RootedJunctionTree | None:
+    """`_CACHE[key]` if present (marking it most-recently-used), else `None`."""
+    if key not in _CACHE:
+        return None
+    _CACHE.move_to_end(key)
+    return _CACHE[key]
+
+
+def _cache_put(key: str, value: RootedJunctionTree) -> None:
+    """Store `value` under `key`, evicting the least-recently-used entry past `_CACHE_MAX_SIZE`."""
+    _CACHE[key] = value
+    _CACHE.move_to_end(key)
+    if len(_CACHE) > _CACHE_MAX_SIZE:
+        _CACHE.popitem(last=False)
 
 
 def _run_algorithm_1(
@@ -338,6 +379,41 @@ def _assign_bfs_order(nodes: list[str], root: str, parent_of: dict[str, str]) ->
     return bfs_order
 
 
+def _root_and_bfs_order(nodes: list[str], parent_of: dict[str, str]) -> tuple[str, dict[str, int]]:
+    """Find the single root in `parent_of` and BFS-order every node from it, or raise.
+
+    `len(roots) == 1` only implies a single connected tree given the invariant `_run_algorithm_1`
+    proves (every `parent_of[v]` precedes `v` in ⪯, so `parent_of` can't contain a cycle disjoint
+    from the root) -- so the BFS reachability is re-checked directly here too, as
+    defense-in-depth: a future violation of that invariant then fails with a clear, diagnostic
+    `ValueError` naming the unreached nodes, rather than a bare `KeyError` from a `bfs_order`
+    lookup downstream.
+    """
+    roots = [node for node in nodes if node not in parent_of]
+    if len(roots) != 1:
+        msg = (
+            f"Rooted junction tree construction found {len(roots)} root(s) ({sorted(roots)}) "
+            f"instead of one over {len(nodes)} node(s); the diagram's chance/decision nodes "
+            "(plus any objective/constraint clique requirements) must form a single connected "
+            "component -- see the module docstring's Limitation paragraph."
+        )
+        raise ValueError(msg)
+    root = roots[0]
+
+    bfs_order = _assign_bfs_order(nodes, root, parent_of)
+    unreached = set(nodes) - set(bfs_order)
+    if unreached:
+        msg = (
+            f"Rooted junction tree construction produced a single root but "
+            f"{len(unreached)} node(s) unreachable from it: {sorted(unreached)}. This points at "
+            "a bug in the construction algorithm itself (parent_of should never contain a cycle "
+            "disjoint from the root) rather than a malformed diagram."
+        )
+        raise ValueError(msg)
+
+    return root, bfs_order
+
+
 def build_rooted_junction_tree(
     network: DiscreteNetwork,
     annotation: DecisionAnnotation,
@@ -360,7 +436,10 @@ def build_rooted_junction_tree(
             `max_cluster_size` is exceeded.
         use_cache: look up/store the result in the module-level cache, keyed on
             `_structure_hash` -- CPT/utility values never affect the key, so relearning CPTs
-            without touching structure reuses the cached tree instead of re-triangulating.
+            without touching structure reuses the cached tree instead of re-triangulating. A
+            cache hit skips `validate_against` too: the hash already captures everything that
+            check reads (variable/decision cardinalities, objective/constraint node references),
+            so if this exact structure validated once, it validates again.
 
     Returns:
         RootedJunctionTree: the constructed tree.
@@ -370,11 +449,13 @@ def build_rooted_junction_tree(
             dependency graph has a cycle; the graph is disconnected (unsupported, see the module
             docstring); or `max_cluster_size` is exceeded and `on_exceed == "raise"`.
     """
-    annotation.validate_against(network)
-
     cache_key = _structure_hash(network, annotation)
-    if use_cache and cache_key in _CACHE:
-        return _CACHE[cache_key]
+    if use_cache:
+        cached = _cache_get(cache_key)
+        if cached is not None:
+            return cached
+
+    annotation.validate_against(network)
 
     cardinalities: dict[str, int] = {variable.name: len(variable.labels) for variable in network.variables}
     cardinalities.update({decision.symbol: len(decision.states) for decision in annotation.decisions})
@@ -411,24 +492,16 @@ def build_rooted_junction_tree(
     order = _topological_order(nodes, predecessors, declared_index)
     order_index = {node: i for i, node in enumerate(order)}
 
+    objective_parents = {objective.symbol: objective.parents for objective in annotation.objectives}
     for objective in annotation.objectives:
-        _extend_family_for_clique(family, [p for p in objective.parents if p in node_set], order_index)
+        members = _resolve_clique_members(objective.parents, node_set, objective_parents)
+        _extend_family_for_clique(family, members, order_index)
     for constraint in annotation.constraints:
-        _extend_family_for_clique(family, [n for n in constraint.nodes if n in node_set], order_index)
+        members = _resolve_clique_members(constraint.nodes, node_set, objective_parents)
+        _extend_family_for_clique(family, members, order_index)
 
     cluster_nodes, parent_of = _run_algorithm_1(nodes, family, order_index)
-
-    roots = [node for node in nodes if node not in parent_of]
-    if len(roots) != 1:
-        msg = (
-            f"Rooted junction tree construction found {len(roots)} root(s) ({sorted(roots)}) "
-            f"instead of one over {len(nodes)} node(s); the diagram's chance/decision nodes "
-            "(plus any objective/constraint clique requirements) must form a single connected "
-            "component -- see the module docstring's Limitation paragraph."
-        )
-        raise ValueError(msg)
-    root = roots[0]
-    bfs_order = _assign_bfs_order(nodes, root, parent_of)
+    root, bfs_order = _root_and_bfs_order(nodes, parent_of)
 
     clusters: dict[str, Cluster] = {}
     for v in nodes:
@@ -459,6 +532,6 @@ def build_rooted_junction_tree(
         warnings.warn(msg, ClusterSizeWarning, stacklevel=2)
 
     if use_cache:
-        _CACHE[cache_key] = rjt
+        _cache_put(cache_key, rjt)
 
     return rjt

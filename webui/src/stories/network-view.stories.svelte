@@ -1,6 +1,6 @@
 <script module>
 	import { defineMeta } from '@storybook/addon-svelte-csf';
-	import { NetworkView } from '$lib/components/network';
+	import { NetworkView } from '$lib/components/custom/network';
 
 	const { Story } = defineMeta({
 		title: 'Example/NetworkView',
@@ -10,7 +10,7 @@
 </script>
 
 <script lang="ts">
-	import { sampleIrrigationNetwork } from '$lib/components/network/sample-network';
+	import { sampleIrrigationNetwork } from '$lib/components/custom/network/sample-network';
 
 	// `model` is `$bindable` on NetworkView (layout gets written back onto it), so each story
 	// needs its own local state rather than a shared `args.model` — see NetworkView's docs.

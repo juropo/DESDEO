@@ -1,4 +1,4 @@
-"""Tests for `desdeo.problem.graphical.annotation` (`DecisionAnnotation` and friends).
+"""Tests for `desdeo.problem.graphical.schema` (`DecisionAnnotation` and friends).
 
 Phase 2 of `.claude/desdeo-graphical-models-plan.md`. No pyAgrum in the schema/validator tests
 (pure pydantic, like `tests/test_graphical_network.py`); the round-trip test at the bottom uses
@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pyagrum as gum
 import pytest
+from fixtures import two_node_chain_network as _chance_network
 from pydantic import ValidationError
 
 from desdeo.problem.graphical import (
@@ -16,27 +17,15 @@ from desdeo.problem.graphical import (
     DecisionNode,
     DiagramConstraint,
     DiagramConstraintKind,
-    DiscreteNetwork,
-    DiscreteVariable,
     ObjectiveNode,
     Potential,
     RiskMeasure,
 )
 from desdeo.problem.graphical.adapters.pyagrum import from_pyagrum, learn_network, to_pyagrum
 
-
-def _chance_network() -> DiscreteNetwork:
-    """A -> B, two binary chance nodes."""
-    a = DiscreteVariable(name="A", labels=["low", "high"])
-    b = DiscreteVariable(name="B", labels=["low", "high"])
-    return DiscreteNetwork(
-        variables=[a, b],
-        arcs=[("A", "B")],
-        potentials={
-            "A": Potential(variables=["A"], shape=[2], values=[0.4, 0.6]),
-            "B": Potential(variables=["B", "A"], shape=[2, 2], values=[[0.9, 0.1], [0.2, 0.8]]),
-        },
-    )
+# `_chance_network` is `tests/fixtures/graphical.py`'s `two_node_chain_network` (A -> B, two
+# binary chance nodes), imported above under its old private name so call sites didn't need
+# touching.
 
 
 def _decision_node() -> DecisionNode:

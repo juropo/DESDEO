@@ -24,18 +24,24 @@
 	let sortKey = $state<SortKey>('label');
 	let sortAsc = $state(true);
 
-	function counts(nodeId: string) {
-		let parents = 0;
-		let children = 0;
-		for (const edge of model.edges) {
-			if (edge.target === nodeId) parents++;
-			if (edge.source === nodeId) children++;
+	/** One O(nodes + edges) pass building every node's parent/child count, instead of the O(edges)
+	 *  scan `counts()` used to redo per node (making the old `rows` derivation O(nodes * edges)). */
+	function buildCounts(m: NetworkModel): Record<string, { parents: number; children: number }> {
+		const counts: Record<string, { parents: number; children: number }> = {};
+		for (const node of m.nodes) counts[node.id] = { parents: 0, children: 0 };
+		for (const edge of m.edges) {
+			if (counts[edge.target]) counts[edge.target].parents++;
+			if (counts[edge.source]) counts[edge.source].children++;
 		}
-		return { parents, children };
+		return counts;
 	}
 
 	let rows = $derived.by(() => {
-		const withCounts = model.nodes.map((node) => ({ node, ...counts(node.id) }));
+		const counts = buildCounts(model);
+		const withCounts = model.nodes.map((node) => ({
+			node,
+			...(counts[node.id] ?? { parents: 0, children: 0 })
+		}));
 		const dir = sortAsc ? 1 : -1;
 		return withCounts.sort((a, b) => {
 			switch (sortKey) {

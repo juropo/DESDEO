@@ -21,7 +21,7 @@
 	import { NETWORK_NODE_TYPES } from './nodes';
 	import { computeElkLayout, layoutCoversModel } from './layout';
 	import { computeDetailLevel } from './lod';
-	import { ancestralSet } from './dag-algorithms';
+	import { ancestralSet, buildAdjacency, type Adjacency } from './dag-algorithms';
 	import type { NetworkModel } from './types';
 	import type { NetworkFlowEdge, NetworkFlowNode } from './view-types';
 
@@ -57,13 +57,18 @@
 
 	let detailLevel = $derived(computeDetailLevel(containerWidth, viewport.zoom, compact));
 
+	// Rebuilt only when `model.nodes`/`model.edges` themselves change (that's all `buildAdjacency`
+	// reads), not on every hover/select -- `highlightedIds` below used to call `ancestralSet`
+	// without this, which rebuilt the adjacency maps from scratch on every single hover event.
+	let adjacency = $derived.by((): Adjacency => buildAdjacency(model));
+
 	// Free (structural, backend-independent) slice of phase C: hovering/selecting a node lights
 	// up its ancestor set. Full active-trail-given-evidence highlighting needs evidence state
 	// that only exists once phase D's what-if machinery lands.
 	let highlightFocusId = $derived(hoveredId ?? selectedId);
 	let highlightedIds = $derived.by((): Set<string> | null => {
 		if (!highlightFocusId) return null;
-		return ancestralSet(model, [highlightFocusId]);
+		return ancestralSet(model, [highlightFocusId], adjacency);
 	});
 
 	let flowNodes = $state.raw<NetworkFlowNode[]>([]);

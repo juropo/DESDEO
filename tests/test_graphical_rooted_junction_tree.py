@@ -1,17 +1,21 @@
-"""Tests for `desdeo.problem.graphical.rjt` (`RootedJunctionTree` construction).
+"""Tests for `desdeo.problem.graphical.rooted_junction_tree` (`RootedJunctionTree` construction).
 
 Phase 3 of `.claude/desdeo-graphical-models-plan.md`. Pure pydantic/pure-Python, like
-`tests/test_graphical_network.py`/`tests/test_graphical_annotation.py` -- no pyAgrum involved,
-so none of these are marked `graphical`.
+`tests/test_graphical_network.py`/`tests/test_graphical_schema.py` -- no pyAgrum involved, so
+none of these are marked `graphical`.
 
 Correctness is checked directly against the "gradual RJT" definition (running intersection,
 information-set containment, one cluster per node) rather than against a specific published
-worked example -- see the module docstring in `desdeo/problem/graphical/rjt.py` for why.
+worked example -- see the module docstring in `desdeo/problem/graphical/rooted_junction_tree.py`
+for why.
 """
 
 from collections import deque
 
 import pytest
+from fixtures import chain_network as _chain_network
+from fixtures import fork_network as _fork_network
+from fixtures import independent_network as _independent_network
 
 from desdeo.problem.graphical import (
     DecisionAnnotation,
@@ -19,20 +23,15 @@ from desdeo.problem.graphical import (
     DiagramConstraint,
     DiagramConstraintKind,
     DiscreteNetwork,
-    DiscreteVariable,
     ObjectiveNode,
     Potential,
     RootedJunctionTree,
     build_rooted_junction_tree,
     clear_rjt_cache,
 )
-from desdeo.problem.graphical.rjt import ClusterSizeWarning
+from desdeo.problem.graphical.rooted_junction_tree import _CACHE, _CACHE_MAX_SIZE, ClusterSizeWarning
 
 # ── Helpers ──────────────────────────────────────────────────────────────────────────────────
-
-
-def _binary(name: str) -> DiscreteVariable:
-    return DiscreteVariable(name=name, labels=["lo", "hi"])
 
 
 def _running_intersection_holds(rjt: RootedJunctionTree) -> bool:
@@ -74,42 +73,10 @@ def _is_gradual(rjt: RootedJunctionTree, expected_nodes: set[str]) -> bool:
 
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────────────────────
-
-
-def _chain_network() -> DiscreteNetwork:
-    """A -> B -> C, three binary chance nodes."""
-    return DiscreteNetwork(
-        variables=[_binary("A"), _binary("B"), _binary("C")],
-        arcs=[("A", "B"), ("B", "C")],
-        potentials={
-            "A": Potential(variables=["A"], shape=[2], values=[0.4, 0.6]),
-            "B": Potential(variables=["B", "A"], shape=[2, 2], values=[[0.9, 0.1], [0.2, 0.8]]),
-            "C": Potential(variables=["C", "B"], shape=[2, 2], values=[[0.7, 0.3], [0.3, 0.7]]),
-        },
-    )
-
-
-def _fork_network() -> DiscreteNetwork:
-    """A -> B, A -> C: a common-cause fork. A has two real children."""
-    return DiscreteNetwork(
-        variables=[_binary("A"), _binary("B"), _binary("C")],
-        arcs=[("A", "B"), ("A", "C")],
-        potentials={
-            "A": Potential(variables=["A"], shape=[2], values=[0.4, 0.6]),
-            "B": Potential(variables=["B", "A"], shape=[2, 2], values=[[0.9, 0.1], [0.2, 0.8]]),
-            "C": Potential(variables=["C", "A"], shape=[2, 2], values=[[0.7, 0.3], [0.3, 0.7]]),
-        },
-    )
-
-
-def _independent_network(*names: str) -> DiscreteNetwork:
-    """`len(names)` binary chance nodes with no arcs between them at all."""
-    variables = [_binary(name) for name in names]
-    return DiscreteNetwork(
-        variables=variables,
-        arcs=[],
-        potentials={name: Potential(variables=[name], shape=[2], values=[0.5, 0.5]) for name in names},
-    )
+#
+# `_chain_network`/`_fork_network`/`_independent_network` are `tests/fixtures/graphical.py`'s
+# `chain_network`/`fork_network`/`independent_network`, imported above under their old private
+# names so the many call sites below didn't need touching.
 
 
 def _objective(symbol: str, parents: list[str], *, cardinality: int = 2) -> ObjectiveNode:
@@ -204,6 +171,24 @@ def test_diagram_constraint_clique_is_satisfiable():
     annotation = DecisionAnnotation(objectives=[_objective("F", ["A"])], constraints=[constraint])
     rjt = build_rooted_junction_tree(network, annotation, use_cache=False)
 
+    assert rjt.find_containing_cluster(["A", "B"]) is not None
+
+
+def test_constraint_referencing_objective_node_folds_its_parents():
+    """A constraint naming an `ObjectiveNode` symbol must still get a home cluster.
+
+    `DiagramConstraint.nodes` may legally reference an objective symbol directly (e.g. a tail
+    constraint on F's own distribution -- see
+    `test_validate_against_constraint_may_reference_objective_node` in
+    `test_graphical_schema.py`), but an `ObjectiveNode` has no cardinality and can never own
+    a cluster. The clique this constraint actually needs is over F's own parents.
+    """
+    network = _independent_network("A", "B")
+    constraint = DiagramConstraint(symbol="c1", kind=DiagramConstraintKind.tail, nodes=["F"], func=["F"])
+    annotation = DecisionAnnotation(objectives=[_objective("F", ["A", "B"])], constraints=[constraint])
+    rjt = build_rooted_junction_tree(network, annotation, use_cache=False)
+
+    assert _is_gradual(rjt, {"A", "B"})
     assert rjt.find_containing_cluster(["A", "B"]) is not None
 
 
@@ -368,3 +353,29 @@ def test_use_cache_false_bypasses_cache():
     assert first is not second
     assert first == second
     clear_rjt_cache()
+
+
+def test_cache_evicts_least_recently_used_past_max_size():
+    """Filling the cache past `_CACHE_MAX_SIZE` evicts the least-recently-used entry, not others."""
+    clear_rjt_cache()
+    try:
+        for i in range(_CACHE_MAX_SIZE):
+            network = _independent_network(f"A{i}")
+            annotation = DecisionAnnotation(objectives=[_objective("F", [f"A{i}"])])
+            build_rooted_junction_tree(network, annotation)
+        first_key = next(iter(_CACHE))
+
+        # Touch every entry except the first, moving them all ahead of it in LRU order.
+        for i in range(1, _CACHE_MAX_SIZE):
+            network = _independent_network(f"A{i}")
+            annotation = DecisionAnnotation(objectives=[_objective("F", [f"A{i}"])])
+            build_rooted_junction_tree(network, annotation)
+
+        overflow_network = _independent_network("Aoverflow")
+        overflow_annotation = DecisionAnnotation(objectives=[_objective("F", ["Aoverflow"])])
+        build_rooted_junction_tree(overflow_network, overflow_annotation)
+
+        assert len(_CACHE) == _CACHE_MAX_SIZE
+        assert first_key not in _CACHE
+    finally:
+        clear_rjt_cache()

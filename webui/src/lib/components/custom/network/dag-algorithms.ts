@@ -10,12 +10,19 @@
 
 import type { NetworkEdgeModel, NetworkModel, NetworkNodeModel } from './types';
 
-interface Adjacency {
+export interface Adjacency {
 	parents: Map<string, string[]>;
 	children: Map<string, string[]>;
 }
 
-function buildAdjacency(model: Pick<NetworkModel, 'nodes' | 'edges'>): Adjacency {
+/**
+ * Build the parent/child adjacency maps for `model`. O(nodes + edges) — exported (rather than
+ * kept private and rebuilt inside every call below) so a caller that queries the same model
+ * repeatedly (e.g. `NetworkView.svelte` recomputing ancestor highlights on every hover event) can
+ * build it once and pass it into `ancestors`/`ancestralSet`, instead of paying an O(V+E) rebuild
+ * per query.
+ */
+export function buildAdjacency(model: Pick<NetworkModel, 'nodes' | 'edges'>): Adjacency {
 	const parents = new Map<string, string[]>();
 	const children = new Map<string, string[]>();
 	for (const node of model.nodes) {
@@ -29,12 +36,16 @@ function buildAdjacency(model: Pick<NetworkModel, 'nodes' | 'edges'>): Adjacency
 	return { parents, children };
 }
 
-/** All strict ancestors of `nodeId` (not including `nodeId` itself). */
+/** All strict ancestors of `nodeId` (not including `nodeId` itself).
+ *
+ * `adjacency` may be passed in (e.g. built once per `model` by a caller doing many queries)
+ * instead of being rebuilt from `model` on every call. */
 export function ancestors(
 	model: Pick<NetworkModel, 'nodes' | 'edges'>,
-	nodeId: string
+	nodeId: string,
+	adjacency: Adjacency = buildAdjacency(model)
 ): Set<string> {
-	const { parents } = buildAdjacency(model);
+	const { parents } = adjacency;
 	const seen = new Set<string>();
 	const stack = [...(parents.get(nodeId) ?? [])];
 	while (stack.length > 0) {
@@ -46,12 +57,13 @@ export function ancestors(
 	return seen;
 }
 
-/** All strict descendants of `nodeId` (not including `nodeId` itself). */
+/** All strict descendants of `nodeId` (not including `nodeId` itself). See `ancestors` re: `adjacency`. */
 export function descendants(
 	model: Pick<NetworkModel, 'nodes' | 'edges'>,
-	nodeId: string
+	nodeId: string,
+	adjacency: Adjacency = buildAdjacency(model)
 ): Set<string> {
-	const { children } = buildAdjacency(model);
+	const { children } = adjacency;
 	const seen = new Set<string>();
 	const stack = [...(children.get(nodeId) ?? [])];
 	while (stack.length > 0) {
@@ -63,14 +75,16 @@ export function descendants(
 	return seen;
 }
 
-/** Union of `nodeIds` with every one of their ancestors (including `nodeIds` themselves). */
+/** Union of `nodeIds` with every one of their ancestors (including `nodeIds` themselves).
+ *  See `ancestors` re: `adjacency`. */
 export function ancestralSet(
 	model: Pick<NetworkModel, 'nodes' | 'edges'>,
-	nodeIds: Iterable<string>
+	nodeIds: Iterable<string>,
+	adjacency: Adjacency = buildAdjacency(model)
 ): Set<string> {
 	const result = new Set(nodeIds);
 	for (const id of [...result]) {
-		for (const a of ancestors(model, id)) result.add(a);
+		for (const a of ancestors(model, id, adjacency)) result.add(a);
 	}
 	return result;
 }
