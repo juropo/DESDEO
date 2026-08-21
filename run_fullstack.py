@@ -5,6 +5,7 @@ Both processes run concurrently. Their output is prefixed with colored labels
 so they can be distinguished. Press Ctrl+C to shut down both.
 """
 
+import argparse
 import signal
 import subprocess
 import sys
@@ -27,8 +28,21 @@ def stream_output(process: subprocess.Popen, label: str, color: str) -> None:
         print(f"{color}({label}){RESET} {line}", end="", flush=True)  # noqa: T201
 
 
+def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--no-open",
+        action="store_true",
+        help="Don't open a browser tab for the web-GUI (e.g. when driving it via an agent/automation).",
+    )
+    return parser.parse_args()
+
+
 def main() -> int:
     """Run the backend and frontend as subprocesses."""
+    args = parse_args()
+
     backend_cmd = [
         sys.executable,
         "-m",
@@ -42,7 +56,9 @@ def main() -> int:
         "--port",
         "8000",
     ]
-    frontend_cmd = ["npm", "run", "dev", "--", "--open"]
+    frontend_cmd = ["npm", "run", "dev"]
+    if not args.no_open:
+        frontend_cmd += ["--", "--open"]
 
     procs: list[subprocess.Popen] = []
 
