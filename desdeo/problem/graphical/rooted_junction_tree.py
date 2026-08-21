@@ -183,7 +183,7 @@ class RootedJunctionTree(BaseModel):
         return min(candidates, key=lambda cluster: (cluster.state_space_size, cluster.order)).ownership
 
 
-def _effective_information_sets(annotation: DecisionAnnotation) -> dict[str, set[str]]:
+def effective_information_sets(annotation: DecisionAnnotation) -> dict[str, set[str]]:
     """Each decision's information set, expanded per `no_forgetting` if that's set.
 
     Without `no_forgetting` (or without `decision_order`, which it requires), a decision's
@@ -193,6 +193,12 @@ def _effective_information_sets(annotation: DecisionAnnotation) -> dict[str, set
     decision_order) and its parents" -- applied incrementally along `decision_order` so each
     earlier decision's *own* (already-expanded) effective information set is folded in too, not
     just its declared one.
+
+    Public (not module-private) because Phase 4's compiler (`compile.py`) needs the exact same
+    expansion to decide what a decision's z (policy indicator) variable is conditioned on --
+    conditioning z on only the *declared* `information_set` while the cluster it lives in was
+    built from the *effective* one (this function's output) would silently ignore
+    `no_forgetting` in the compiled MILP.
     """
     raw = {decision.symbol: set(decision.information_set) for decision in annotation.decisions}
     if not (annotation.decision_order and annotation.no_forgetting):
@@ -265,8 +271,6 @@ def _topological_order(
             "observing a node that decision_order says is only revealed after it."
         )
         raise ValueError(msg)
-
-    return order
 
     return order
 
@@ -470,10 +474,10 @@ def build_rooted_junction_tree(
         variable.name: {variable.name, *network.potentials[variable.name].variables[1:]}
         for variable in network.variables
     }
-    effective_information_sets = _effective_information_sets(annotation)
+    decision_effective_info_sets = effective_information_sets(annotation)
     family.update(
         {
-            decision.symbol: {decision.symbol, *effective_information_sets[decision.symbol]}
+            decision.symbol: {decision.symbol, *decision_effective_info_sets[decision.symbol]}
             for decision in annotation.decisions
         }
     )
