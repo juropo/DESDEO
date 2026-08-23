@@ -28,6 +28,22 @@
 	import SolutionDescriptionPanel from '$lib/components/custom/nimbus/solution-description-panel.svelte';
 	import { PREFERENCE_TYPES } from '$lib/constants';
 
+	// Graphical-models plan, frontend phase B: embedding the reusable network component into a
+	// real method UI, ahead of any backend compiler (phases 4-7) -- see the "Findings" for phase B
+	// in .claude/desdeo-graphical-models-plan.md for why this uses demo data rather than a live
+	// compiled diagram for this problem.
+	import { NetworkView } from '$lib/components/custom/network';
+	import { sampleIrrigationNetwork } from '$lib/components/custom/network/sample-network';
+	import type {
+		DecisionMode,
+		NetworkEvidence,
+		NetworkPolicy,
+		NetworkPosteriors
+	} from '$lib/components/custom/network';
+	import IconFlag from '@lucide/svelte/icons/flag';
+	import { toggleSet } from '$lib/helpers';
+	import { dev } from '$app/environment';
+
 	// Utility functions (reused from NIMBUS — logic is identical)
 	import {
 		checkUtopiaMetadata,
@@ -155,6 +171,31 @@
 	let selected_measures: MeasureType[] = $state(['expected_value']);
 	let cvar_alpha = $state(0.95);
 	let combined_problem_name = $state('');
+
+	// Network structure demo dialog (frontend phase B) -- exercises the `<NetworkView>` embedding
+	// contract (evidence/posteriors/policy/decisionMode/nodeChrome) inside a real method UI's
+	// chrome, using a sample diagram rather than this problem's actual structure since no backend
+	// compiler exists yet (phases 4-7). Plain `string`, not `DecisionMode`, for the SegmentedControl
+	// binding -- see NetworkView's own `viewMode` for why.
+	let show_network_dialog = $state(false);
+	let network_model = $state(structuredClone(sampleIrrigationNetwork));
+	let network_evidence: NetworkEvidence = $state({});
+	let network_decision_mode_str = $state<string>('manual');
+	let network_decision_mode = $derived(network_decision_mode_str as DecisionMode);
+	let network_flagged: Set<string> = $state(new Set());
+
+	// Stand-in for what a compiled diagram's solve/inference would return -- see the dialog
+	// description in the markup below.
+	const NETWORK_DEMO_POLICY: NetworkPolicy = { irrigate: 'light' };
+	const NETWORK_DEMO_POSTERIORS: NetworkPosteriors = {
+		weather: [0.3, 0.4, 0.3],
+		soil_moisture: [0.25, 0.5, 0.25],
+		crop_yield: [0.2, 0.5, 0.3]
+	};
+
+	function toggle_network_flag(id: string) {
+		network_flagged = toggleSet(network_flagged, id);
+	}
 
 	$effect(() => {
 		if (problem && active_objective_symbols.size === 0) {
@@ -843,6 +884,16 @@
 					<DropdownMenu.Item onclick={() => (show_constraint_dialog = true)}>Add objective constraint</DropdownMenu.Item>
 					<DropdownMenu.Item>Add uncertainty measures</DropdownMenu.Item>
 					<DropdownMenu.Item>Modify problem</DropdownMenu.Item>
+					{#if dev}
+						<!-- Dev-only: exercises the network-view embedding contract (frontend phase B)
+						     against real fixture data, ahead of the backend compiler (phases 4-7) --
+						     see the import comment above. Gated out of production builds so a real
+						     CUMULUS user never sees a fabricated diagram styled like the real actions
+						     above it. -->
+						<DropdownMenu.Item onclick={() => (show_network_dialog = true)}>
+							View network structure (demo)
+						</DropdownMenu.Item>
+					{/if}
 				</DropdownMenu.Content>
 			</DropdownMenu.Root>
 		{/snippet}
@@ -1185,6 +1236,73 @@
 			<Dialog.Footer>
 				<Dialog.Close>
 					<Button variant="default">Done</Button>
+				</Dialog.Close>
+			</Dialog.Footer>
+		</Dialog.Content>
+	</Dialog.Portal>
+</Dialog.Root>
+
+<!-- Network structure dialog (demo) -- frontend phase B embedding contract, see the import
+     comment above -->
+<Dialog.Root bind:open={show_network_dialog}>
+	<Dialog.Portal>
+		<Dialog.Overlay />
+		<Dialog.Content class="flex h-[85vh] w-[90vw] max-w-4xl flex-col gap-3">
+			<Dialog.Header>
+				<Dialog.Title>Network structure (demo)</Dialog.Title>
+				<Dialog.Description>
+					Preview of the reusable graphical-model network component embedded in CUMULUS, ahead of
+					the backend compiler (plan phases 4-7). This shows a sample irrigation diagram, not this
+					problem's actual structure -- evidence, posteriors and the policy below are fixed demo
+					data, not a live solve.
+				</Dialog.Description>
+			</Dialog.Header>
+			<div class="flex flex-wrap items-center gap-3 text-sm">
+				<span class="text-muted-foreground">Decision mode:</span>
+				<SegmentedControl
+					size="sm"
+					bind:value={network_decision_mode_str}
+					options={[
+						{ value: 'manual', label: 'Manual' },
+						{ value: 'solver', label: 'Solver' }
+					]}
+				/>
+				{#if network_flagged.size > 0}
+					<span class="text-muted-foreground">
+						Flagged for follow-up: {[...network_flagged].join(', ')}
+					</span>
+				{/if}
+			</div>
+			<div class="min-h-0 flex-1">
+				<NetworkView
+					bind:model={network_model}
+					bind:evidence={network_evidence}
+					posteriors={NETWORK_DEMO_POSTERIORS}
+					policy={network_decision_mode === 'solver' ? NETWORK_DEMO_POLICY : undefined}
+					decisionMode={network_decision_mode}
+				>
+					{#snippet nodeChrome({ id })}
+						<button
+							type="button"
+							class="bg-background flex size-4 items-center justify-center rounded-full border shadow-sm"
+							title={network_flagged.has(id) ? 'Unflag' : 'Flag for follow-up'}
+							onclick={(e) => {
+								e.stopPropagation();
+								toggle_network_flag(id);
+							}}
+						>
+							<IconFlag
+								class="size-2.5 {network_flagged.has(id)
+									? 'text-primary'
+									: 'text-muted-foreground'}"
+							/>
+						</button>
+					{/snippet}
+				</NetworkView>
+			</div>
+			<Dialog.Footer>
+				<Dialog.Close>
+					<Button variant="outline">Close</Button>
 				</Dialog.Close>
 			</Dialog.Footer>
 		</Dialog.Content>

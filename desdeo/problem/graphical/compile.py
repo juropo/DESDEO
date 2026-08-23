@@ -46,24 +46,98 @@ possible (Remark 4) -- tightening it, and the Section 5 valid cuts, are optimisa
 concerns for a later phase, not correctness ones; the MILP (with `z` integrality) is exact
 regardless of which valid `b` is used.
 
-**Scope.** Only what Phase 4's checklist lists: mu/z variables, local consistency, CPT
-constraints, decision-link constraints, and one linear `Objective` per `ObjectiveNode`.
-`DiagramConstraint`/`RiskMeasure` compilation is Phase 5/6's job, not this module's -- see the
-plan.
+**Scope.** Phase 4's mu/z variables, local consistency, CPT constraints, decision-link
+constraints, and one linear `Objective` per `ObjectiveNode`, plus Phase 5's `DiagramConstraint`
+compilation (`_build_diagram_constraint`) and Phase 6's `RiskMeasure`/CVaR compilation
+(`_build_risk_measure`).
 
-**Reserved symbol namespace.** `mu_*`/`z_*`/`sep_*_*` (variables/extra functions) and
-`cpt_*`/`mc_hi_*`/`mc_lo_*`/`zsum_*`/`lc_*`/`mass_*` (constraints) are this module's own; an
-`ObjectiveNode`/`DiagramConstraint` symbol that happens to collide surfaces as an opaque
-`Problem` "non-unique symbols" error, not a message naming these as reserved -- worth knowing if
-one of those errors ever needs debugging.
+**Phase 6: CVaR (`RiskMeasure`), following Herrala, Terho & Oliveira, "Risk-averse decision
+strategies for influence diagrams using rooted junction trees" (Operations Research Letters 61
+(2025) 107308, arXiv:2401.03734), Section 3.4 and Table 1 (equations 11-21).** Applied as part of
+this same compile pass, using the target `ObjectiveNode`'s own containing cluster's mu -- not as a
+`Constraint` appended to an already-finished `Problem` the way a naive reading of "transformation"
+might suggest (see the plan's Phase 6 preamble, "applied as transformations... not as constraints
+appended afterward"). Concretely: `_build_risk_measure` takes the same `_objective_groups` result
+`_build_objective` uses for its target objective (`compile_diagram` computes `_objective_groups`
+once per distinct target objective symbol and shares it -- see `objective_groups_by_symbol` --
+rather than each caller recomputing an `O(cluster state space)` pass; a real inefficiency the code
+review pass caught, see the plan's Findings) but merges the per-state groups by
+*equal utility value* instead of summing them -- giving the target objective's own realizable
+utility support U and, for each u in U, a `Sum`/`Extract` expression over mu computing its
+(unnormalised, since mu is only pinned to total 1 at the root) probability p(u). One eta
+(`Variable`, playing the paper's own VaR_alpha role -- see `RiskMeasureIndexMap.eta_symbol`'s own
+docstring for why the *solved* value isn't guaranteed to equal the canonical VaR_alpha), and four
+length-|U| `TensorVariable`s (lambda, lambda_bar binary; rho, rho_bar in [0,1]) implement equations
+(11)-(20) exactly (`M = max(U) - min(U)`, `epsilon = 0.5 *
+min pairwise gap between distinct u values` -- both per the paper's own convention), and one
+`Objective` per `RiskMeasure` computes `CVaR_alpha = (1/alpha) * sum_u rho_bar(u) * u` (Eq. before
+Table 1, page 7).
+
+**A real, confirmed erratum in the published Table 1, not a lossy-fetch artifact.** Table 1's own
+description of rho_bar(u) at u = eta reads "alpha - sum_{u in U} p(u)" in the rendered PDF (checked
+by direct glyph/font inspection, not the lossy pypdf dump -- the character genuinely is Latin
+italic 'p', not a bar-dropped rho). That's dimensionally wrong: sum_{u in U} p(u) = 1 always (p is
+a full probability mass function), so alpha - 1 is negative for any alpha < 1, violating rho_bar's
+own [0,1] bound (20). The paper's own body text one paragraph later (page 7, "the value of
+rho_bar(u) must be alpha - sum_{u in U} rho(u) for u = eta") uses rho(u), not p(u) -- and since
+rho(u) = 0 for every u >= eta (established earlier in that same paragraph), summing rho(u) over
+all of U is exactly the tail sum sum_{u < eta} p(u), matching what equation (18) (sum_u rho_bar(u)
+= alpha) actually forces once rho_bar(u) = p(u) for u < eta and 0 for u > eta. This module
+implements the algebraically-derived, self-consistent behaviour (rho_bar(u) is only ever
+constrained by (11)-(18) directly -- no formula is hardcoded), so the erratum doesn't affect
+correctness here; it's recorded for anyone cross-checking against the paper's own Table 1 directly.
+
+**Sign convention for a minimizing target.** The paper's own u is a value/utility to be
+maximized throughout -- CVaR_alpha averages the *lower* alpha-tail (VaR_alpha down to the worst
+outcome), the risk-averse direction for maximization. DESDEO's `ObjectiveNode.maximize` can be
+`False` (a cost to minimize); for that case, `_build_risk_measure` runs the identical paper
+formulation over the *negated* utility values, then negates the resulting CVaR expression back
+(and reports the compiled `Objective` with `maximize=objective.maximize`, mirroring the target's
+own sense rather than always `True`) -- which is exactly the standard Rockafellar-Uryasev
+CVaR-of-loss framing (the risk-averse average of the worst, i.e. *highest*, cost outcomes,
+minimized), not something the paper itself needed to address since it has no minimizing case.
+
+**`DiagramConstraint.func` node-reference scope, Phase 5.** The only supported way `func` may
+reference a node in `DiagramConstraint.nodes` is `["At", "<node-symbol>", k]` -- a single 1-based
+own-state index. This module only compiles **linear combinations of single-node marginals**: any
+number of such `At` terms may be combined with `Add`/`Subtract`, and multiplied by a plain numeric
+constant (`Multiply`, at most one operand node-derived), but combining two or more node-derived
+subtrees under `Multiply`/`Divide`-by-a-node-derived-denominator/any other non-linear operator is
+rejected at compile time (see `_substitute_at_nodes`) -- a joint-event probability like
+`P(A == lo AND D == s0)` is genuinely *not* expressible this way: the natural-looking
+`["Multiply", At_A, At_D]` encoding would compute an independence-assuming *product* of two
+marginals, a different (and usually wrong) quantity, not the joint probability -- exactly why it's
+rejected rather than silently computed. Every reference to a node *anywhere else* in `func` -- a
+bare symbol leaf, in operator position, inside `Extract`/`Sum`, as `At`'s `k` argument with a
+non-literal-int index, or a node/objective symbol that exists elsewhere in the compiled model but
+isn't declared in this constraint's own `nodes` -- raises `ValueError` instead of being silently
+misinterpreted or silently passed through unsubstituted (the latter is a real risk if the
+reference happens to collide with another compiled symbol, e.g. an `ObjectiveNode.symbol`, since
+it would then silently resolve to *that* symbol's own compiled expression instead of erroring).
+`kind == decision` substitutes directly against that decision's own `z` (only supported for
+decisions with an empty *effective* information set -- see `_build_diagram_constraint`); `kind in
+{probability, expected_value}` substitutes against the marginal of that node's own state, read out
+of its containing cluster's `mu` (both kinds compile identically -- `kind` only documents the
+constraint author's intent, per the plan's taxonomy table); `kind == tail` is rejected outright --
+Phase 6 adds `RiskMeasure`/CVaR compilation (a different mechanism, see the module docstring), not
+a `DiagramConstraint` `kind == tail` implementation, so this remains unsupported.
+
+**Reserved symbol namespace.** `mu_*`/`z_*`/`sep_*_*`/`eta_*`/`lambda_*`/`lambdabar_*`/`rho_*`/
+`rhobar_*` (variables/extra functions) and `cpt_*`/`mc_hi_*`/`mc_lo_*`/`zsum_*`/`lc_*`/`mass_*`/
+`cvar_11_*`...`cvar_18_*` (constraints) are this module's own; an `ObjectiveNode`/
+`DiagramConstraint`/`RiskMeasure` symbol that happens to collide surfaces as an opaque `Problem`
+"non-unique symbols" error, not a message naming these as reserved -- worth knowing if one of
+those errors ever needs debugging.
 """
 
+import itertools
+from collections.abc import Callable
 from functools import lru_cache
 from math import prod
 from typing import Literal
 
 import numpy as np
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from desdeo.problem.graphical.index_map import mixed_radix_decode, mixed_radix_encode, separator_block_range
 from desdeo.problem.graphical.network import DiscreteNetwork, Potential
@@ -72,7 +146,14 @@ from desdeo.problem.graphical.rooted_junction_tree import (
     build_rooted_junction_tree,
     effective_information_sets,
 )
-from desdeo.problem.graphical.schema import DecisionAnnotation, DecisionNode, ObjectiveNode
+from desdeo.problem.graphical.schema import (
+    DecisionAnnotation,
+    DecisionNode,
+    DiagramConstraint,
+    DiagramConstraintKind,
+    ObjectiveNode,
+    RiskMeasure,
+)
 from desdeo.problem.schema import (
     Constraint,
     ConstraintTypeEnum,
@@ -80,6 +161,7 @@ from desdeo.problem.schema import (
     Objective,
     Problem,
     TensorVariable,
+    Variable,
     VariableTypeEnum,
 )
 
@@ -159,6 +241,50 @@ class DecisionIndexMap(BaseModel):
     """Symbol of the binary `TensorVariable`, length `prod(information_cardinalities) * len(states)`."""
 
 
+class RiskMeasureIndexMap(BaseModel):
+    """Bookkeeping for one compiled `RiskMeasure` (Phase 6, CVaR -- see the module docstring).
+
+    `utility_values` and `eta_symbol` are in *internal sign convention*: unchanged from the target
+    `ObjectiveNode`'s own utility values when it maximizes, negated when it minimizes (see the
+    module docstring's "Sign convention for a minimizing target" paragraph) -- `target_maximizes`
+    records which, so a caller reading `eta_symbol`'s solved value back would know whether to
+    negate it (`value if target_maximizes else -value`, same rule for `utility_values`) *if*
+    `eta_symbol` reliably held a value worth reading back this way -- see its own docstring below
+    for why it doesn't, in general.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    symbol: str
+    """`RiskMeasure.symbol`; also the compiled CVaR `Objective`'s own symbol."""
+    target: str
+    """`RiskMeasure.target` -- the `ObjectiveNode.symbol` this risk measure was built for."""
+    target_maximizes: bool
+    """`ObjectiveNode.maximize` of the target objective -- see the class docstring."""
+    utility_values: list[float]
+    """U's support, ascending, in internal sign convention -- index `i` (0-based) is the u that
+    `lambda_symbol`/`lambda_bar_symbol`/`rho_symbol`/`rho_bar_symbol`'s element `i+1` (1-based, per
+    `TensorVariable` convention) refers to."""
+    eta_symbol: str
+    """Symbol of the scalar `Variable` (11)-(18) constrain to *some* alpha-quantile of the
+    compiled distribution -- **not necessarily the canonical lower VaR_alpha, and not necessarily
+    equal to any element of `utility_values`.** Confirmed by the code review pass (see the plan's
+    Findings): whenever the CDF hits `alpha` exactly at a support point, the whole open interval up
+    to the next support point is equally feasible for `eta` and the CVaR objective is indifferent
+    to which point in it the solver picks -- e.g. `p=[0.5,0.3,0.2]`, `u=[10,20,30]`, `alpha=0.5`
+    compiles a correct `CVaR_0.5=10.0`, yet a solved `eta` of `15.0` (between the first two support
+    points, not equal to either) also satisfies every constraint. `CVaR_alpha` itself (the
+    corresponding compiled `Objective`'s value) has no such ambiguity -- only `eta`'s own solved
+    value does. A canonical VaR read-back, if ever needed, should be derived from the solved
+    `rho_bar`/mu (the smallest `u` whose cumulative `rho_bar` reaches `alpha`) rather than trusted
+    from `eta` directly -- not implemented here, out of this phase's scope."""
+    lambda_symbol: str
+    lambda_bar_symbol: str
+    rho_symbol: str
+    rho_bar_symbol: str
+    """Symbols of the four length-`len(utility_values)` `TensorVariable`s implementing (11)-(20)."""
+
+
 class IndexMap(BaseModel):
     """Everything needed to read a compiled solution back into cluster moments / policies.
 
@@ -176,6 +302,8 @@ class IndexMap(BaseModel):
     one cluster, same as every chance node), containing only the decision ones."""
     root: str
     """`RootedJunctionTree.root`, carried through for convenience."""
+    risk_measures: dict[str, RiskMeasureIndexMap] = Field(default_factory=dict)
+    """Keyed by `RiskMeasure.symbol`. Empty when `annotation.risk_measures` is empty."""
 
 
 @lru_cache(maxsize=2048)
@@ -431,13 +559,17 @@ def _build_local_consistency_constraints(
     return constraints
 
 
-def _build_objective(
+def _objective_groups(
     objective: ObjectiveNode,
     rjt: RootedJunctionTree,
     cluster_maps: dict[str, ClusterIndexMap],
     cardinality: dict[str, int],
-) -> Objective:
-    """One linear `Objective`, evaluated as a sum over its parents' joint states.
+) -> tuple[ClusterIndexMap, np.ndarray, list[list[int]], list[int]]:
+    """The containing cluster, utility array, and per-target-state mu flat-index groups.
+
+    Shared by `_build_objective` (which sums these into one linear expected-value `Objective`) and
+    `_build_risk_measure` (Phase 6, which instead merges them by equal utility value to get the
+    target's realizable utility distribution -- see that function's docstring).
 
     `objective.parents` is never empty in practice: `ObjectiveNode.utility` (a `Potential`) would
     need `shape=[]`/a 0-d `values` to represent a parent-less (constant) utility, and
@@ -463,7 +595,26 @@ def _build_objective(
     groups = _group_flat_indices_by_projection(
         cluster_map.nodes, cluster_map.cardinalities, objective.parents, target_cardinalities
     )
+    return cluster_map, utility_array, groups, target_cardinalities
 
+
+def _build_objective(
+    objective: ObjectiveNode,
+    cluster_map: ClusterIndexMap,
+    utility_array: np.ndarray,
+    groups: list[list[int]],
+    target_cardinalities: list[int],
+) -> Objective:
+    """One linear `Objective`, evaluated as a sum over its parents' joint states.
+
+    Takes `_objective_groups`' own return values directly rather than calling it itself, so
+    `compile_diagram` can compute `_objective_groups` once per distinct target objective and share
+    the result with every `RiskMeasure` targeting the same objective (`_build_risk_measure` takes
+    the identical shape) -- see `compile_diagram`'s `objective_groups_by_symbol`. `_objective_groups`
+    is an `O(cluster state space)` pass; recomputing it once per `RiskMeasure` sharing a target was
+    a real, measured inefficiency the code review caught (see the plan's Phase 6 review-pass
+    Findings).
+    """
     terms = []
     for target_flat, group in enumerate(groups):
         state = mixed_radix_decode(target_flat, target_cardinalities)
@@ -484,6 +635,559 @@ def _build_objective(
         symbol=objective.symbol,
         func=func,
         maximize=objective.maximize,
+        is_linear=True,
+        is_convex=True,
+        is_twice_differentiable=True,
+    )
+
+
+def _eta_symbol(symbol: str) -> str:
+    return f"eta_{symbol}"
+
+
+def _lambda_symbol(symbol: str) -> str:
+    return f"lambda_{symbol}"
+
+
+def _lambda_bar_symbol(symbol: str) -> str:
+    return f"lambdabar_{symbol}"
+
+
+def _rho_symbol(symbol: str) -> str:
+    return f"rho_{symbol}"
+
+
+def _rho_bar_symbol(symbol: str) -> str:
+    return f"rhobar_{symbol}"
+
+
+def _risk_measure_internal_symbols(risk_measures: list[RiskMeasure]) -> set[str]:
+    """Every eta/lambda/lambda_bar/rho/rho_bar symbol `_build_risk_measure` would emit for `risk_measures`.
+
+    Computed directly from each `RiskMeasure.symbol` (the naming is deterministic, no RJT/cluster
+    context needed) so `compile_diagram` can pass this to `_build_diagram_constraint` *before*
+    `_build_risk_measure` itself runs. Used to keep `DiagramConstraint.func` from silently reaching
+    into these reserved internal MILP variables (see the module docstring's reserved-namespace
+    note and `_build_diagram_constraint`'s own docstring) -- a gap the code review pass flagged
+    alongside the `objective_like_symbols` one.
+    """
+    symbols: set[str] = set()
+    for risk_measure in risk_measures:
+        symbols |= {
+            _eta_symbol(risk_measure.symbol),
+            _lambda_symbol(risk_measure.symbol),
+            _lambda_bar_symbol(risk_measure.symbol),
+            _rho_symbol(risk_measure.symbol),
+            _rho_bar_symbol(risk_measure.symbol),
+        }
+    return symbols
+
+
+_MIN_DISTINCT_UTILITY_VALUES_FOR_GAP = 2
+"""Fewer than two distinct utility values means no pair to compute a gap between -- see
+`_cvar_epsilon`'s degenerate-case fallback."""
+
+
+def _cvar_epsilon(distinct_us: list[float]) -> float:
+    """0.5 * the minimum gap between adjacent distinct utility values.
+
+    `distinct_us` is sorted ascending -- this is the paper's own convention (Section 3.4, citing
+    Salo et al. [22]) for choosing the smallest epsilon that still models (11)-(14)'s strict
+    inequalities correctly.
+
+    A single distinct utility value has no pair to compare, but also needs no real separation --
+    `eta` is then forced to equal that one value by (11)/(12) alone (`M = 0` in that case, since
+    `max(U) == min(U)`), for *any* positive epsilon. `1.0` is used as an arbitrary positive
+    placeholder in that degenerate case.
+    """
+    if len(distinct_us) < _MIN_DISTINCT_UTILITY_VALUES_FOR_GAP:
+        return 1.0
+    return 0.5 * min(b - a for a, b in itertools.pairwise(distinct_us))
+
+
+def _build_risk_measure(
+    risk_measure: RiskMeasure,
+    objective: ObjectiveNode,
+    cluster_map: ClusterIndexMap,
+    utility_array: np.ndarray,
+    groups: list[list[int]],
+    target_cardinalities: list[int],
+) -> tuple[list[Variable | TensorVariable], list[Constraint], Objective, RiskMeasureIndexMap]:
+    """One `RiskMeasure`'s CVaR reformulation.
+
+    Builds eta/lambda/lambda_bar/rho/rho_bar plus (11)-(20), and one `Objective` computing
+    `CVaR_alpha = (1/alpha) * sum_u rho_bar(u) * u` -- see the module docstring for the paper
+    citation, the Table 1 erratum this deliberately does *not* reproduce, and the sign convention
+    used when `objective.maximize` is `False`.
+
+    `objective` is the target `ObjectiveNode` (`annotation.objectives[i]` where
+    `.symbol == risk_measure.target` -- resolved by the caller, `compile_diagram`). Takes
+    `_objective_groups`' own return values directly (`cluster_map`/`utility_array`/`groups`/
+    `target_cardinalities`) rather than calling it itself -- see `_build_objective`'s docstring for
+    why (shared, memoised once per target objective by `compile_diagram`, not recomputed per
+    `RiskMeasure`). U -- the target's realizable utility support -- is obtained by merging
+    `groups` by equal utility value (unlike `_build_objective`, zero-utility states are *not*
+    skipped here: they're a real point of U's support with their own probability mass, not a term
+    that drops out of a sum).
+    """
+    sign = 1.0 if objective.maximize else -1.0
+
+    by_value: dict[float, list[int]] = {}
+    for target_flat, group in enumerate(groups):
+        if not group:
+            continue
+        state = mixed_radix_decode(target_flat, target_cardinalities)
+        u = sign * float(utility_array[state])
+        by_value.setdefault(u, []).extend(group)
+
+    us = sorted(by_value)
+    n = len(us)
+    p_exprs = [_extract_expr(cluster_map.mu_symbol, sorted(by_value[u])) for u in us]
+
+    alpha = risk_measure.alpha
+    symbol = risk_measure.symbol
+    big_m = us[-1] - us[0]
+    epsilon = _cvar_epsilon(us)
+
+    eta_symbol = _eta_symbol(symbol)
+    lambda_symbol = _lambda_symbol(symbol)
+    lambda_bar_symbol = _lambda_bar_symbol(symbol)
+    rho_symbol = _rho_symbol(symbol)
+    rho_bar_symbol = _rho_bar_symbol(symbol)
+
+    variables: list[Variable | TensorVariable] = [
+        Variable(name=f"VaR_alpha[{symbol}]", symbol=eta_symbol, variable_type=VariableTypeEnum.real),
+        TensorVariable(
+            name=f"lambda[{symbol}]", symbol=lambda_symbol, variable_type=VariableTypeEnum.binary, shape=[n]
+        ),
+        TensorVariable(
+            name=f"lambda_bar[{symbol}]",
+            symbol=lambda_bar_symbol,
+            variable_type=VariableTypeEnum.binary,
+            shape=[n],
+        ),
+        TensorVariable(
+            name=f"rho[{symbol}]",
+            symbol=rho_symbol,
+            variable_type=VariableTypeEnum.real,
+            shape=[n],
+            lowerbounds=0.0,
+            upperbounds=1.0,
+        ),
+        TensorVariable(
+            name=f"rho_bar[{symbol}]",
+            symbol=rho_bar_symbol,
+            variable_type=VariableTypeEnum.real,
+            shape=[n],
+            lowerbounds=0.0,
+            upperbounds=1.0,
+        ),
+    ]
+
+    def _linear(name: str, cons_symbol: str, func: list) -> Constraint:
+        return Constraint(
+            name=name,
+            symbol=cons_symbol,
+            cons_type=ConstraintTypeEnum.LTE,
+            func=func,
+            is_linear=True,
+            is_convex=True,
+            is_twice_differentiable=True,
+        )
+
+    constraints: list[Constraint] = []
+    for i, u in enumerate(us):
+        lam = ["At", lambda_symbol, i + 1]
+        lam_bar = ["At", lambda_bar_symbol, i + 1]
+        rho = ["At", rho_symbol, i + 1]
+        rho_bar = ["At", rho_bar_symbol, i + 1]
+        p = p_exprs[i]
+        eta_minus_u = ["Subtract", eta_symbol, u]
+
+        # (11) eta - u <= M * lambda(u)
+        constraints.append(
+            _linear(
+                f"CVaR VaR upper link (11) for {symbol} at u={u}",
+                f"cvar_11_{symbol}_{i}",
+                ["Subtract", eta_minus_u, ["Multiply", big_m, lam]],
+            )
+        )
+        # (12) eta - u >= (M+eps)*lambda(u) - M
+        constraints.append(
+            _linear(
+                f"CVaR VaR lower link (12) for {symbol} at u={u}",
+                f"cvar_12_{symbol}_{i}",
+                ["Subtract", ["Subtract", ["Multiply", big_m + epsilon, lam], big_m], eta_minus_u],
+            )
+        )
+        # (13) eta - u <= (M+eps)*lambda_bar(u) - eps
+        constraints.append(
+            _linear(
+                f"CVaR VaR upper link (13) for {symbol} at u={u}",
+                f"cvar_13_{symbol}_{i}",
+                ["Subtract", eta_minus_u, ["Subtract", ["Multiply", big_m + epsilon, lam_bar], epsilon]],
+            )
+        )
+        # (14) eta - u >= M*(lambda_bar(u) - 1)
+        constraints.append(
+            _linear(
+                f"CVaR VaR lower link (14) for {symbol} at u={u}",
+                f"cvar_14_{symbol}_{i}",
+                ["Subtract", ["Multiply", big_m, ["Subtract", lam_bar, 1]], eta_minus_u],
+            )
+        )
+        # (15) rho_bar(u) <= lambda_bar(u)
+        constraints.append(
+            _linear(
+                f"CVaR rho_bar <= lambda_bar (15) for {symbol} at u={u}",
+                f"cvar_15_{symbol}_{i}",
+                ["Subtract", rho_bar, lam_bar],
+            )
+        )
+        # (16) p(u) - (1 - lambda(u)) <= rho(u) <= lambda(u)
+        constraints.append(
+            _linear(
+                f"CVaR rho lower bound (16) for {symbol} at u={u}",
+                f"cvar_16lo_{symbol}_{i}",
+                ["Subtract", ["Subtract", p, ["Subtract", 1, lam]], rho],
+            )
+        )
+        constraints.append(
+            _linear(
+                f"CVaR rho upper bound (16) for {symbol} at u={u}",
+                f"cvar_16hi_{symbol}_{i}",
+                ["Subtract", rho, lam],
+            )
+        )
+        # (17) rho(u) <= rho_bar(u) <= p(u)
+        constraints.append(
+            _linear(
+                f"CVaR rho <= rho_bar (17) for {symbol} at u={u}",
+                f"cvar_17lo_{symbol}_{i}",
+                ["Subtract", rho, rho_bar],
+            )
+        )
+        constraints.append(
+            _linear(
+                f"CVaR rho_bar <= p (17) for {symbol} at u={u}",
+                f"cvar_17hi_{symbol}_{i}",
+                ["Subtract", rho_bar, p],
+            )
+        )
+
+    # (18) sum_u rho_bar(u) = alpha
+    constraints.append(
+        Constraint(
+            name=f"CVaR tail mass total (18) for {symbol}",
+            symbol=f"cvar_18_{symbol}",
+            cons_type=ConstraintTypeEnum.EQ,
+            func=["Subtract", ["Sum", rho_bar_symbol], alpha],
+            is_linear=True,
+            is_convex=True,
+            is_twice_differentiable=True,
+        )
+    )
+
+    cvar_terms = [["Multiply", u, ["At", rho_bar_symbol, i + 1]] for i, u in enumerate(us)]
+    cvar_expr: list = ["Multiply", 1.0 / alpha, ["Add", *cvar_terms]]
+    if not objective.maximize:
+        # See the module docstring's "Sign convention for a minimizing target": `cvar_expr` here
+        # is CVaR of the *negated* utility, i.e. -1 times the risk-averse average of the worst
+        # (highest) cost outcomes; negate back so the compiled Objective reports that quantity
+        # directly, in the target's own (cost) units, to be minimized.
+        cvar_expr = ["Multiply", -1.0, cvar_expr]
+
+    risk_objective = Objective(
+        name=risk_measure.symbol,
+        symbol=risk_measure.symbol,
+        func=cvar_expr,
+        maximize=objective.maximize,
+        is_linear=True,
+        is_convex=True,
+        is_twice_differentiable=True,
+    )
+
+    index_map = RiskMeasureIndexMap(
+        symbol=symbol,
+        target=objective.symbol,
+        target_maximizes=objective.maximize,
+        utility_values=us,
+        eta_symbol=eta_symbol,
+        lambda_symbol=lambda_symbol,
+        lambda_bar_symbol=lambda_bar_symbol,
+        rho_symbol=rho_symbol,
+        rho_bar_symbol=rho_bar_symbol,
+    )
+
+    return variables, constraints, risk_objective, index_map
+
+
+_AT_NODE_EXPR_LENGTH = 3
+"""Length of a matchable `["At", "<node>", k]` sub-list -- see `_substitute_at_nodes`."""
+
+_ALWAYS_LINEAR_OPERATORS = {"Add", "Subtract"}
+"""Operators that stay linear no matter how many node-derived operands they combine."""
+
+
+def _check_node_derived_linear(operator: str, derived_flags: list[bool], constraint_symbol: str) -> None:
+    """Reject a non-linear combination of node-derived subtrees under `operator`.
+
+    A "node-derived" subtree is one containing at least one substituted `At` reference (a
+    marginal/z value, per `_substitute_at_nodes`) -- called once per compiled operator node that
+    has at least one node-derived operand. `Add`/`Subtract` combine any number of them linearly
+    (the entire point of the `At`-only design -- see the module docstring). `Multiply` stays
+    linear only with at most one node-derived operand (the other side a plain constant, e.g.
+    "weight * probability" for an `expected_value` constraint); two or more node-derived operands
+    would multiply marginals together -- an independence-assuming product, not a linear
+    combination, and not the same quantity as a joint-event probability either. `Divide` stays
+    linear only when the denominator (every operand but the first, matching this module's/the
+    parser's left-to-right `reduce` semantics) isn't node-derived. Any other operator applied to a
+    node-derived operand (`Power`, etc.) is rejected outright.
+    """
+    if operator in _ALWAYS_LINEAR_OPERATORS:
+        return
+
+    if operator == "Multiply":
+        if sum(derived_flags) <= 1:
+            return
+        msg = (
+            f"DiagramConstraint '{constraint_symbol}': func multiplies two or more node-derived "
+            "terms together (e.g. two At-substituted marginals). This computes an "
+            "independence-assuming product, not a linear combination -- and isn't the same "
+            "quantity as a joint-event probability either. Only 'plain numeric constant * a "
+            "single node-derived term' is supported; see the module docstring's "
+            "single-node-marginals-only scope."
+        )
+        raise ValueError(msg)
+
+    if operator == "Divide":
+        if not any(derived_flags[1:]):
+            return
+        msg = (
+            f"DiagramConstraint '{constraint_symbol}': func divides by a node-derived "
+            "denominator (e.g. an At-substituted marginal) -- only dividing by a plain numeric "
+            "constant is a linear form; see the module docstring's single-node-marginals-only "
+            "scope."
+        )
+        raise ValueError(msg)
+
+    msg = (
+        f"DiagramConstraint '{constraint_symbol}': func applies operator '{operator}' to a "
+        "node-derived term (e.g. an At-substituted marginal) -- only Add/Subtract (any "
+        "combination) and Multiply/Divide by a plain numeric constant are supported linear "
+        "forms; see the module docstring's single-node-marginals-only scope."
+    )
+    raise ValueError(msg)
+
+
+def _substitute_at_nodes(
+    func: list | str | int | float,
+    nodes: set[str],
+    make_expr: Callable[[str, int], list],
+    constraint_symbol: str,
+    known_symbols: set[str],
+) -> tuple[list | str | int | float, bool]:
+    """Walk `func`, replacing every `["At", "<node>", k]` sub-list for `node` in `nodes`.
+
+    `make_expr(node, k)` builds the substituted MathJSON expression for one match (differs
+    between `kind == decision` and `kind in {probability, expected_value}` -- see
+    `_build_diagram_constraint`). `known_symbols` is every chance/decision/objective symbol that
+    exists anywhere in the compiled model (a superset of `nodes`) -- any occurrence of one of
+    these *outside* `nodes`, in any form, raises `ValueError` as "referenced but not declared in
+    nodes" (a node this constraint didn't declare, previously silently passed through
+    unsubstituted -- and, worse, silently resolving to another compiled symbol's own expression
+    at solve time if the name happened to collide with one); any occurrence of a `nodes` member
+    outside `["At", node, k]` -- a bare symbol leaf, in operator position, inside `Extract`/`Sum`,
+    or as `At`'s `k` argument with a non-literal-int index -- raises `ValueError` as "unsupported
+    form". Returns `(substituted, is_node_derived)`: `is_node_derived` is true iff the returned
+    subtree contains at least one substituted reference, used by the caller (via
+    `_check_node_derived_linear`) to reject non-linear combinations of node-derived subtrees --
+    this is the module docstring's `At`-only, linear-combinations-only scope restriction, enforced
+    here rather than assumed.
+    """
+    if isinstance(func, list) and len(func) == _AT_NODE_EXPR_LENGTH and func[0] == "At" and isinstance(func[1], str):
+        node = func[1]
+        if node in known_symbols:
+            if node not in nodes:
+                msg = (
+                    f"DiagramConstraint '{constraint_symbol}': func references node '{node}' via "
+                    f'["At", "{node}", ...], but "{node}" is not declared in this constraint\'s '
+                    f"nodes {sorted(nodes)}. Add it to nodes, or remove the reference."
+                )
+                raise ValueError(msg)
+            k = func[2]
+            if not isinstance(k, int) or isinstance(k, bool):
+                msg = (
+                    f"DiagramConstraint '{constraint_symbol}': the state index in "
+                    f'["At", "{node}", {k!r}] must be a literal 1-based integer, not {type(k).__name__}.'
+                )
+                raise ValueError(msg)
+            return make_expr(node, k), True
+
+    if isinstance(func, list):
+        operator = func[0]
+        substituted: list = [operator]
+        derived_flags: list[bool] = []
+        for item in func[1:]:
+            sub_item, is_derived = _substitute_at_nodes(item, nodes, make_expr, constraint_symbol, known_symbols)
+            substituted.append(sub_item)
+            derived_flags.append(is_derived)
+
+        is_node_derived = any(derived_flags)
+        if is_node_derived:
+            _check_node_derived_linear(operator, derived_flags, constraint_symbol)
+
+        return substituted, is_node_derived
+
+    if isinstance(func, str) and func in known_symbols:
+        if func in nodes:
+            msg = (
+                f"DiagramConstraint '{constraint_symbol}': func references node '{func}' in an "
+                'unsupported form. Only ["At", "<node>", k] (a single 1-based own-state index) is '
+                "supported for referencing a node's state -- combine several such At terms with "
+                "Add/Multiply/Subtract for anything more complex."
+            )
+        else:
+            msg = (
+                f"DiagramConstraint '{constraint_symbol}': func references '{func}', which is not "
+                f"declared in this constraint's nodes {sorted(nodes)}. Add it to nodes, or remove "
+                "the reference."
+            )
+        raise ValueError(msg)
+
+    return func, False
+
+
+def _build_diagram_constraint(
+    diagram_constraint: DiagramConstraint,
+    rjt: RootedJunctionTree,
+    cluster_maps: dict[str, ClusterIndexMap],
+    decision_maps: dict[str, DecisionIndexMap],
+    decision_effective_info_sets: dict[str, set[str]],
+    cardinality: dict[str, int],
+    objective_like_symbols: set[str],
+    reserved_risk_measure_symbols: set[str] = frozenset(),
+) -> Constraint:
+    """One `Constraint`, compiled per the Phase 5 taxonomy table (see the module docstring).
+
+    `kind == tail` is rejected -- Phase 6 adds `RiskMeasure`/CVaR compilation
+    (`_build_risk_measure`), a different mechanism than a `DiagramConstraint`, and doesn't give
+    `kind == tail` a compilation either. `kind == decision` is only supported for decisions whose
+    *effective* information set
+    (`effective_information_sets`) is empty: `z_<node>` is then just `own_cardinality` entries
+    (no information-state axis), so `["At", node, k]` substitutes directly to `["At", z_node, k]`
+    with no marginalisation needed -- an info-conditional decision constraint would need
+    per-information-state replication, out of scope here. `kind in {probability, expected_value}`
+    substitutes the marginal of `node`'s own state k, read out of its containing cluster's `mu`,
+    built the same way `_build_objective` evaluates an objective (`find_containing_cluster` +
+    `_group_flat_indices_by_projection` + `_extract_expr`) -- both kinds compile identically,
+    `kind` only records the constraint author's intent. The hardcoded `is_linear=True` etc. on the
+    returned `Constraint` are safe to hardcode *because* `_substitute_at_nodes` (via
+    `_check_node_derived_linear`) rejects anything that isn't actually a linear combination of
+    single-node marginals before this returns -- not merely assumed from the taxonomy table.
+
+    `objective_like_symbols` is every `ObjectiveNode.symbol` *and* every `RiskMeasure.symbol` --
+    both compile to an ordinary `Objective` in the emitted `Problem`, owning no RJT cluster or z,
+    so both must be rejected identically by the check just below, and both feed `known_symbols`
+    (below) so a bare/`At` reference to either outside `nodes` is rejected too, not silently passed
+    through. `reserved_risk_measure_symbols` (every risk measure's own internal eta/lambda/
+    lambda_bar/rho/rho_bar variable symbols -- see `_risk_measure_internal_symbols`) is folded into
+    `known_symbols` only, not this rejection: these aren't objective-like at all (a `DiagramConstraint`
+    was never meant to reference them under any kind, "tail" included), so they get the generic
+    "not declared in this constraint's nodes" rejection via `_substitute_at_nodes` rather than this
+    objective-specific one. Defaults to `frozenset()` for callers with no risk measures at all.
+    """
+    symbol = diagram_constraint.symbol
+    nodes = set(diagram_constraint.nodes)
+
+    if diagram_constraint.kind == DiagramConstraintKind.tail:
+        msg = (
+            f"DiagramConstraint '{symbol}' has kind 'tail' -- Phase 6 adds `RiskMeasure`/CVaR "
+            "compilation, a different mechanism than a DiagramConstraint, and doesn't give "
+            "kind 'tail' a compilation either. Not supported by this compiler."
+        )
+        raise ValueError(msg)
+
+    referenced_objectives = nodes & objective_like_symbols
+    if referenced_objectives:
+        msg = (
+            f"DiagramConstraint '{symbol}' (kind '{diagram_constraint.kind}') references "
+            f"objective or risk-measure symbol(s) {sorted(referenced_objectives)} -- neither owns "
+            "an RJT cluster or z, and can only legally be referenced by a 'tail' constraint."
+        )
+        raise ValueError(msg)
+
+    if diagram_constraint.kind == DiagramConstraintKind.decision:
+
+        def make_expr(node: str, k: int) -> list:
+            if node not in decision_maps:
+                msg = f"DiagramConstraint '{symbol}' (kind 'decision'): '{node}' isn't a DecisionNode."
+                raise ValueError(msg)
+            if decision_effective_info_sets[node]:
+                msg = (
+                    f"DiagramConstraint '{symbol}' (kind 'decision'): decision '{node}' has a "
+                    f"non-empty effective information set {sorted(decision_effective_info_sets[node])} "
+                    "-- info-conditional decision constraints are out of scope for this phase "
+                    "(they would need per-information-state replication)."
+                )
+                raise ValueError(msg)
+
+            own_cardinality = cardinality[node]
+            if not 1 <= k <= own_cardinality:
+                msg = (
+                    f"DiagramConstraint '{symbol}': state index {k} for decision '{node}' is out "
+                    f"of range (decision has {own_cardinality} states, expected 1..{own_cardinality}; "
+                    "only positive 1-based indices are supported here, not DESDEO's general "
+                    "end-relative negative indexing)."
+                )
+                raise ValueError(msg)
+
+            return ["At", decision_maps[node].z_symbol, k]
+
+    else:
+
+        def make_expr(node: str, k: int) -> list:
+            if node not in cardinality:
+                # Defensive: `_substitute_at_nodes` only ever calls `make_expr` for a `node` in
+                # `nodes`, and `nodes` is checked against `known_symbols` (below) before
+                # `make_expr` can be reached at all -- combined with the `referenced_objectives`
+                # rejection above (an objective/risk-measure symbol can't be in `nodes` here),
+                # every reachable `node` is guaranteed to be in `cardinality`. Should be
+                # unreachable.
+                msg = f"DiagramConstraint '{symbol}': '{node}' isn't a chance or decision node."
+                raise ValueError(msg)
+
+            own_cardinality = cardinality[node]
+            if not 1 <= k <= own_cardinality:
+                msg = (
+                    f"DiagramConstraint '{symbol}': state index {k} for node '{node}' is out of "
+                    f"range (node has {own_cardinality} states, expected 1..{own_cardinality}; only "
+                    "positive 1-based indices are supported here, not DESDEO's general "
+                    "end-relative negative indexing)."
+                )
+                raise ValueError(msg)
+
+            containing = rjt.find_containing_cluster([node])
+            if containing is None:
+                # Defensive: every node owns a cluster containing at least itself, by RJT
+                # construction (see build_rooted_junction_tree) -- should be unreachable.
+                msg = f"DiagramConstraint '{symbol}': no cluster contains node '{node}'."
+                raise ValueError(msg)
+
+            cluster_map = cluster_maps[containing]
+            groups = _group_flat_indices_by_projection(
+                cluster_map.nodes, cluster_map.cardinalities, [node], [own_cardinality]
+            )
+            return _extract_expr(cluster_map.mu_symbol, groups[k - 1])
+
+    known_symbols = set(cardinality) | objective_like_symbols | reserved_risk_measure_symbols
+    func, _ = _substitute_at_nodes(diagram_constraint.func, nodes, make_expr, symbol, known_symbols)
+
+    return Constraint(
+        name=diagram_constraint.name or diagram_constraint.symbol,
+        symbol=symbol,
+        cons_type=diagram_constraint.cons_type,
+        func=func,
         is_linear=True,
         is_convex=True,
         is_twice_differentiable=True,
@@ -551,9 +1255,13 @@ def compile_diagram(
         annotation: the decision/objective overlay; validated against `network` first.
         rjt: a pre-built `RootedJunctionTree` for `(network, annotation)` -- built with
             `build_rooted_junction_tree`'s defaults if omitted. Passing one in lets a caller
-            reuse a tree across recompiles (e.g. after `RiskMeasure` transforms, Phase 6).
-            Checked for the expected node set and for family containment (every chance node's
-            CPT parents, every decision's effective information set, and every cluster's
+            reuse a tree across recompiles. No RJT-level transform is needed for `RiskMeasure`
+            (Phase 6): `build_rooted_junction_tree`'s `_extend_family_for_clique` already folds
+            every `ObjectiveNode`'s parents -- including a `RiskMeasure`'s own target -- into some
+            cluster's family unconditionally (see `_build_risk_measure`'s docstring), so the same
+            tree that compiles a diagram's expected-value objectives already contains what CVaR
+            compilation needs. Checked for the expected node set and for family containment (every
+            chance node's CPT parents, every decision's effective information set, and every cluster's
             separator toward its parent must lie inside the cluster that's supposed to contain
             them) rather than recomputed from scratch, if given -- a stale tree from a materially
             different annotation fails here with a clear message instead of a bare `KeyError` deep
@@ -573,9 +1281,15 @@ def compile_diagram(
     Raises:
         ValueError: `annotation` doesn't validate against `network`; a chance node's CPT isn't
             normalised; `rjt` was given but doesn't match `(network, annotation)`'s expected node
-            set or family containment; or (defensively -- should not happen for a
+            set or family containment; (defensively -- should not happen for a
             `RootedJunctionTree` built by `build_rooted_junction_tree`) an `ObjectiveNode`'s
-            parents aren't contained in any cluster.
+            parents aren't contained in any cluster; or a `DiagramConstraint` is out of Phase 5's
+            scope (`kind == "tail"`, references an objective symbol, references a decision with a
+            non-empty effective information set under `kind == "decision"`, references a `nodes`
+            member in an unsupported MathJSON form, references a node/objective symbol that isn't
+            declared in this constraint's own `nodes`, combines node-derived subtrees under a
+            non-linear operator, or an `At` state index is out of range -- see
+            `_build_diagram_constraint`/`_substitute_at_nodes`).
     """
     annotation.validate_against(network)
     _check_cpts_normalized(network)
@@ -597,7 +1311,7 @@ def compile_diagram(
     decision_effective_info_sets = effective_information_sets(annotation)
 
     cluster_maps: dict[str, ClusterIndexMap] = {}
-    variables: list[TensorVariable] = []
+    variables: list[Variable | TensorVariable] = []
     extra_funcs: list[ExtraFunction] = []
 
     for ownership, cluster in rjt.clusters.items():
@@ -671,7 +1385,59 @@ def compile_diagram(
         )
     )
 
-    objectives = [_build_objective(objective, rjt, cluster_maps, cardinality) for objective in annotation.objectives]
+    # Computed once per distinct target objective symbol and shared below by both `_build_objective`
+    # and every `RiskMeasure` targeting that objective -- `_objective_groups` is an
+    # `O(cluster state space)` pass, and recomputing it once per `RiskMeasure` sharing a target
+    # (on top of `_build_objective`'s own call for the same objective) was a real, measured
+    # inefficiency the code review pass caught; see the plan's Phase 6 review-pass Findings.
+    objective_groups_by_symbol = {
+        objective.symbol: _objective_groups(objective, rjt, cluster_maps, cardinality)
+        for objective in annotation.objectives
+    }
+    objectives = [
+        _build_objective(objective, *objective_groups_by_symbol[objective.symbol])
+        for objective in annotation.objectives
+    ]
+
+    objective_symbols = {objective.symbol for objective in annotation.objectives}
+    risk_measure_symbols = {risk_measure.symbol for risk_measure in annotation.risk_measures}
+    # Every `RiskMeasure.symbol` compiles to a real `Objective` in the emitted `Problem`, exactly
+    # like an `ObjectiveNode.symbol` -- both must be treated identically by `_build_diagram_
+    # constraint`'s "an objective/risk-measure isn't a chance/decision node" rejection and its
+    # `known_symbols` undeclared-reference guard, or a `DiagramConstraint` can silently reach in
+    # and bind against a risk measure's own compiled CVaR value (a working back-door around the
+    # deliberate `kind == "tail"` rejection) -- a real hole the code review pass caught and this
+    # closes; see the plan's Findings.
+    objective_like_symbols = objective_symbols | risk_measure_symbols
+    reserved_risk_measure_symbols = _risk_measure_internal_symbols(annotation.risk_measures)
+    constraints.extend(
+        _build_diagram_constraint(
+            diagram_constraint,
+            rjt,
+            cluster_maps,
+            decision_maps,
+            decision_effective_info_sets,
+            cardinality,
+            objective_like_symbols,
+            reserved_risk_measure_symbols,
+        )
+        for diagram_constraint in annotation.constraints
+    )
+
+    objective_by_symbol = {objective.symbol: objective for objective in annotation.objectives}
+    risk_index_maps: dict[str, RiskMeasureIndexMap] = {}
+    for risk_measure in annotation.risk_measures:
+        # `risk_measure.target` is guaranteed to name a real objective by
+        # `DecisionAnnotation._check_internal_structure` (runs on every construction, since the
+        # model is frozen) -- no defensive check needed here.
+        target_objective = objective_by_symbol[risk_measure.target]
+        risk_variables, risk_constraints, risk_objective, risk_index_map = _build_risk_measure(
+            risk_measure, target_objective, *objective_groups_by_symbol[risk_measure.target]
+        )
+        variables.extend(risk_variables)
+        constraints.extend(risk_constraints)
+        objectives.append(risk_objective)
+        risk_index_maps[risk_measure.symbol] = risk_index_map
 
     problem = Problem(
         name=network.name or "compiled_diagram",
@@ -682,6 +1448,6 @@ def compile_diagram(
         extra_funcs=extra_funcs,
     )
 
-    index_map = IndexMap(clusters=cluster_maps, decisions=decision_maps, root=rjt.root)
+    index_map = IndexMap(clusters=cluster_maps, decisions=decision_maps, root=rjt.root, risk_measures=risk_index_maps)
 
     return problem, index_map

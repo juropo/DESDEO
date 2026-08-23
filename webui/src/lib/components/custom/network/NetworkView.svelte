@@ -11,7 +11,7 @@
 	 * Level of detail (`compact` / `normal` / `expanded`, see `lod.ts`) is driven by the canvas
 	 * container's width *and* the current zoom, or pinned to `'compact'` via the `compact` prop.
 	 */
-	import { onMount, untrack } from 'svelte';
+	import { onMount, untrack, type Snippet } from 'svelte';
 	import { SvelteFlow, Background, Controls, type Viewport } from '@xyflow/svelte';
 	import '@xyflow/svelte/dist/base.css';
 	import { Button } from '$lib/components/ui/button';
@@ -21,28 +21,71 @@
 	import { NETWORK_NODE_TYPES } from './nodes';
 	import { computeElkLayout, layoutCoversModel } from './layout';
 	import { computeDetailLevel } from './lod';
+	import { isNodeEditable, mergeHighlightSets, toggleEvidenceState } from './interaction';
 	import { ancestralSet, buildAdjacency, type Adjacency } from './dag-algorithms';
-	import type { NetworkModel } from './types';
-	import type { NetworkFlowEdge, NetworkFlowNode } from './view-types';
+	import type {
+		DecisionMode,
+		NetworkEvidence,
+		NetworkModel,
+		NetworkPolicy,
+		NetworkPosteriors
+	} from './types';
+	import type {
+		HighlightState,
+		NetworkChromeContext,
+		NetworkFlowEdge,
+		NetworkFlowNode
+	} from './view-types';
 
 	interface Props {
 		/** Bindable so a computed layout (auto, or from "Re-layout") can be persisted by the
 		 *  caller — see the plan's design decision on where compiled-model metadata lives. */
 		model: NetworkModel;
+		/** Hard evidence pinned per node id. Bindable: editable nodes (see `isNodeEditable`) toggle
+		 *  it on click, but a method UI or `<NetworkPanel>` is free to set/read it directly too —
+		 *  e.g. to seed evidence from elsewhere in its own UI. */
+		evidence?: NetworkEvidence;
+		/** Per-node posterior probabilities to render as state bars (phase B is UI-only — this is
+		 *  the wire shape a real compiled-diagram what-if response fills in later, not a live
+		 *  computation done here). */
+		posteriors?: NetworkPosteriors;
+		/** A solved policy's chosen state per decision node, shown read-only in
+		 *  `decisionMode: 'solver'`. */
+		policy?: NetworkPolicy;
+		/** `'solver'` (default): decision nodes display `policy`'s choice, read-only. `'manual'`:
+		 *  decision nodes become clickable like chance nodes, writing the chosen state into
+		 *  `evidence` instead. */
+		decisionMode?: DecisionMode;
+		/** Externally driven highlight set — e.g. hovering an objective in a reference-point widget
+		 *  (phase C) — unioned with the hover/select ancestor highlighting this component already
+		 *  computes on its own. */
+		highlight?: Iterable<string> | null;
+		/** Injected per-node chrome (a badge, icon, etc.) so a method UI can decorate nodes without
+		 *  forking this component or `GraphNode`. Receives `{ id, kind, label }` for the node being
+		 *  rendered. */
+		nodeChrome?: Snippet<[NetworkChromeContext]>;
 		/** Pins the level of detail to `'compact'` regardless of container width/zoom — set this
 		 *  when the caller already knows it's embedding into a small panel. */
 		compact?: boolean;
 		class?: string;
 		onNodeSelect?: (id: string | null) => void;
 		onNodeHover?: (id: string | null) => void;
+		onEvidenceChange?: (evidence: NetworkEvidence) => void;
 	}
 
 	let {
 		model = $bindable(),
+		evidence = $bindable({}),
+		posteriors,
+		policy,
+		decisionMode = 'solver',
+		highlight = null,
+		nodeChrome,
 		compact = false,
 		class: className = '',
 		onNodeSelect,
-		onNodeHover
+		onNodeHover,
+		onEvidenceChange
 	}: Props = $props();
 
 	let containerEl = $state<HTMLDivElement | null>(null);
@@ -66,27 +109,44 @@
 	// up its ancestor set. Full active-trail-given-evidence highlighting needs evidence state
 	// that only exists once phase D's what-if machinery lands.
 	let highlightFocusId = $derived(hoveredId ?? selectedId);
+	// Unioned with the externally supplied `highlight` prop (phase C: cross-highlighting driven
+	// by other UI, e.g. hovering an objective in a reference-point widget) — see `mergeHighlightSets`.
 	let highlightedIds = $derived.by((): Set<string> | null => {
-		if (!highlightFocusId) return null;
-		return ancestralSet(model, [highlightFocusId], adjacency);
+		const internal = highlightFocusId ? ancestralSet(model, [highlightFocusId], adjacency) : null;
+		return mergeHighlightSets(internal, highlight);
 	});
 
 	let flowNodes = $state.raw<NetworkFlowNode[]>([]);
 	let flowEdges = $state.raw<NetworkFlowEdge[]>([]);
 
-	// Single reconciliation point: reruns on structural changes (node/edge set), detail-level
-	// changes (resize/zoom), and highlight changes (hover/select). Existing node positions
-	// (including manual drags) are preserved via `prevPositions`; only genuinely new nodes fall
-	// back to the persisted layout or the origin.
+	function highlightStateFor(id: string, highlights: Set<string> | null): HighlightState {
+		if (!highlights) return 'normal';
+		return highlights.has(id) ? 'active' : 'dimmed';
+	}
+
+	// Structural reconciliation: reruns on node/edge-set changes, detail-level changes
+	// (resize/zoom), and evidence/policy/posteriors/decisionMode/chrome changes -- deliberately
+	// *not* on highlight changes (hover/select), which the lightweight effect below handles
+	// instead. Rebuilding this whole array (including a fresh `onStateClick` closure per node)
+	// on every hover/select used to make each mouse move over the canvas reallocate N node
+	// objects and N throwaway closures for what is otherwise only a `highlight` field flip.
+	// Existing node positions (including manual drags) are preserved via `prevPositions`; only
+	// genuinely new nodes fall back to the persisted layout or the origin.
 	$effect(() => {
 		const nodes = model.nodes;
 		const edges = model.edges;
 		const layout = model.layout;
 		const detail = detailLevel;
-		const focusId = highlightFocusId;
-		const highlights = highlightedIds;
+		const evidenceSnapshot = evidence;
+		const policySnapshot = policy;
+		const posteriorSnapshot = posteriors;
+		const mode = decisionMode;
+		const chrome = nodeChrome;
 
 		untrack(() => {
+			// Read without subscribing -- this effect only needs *a* value to seed with; the
+			// highlight-patch effect below is what keeps it in sync as it changes.
+			const highlights = highlightedIds;
 			const prevPositions = new Map(flowNodes.map((n) => [n.id, n.position]));
 			flowNodes = nodes.map((n) => ({
 				id: n.id,
@@ -98,18 +158,45 @@
 					states: n.states,
 					description: n.description,
 					detail,
-					highlight: focusId
-						? n.id === focusId
-							? ('active' as const)
-							: highlights?.has(n.id)
-								? ('active' as const)
-								: ('dimmed' as const)
-						: ('normal' as const)
+					highlight: highlightStateFor(n.id, highlights),
+					editable: isNodeEditable(n.kind, mode),
+					evidenceState: evidenceSnapshot[n.id],
+					// Only meaningful read-only in 'solver' mode -- in 'manual' mode the node is
+					// interactive instead, and shouldn't also show a (possibly stale) solved
+					// policy's checkmark alongside its clickable states.
+					policyState: n.kind === 'decision' && mode === 'solver' ? policySnapshot?.[n.id] : undefined,
+					posterior: posteriorSnapshot?.[n.id],
+					chrome,
+					onStateClick: (state: string) => handleStateClick(n.id, state)
 				}
 			}));
 			flowEdges = edges.map((e) => ({ id: e.id, source: e.source, target: e.target }));
 		});
 	});
+
+	// Lightweight highlight-only patch: keeps `flowNodes` in sync with `highlightedIds` (hover/
+	// select, or an externally supplied `highlight` prop) without rebuilding the rest of each
+	// node's data or its closures -- see the effect above.
+	$effect(() => {
+		const highlights = highlightedIds;
+		untrack(() => {
+			flowNodes = flowNodes.map((n) => {
+				const nextHighlight = highlightStateFor(n.id, highlights);
+				return n.data.highlight === nextHighlight
+					? n
+					: { ...n, data: { ...n.data, highlight: nextHighlight } };
+			});
+		});
+	});
+
+	/** Bound into each node's `data.onStateClick` above — toggles hard evidence on that node's
+	 *  state and notifies the caller. Only reachable for editable nodes; `GraphNode` gates the
+	 *  click affordance on `data.editable`, itself driven by `isNodeEditable`. */
+	function handleStateClick(nodeId: string, state: string) {
+		const next = toggleEvidenceState(evidence, nodeId, state);
+		evidence = next;
+		onEvidenceChange?.(next);
+	}
 
 	async function relayout() {
 		relayouting = true;
@@ -219,7 +306,7 @@
 		>
 			<NetworkTable
 				{model}
-				highlightedId={highlightFocusId}
+				{highlightedIds}
 				onRowHover={handleTableHover}
 				onRowSelect={handleTableSelect}
 			/>

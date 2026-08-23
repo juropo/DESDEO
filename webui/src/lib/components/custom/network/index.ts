@@ -5,6 +5,7 @@
 
 export { default as NetworkView } from './NetworkView.svelte';
 export { default as NetworkTable } from './NetworkTable.svelte';
+export { default as NetworkPanel } from './NetworkPanel.svelte';
 
 export type {
 	NetworkModel,
@@ -12,10 +13,21 @@ export type {
 	NetworkEdgeModel,
 	NetworkNodeKind,
 	NetworkLayoutModel,
-	NetworkLayoutPosition
+	NetworkLayoutPosition,
+	DecisionMode,
+	NetworkEvidence,
+	NetworkPosteriors,
+	NetworkPolicy,
+	WhatIfResult
 } from './types';
 
-export type { DetailLevel, HighlightState, NetworkFlowNode, NetworkFlowEdge } from './view-types';
+export type {
+	DetailLevel,
+	HighlightState,
+	NetworkFlowNode,
+	NetworkFlowEdge,
+	NetworkChromeContext
+} from './view-types';
 
 export { NODE_KIND_STYLE } from './node-style';
 export type { NodeShape, NodeKindStyle } from './node-style';
@@ -34,3 +46,5 @@ export {
 } from './dag-algorithms';
 
 export { computeDetailLevel } from './lod';
+
+export { isNodeEditable, toggleEvidenceState, mergeHighlightSets } from './interaction';

@@ -52,6 +52,7 @@
 	import { Input } from '$lib/components/ui/input/index.js';
 	import { Label } from '$lib/components/ui/label/index.js';
 	import { openInputDialog } from '$lib/components/custom/dialogs/dialogs';
+	import { toggleSet } from '$lib/helpers';
 
 
 	import type { PageProps } from './$types';
@@ -322,13 +323,6 @@
 			availableSolvers = solvers;
 		});
 	});
-
-	function toggleSet(set: Set<number>, index: number): Set<number> {
-		const next = new Set(set);
-		if (next.has(index)) next.delete(index);
-		else next.add(index);
-		return next;
-	}
 
 	function handleDelete(problem: ProblemInfo) {
 		openInputDialog({

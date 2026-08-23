@@ -12,13 +12,15 @@
 
 	interface Props {
 		model: NetworkModel;
-		/** Currently hovered/selected node id, for row <-> canvas cross-highlighting. */
-		highlightedId?: string | null;
+		/** Node ids to highlight, for row <-> canvas cross-highlighting -- the same merged set
+		 *  (hover/select ancestor closure unioned with any externally supplied `highlight` prop)
+		 *  the canvas uses, so both panes of a split view agree on what's highlighted. */
+		highlightedIds?: Set<string> | null;
 		onRowHover?: (id: string | null) => void;
 		onRowSelect?: (id: string) => void;
 	}
 
-	let { model, highlightedId = null, onRowHover, onRowSelect }: Props = $props();
+	let { model, highlightedIds = null, onRowHover, onRowSelect }: Props = $props();
 
 	type SortKey = 'label' | 'kind' | 'parents' | 'children';
 	let sortKey = $state<SortKey>('label');
@@ -100,7 +102,7 @@
 		<Table.Body>
 			{#each rows as row (row.node.id)}
 				<Table.Row
-					class="cursor-pointer {highlightedId === row.node.id ? 'bg-accent/60' : ''}"
+					class="cursor-pointer {highlightedIds?.has(row.node.id) ? 'bg-accent/60' : ''}"
 					onmouseenter={() => onRowHover?.(row.node.id)}
 					onmouseleave={() => onRowHover?.(null)}
 					onclick={() => onRowSelect?.(row.node.id)}
