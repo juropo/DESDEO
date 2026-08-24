@@ -18,6 +18,7 @@ export type {
 	NetworkEvidence,
 	NetworkPosteriors,
 	NetworkPolicy,
+	NetworkUtilities,
 	WhatIfResult
 } from './types';
 
@@ -49,7 +50,26 @@ export type { Adjacency } from './dag-algorithms';
 
 export { computeDetailLevel } from './lod';
 
-export { isNodeEditable, toggleEvidenceState, mergeHighlightSets } from './interaction';
+export {
+	isNodeEditable,
+	toggleEvidenceState,
+	mergeHighlightSets,
+	EVIDENCE_MODE_NOTE
+} from './interaction';
 
 export { createNetworkHighlightStore } from './highlight-store';
 export type { NetworkHighlightStore } from './highlight-store';
+
+export {
+	createDebouncer,
+	createWhatIfRunner,
+	computeDelta,
+	dominantDeltaIndex,
+	hasEvidenceDiverged,
+	EVIDENCE_DEBOUNCE_MS,
+	BAR_TRANSITION_MS,
+	DELTA_DISPLAY_THRESHOLD
+} from './whatif';
+export type { Debouncer, WhatIfRunner } from './whatif';
+
+export { explainNoChange } from './null-explanation';

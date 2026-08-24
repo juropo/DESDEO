@@ -42,6 +42,17 @@ export interface NetworkNodeData extends Record<string, unknown> {
 	policyState?: string;
 	/** Per-state posterior probabilities, aligned with `states` (see `NetworkPosteriors`). */
 	posterior?: number[];
+	/** Baseline distribution `posterior` is diffed against — the prior (no evidence at all) until
+	 *  the DM commits some evidence, at which point it becomes that committed evidence's own
+	 *  posteriors (see `NetworkView`'s `ghostPosteriors`/`committedEvidence`/`onCommitEvidence`
+	 *  props, phase D). Rendered behind/alongside `posterior` as a ghost mark; without it a
+	 *  posterior bar conveys nothing on its own. */
+	ghostPosterior?: number[];
+	/** Set when `posterior` came back identical to `ghostPosterior` (within floating-point noise)
+	 *  *and* that's provably because this node is d-separated from the current evidence set — see
+	 *  `explainNoChange` in `null-explanation.ts`. Shown instead of leaving the DM to assume the
+	 *  tool silently failed to update. */
+	nullExplanation?: string;
 	/** Fired when an editable state is clicked; `NetworkView` supplies a closure bound to this
 	 *  node's id. */
 	onStateClick?: (state: string) => void;

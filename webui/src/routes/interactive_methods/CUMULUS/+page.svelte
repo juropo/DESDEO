@@ -31,15 +31,22 @@
 	// Graphical-models plan, frontend phase B: embedding the reusable network component into a
 	// real method UI, ahead of any backend compiler (phases 4-7) -- see the "Findings" for phase B
 	// in .claude/desdeo-graphical-models-plan.md for why this uses demo data rather than a live
-	// compiled diagram for this problem.
+	// compiled diagram for this problem. Phase D adds the ghost/delta/commit/debounce-dim wiring,
+	// via a deterministic mock what-if (`mockWhatIf`) standing in for the same reason.
 	import {
 		NetworkView,
 		createNetworkHighlightStore,
+		createWhatIfRunner,
+		EVIDENCE_DEBOUNCE_MS,
 		ancestralSet,
 		descendants,
 		buildAdjacency
 	} from '$lib/components/custom/network';
-	import { sampleIrrigationNetwork } from '$lib/components/custom/network/sample-network';
+	import {
+		mockWhatIf,
+		sampleIrrigationBaselinePosteriors,
+		sampleIrrigationNetwork
+	} from '$lib/components/custom/network/sample-network';
 	import type {
 		DecisionMode,
 		NetworkEvidence,
@@ -193,14 +200,77 @@
 	// Stand-in for what a compiled diagram's solve/inference would return -- see the dialog
 	// description in the markup below.
 	const NETWORK_DEMO_POLICY: NetworkPolicy = { irrigate: 'light' };
-	const NETWORK_DEMO_POSTERIORS: NetworkPosteriors = {
-		weather: [0.3, 0.4, 0.3],
-		soil_moisture: [0.25, 0.5, 0.25],
-		crop_yield: [0.2, 0.5, 0.3]
-	};
 
 	function toggle_network_flag(id: string) {
 		network_flagged = toggleSet(network_flagged, id);
+	}
+
+	// Phase D (what-if): current/committed evidence, posteriors, and the ghost baseline they're
+	// diffed against -- mirrors `NetworkPanel`'s own state exactly (see that component's
+	// findings-referenced comments), except driven by `mockWhatIf` (no live backend to call for
+	// this problem -- see the import comment above) instead of a real `/graphical/whatif` fetch.
+	// Seeded with the baseline directly (not left `undefined` until the first async round-trip)
+	// so the dialog never flashes empty bars on open.
+	let network_posteriors: NetworkPosteriors = $state(
+		structuredClone(sampleIrrigationBaselinePosteriors)
+	);
+	let network_committed_evidence: NetworkEvidence = $state({});
+	let network_committed_posteriors: NetworkPosteriors | undefined = $state(undefined);
+	let network_ghost_posteriors = $derived(
+		network_committed_posteriors ?? sampleIrrigationBaselinePosteriors
+	);
+	let network_stale = $state(false);
+
+	// Simulated latency so the demo actually exercises debounce/cancel/dim (phase D item 3), not
+	// just an instantaneous synchronous update that could never show a stale/dimmed canvas.
+	const NETWORK_DEMO_LATENCY_MS = 400;
+
+	function fetch_mock_whatif(
+		evidence: NetworkEvidence,
+		signal: AbortSignal
+	): Promise<NetworkPosteriors> {
+		return new Promise((resolve, reject) => {
+			const timer = setTimeout(() => resolve(mockWhatIf(evidence)), NETWORK_DEMO_LATENCY_MS);
+			signal.addEventListener('abort', () => {
+				clearTimeout(timer);
+				reject(new DOMException('Aborted', 'AbortError'));
+			});
+		});
+	}
+
+	const network_whatif_runner = createWhatIfRunner<NetworkPosteriors>(
+		EVIDENCE_DEBOUNCE_MS,
+		(result) => {
+			network_posteriors = result;
+		},
+		(e) => console.error('(demo) mock what-if failed', e),
+		(stale) => {
+			network_stale = stale;
+		}
+	);
+
+	// Re-runs the (debounced, cancellable) mock what-if whenever evidence changes -- mirrors
+	// `NetworkPanel`'s real `handleEvidenceChange` against the deterministic mock instead of a
+	// live backend.
+	$effect(() => {
+		const ev = network_evidence;
+		network_whatif_runner.request((signal) => fetch_mock_whatif(ev, signal));
+	});
+
+	// A pending debounce timer or in-flight mock fetch must not outlive this page -- mirrors
+	// `NetworkPanel`'s own unmount teardown. Distinct from the dialog-close effect below (which
+	// cancels on *close*, since the dialog can reopen and the DM keeps navigating this route); this
+	// one only ever fires once, on navigating away from CUMULUS entirely.
+	$effect(() => {
+		return () => network_whatif_runner.cancel();
+	});
+
+	// Commit (phase D: exploratory vs. committed evidence) -- promotes the current evidence and
+	// its (already-fetched) posteriors into the new ghost baseline, exactly like `NetworkPanel`'s
+	// `handleCommitEvidence`.
+	function handle_network_commit(evidence: NetworkEvidence) {
+		network_committed_evidence = evidence;
+		network_committed_posteriors = network_posteriors;
 	}
 
 	// Phase C (cross-highlighting): a shared highlight store, plus a mock "(demo) Reference
@@ -268,13 +338,26 @@
 	});
 
 	// Escape (or any dialog close that doesn't fire `mouseleave`/blur on the hovered/focused
-	// element) must not leave a stale highlight lit next time the dialog reopens.
+	// element) must not leave a stale highlight lit next time the dialog reopens. Also cancels any
+	// pending/in-flight mock what-if (phase D) -- the same "don't let a debounced/in-flight request
+	// outlive what it was chasing" hygiene `NetworkPanel.loadStructure` applies on a `modelId`
+	// change, applied here to a dialog close instead -- and resets evidence/posteriors/commit state
+	// alongside it. Without this, closing mid-debounce/mid-flight left `network_evidence` pinned
+	// against `network_posteriors` that never actually got refreshed for it, so reopening showed a
+	// pin badge with no way to trigger a refresh (the evidence-watching effect below only re-fires
+	// on an actual *change*, and nothing had changed since the stale request was cancelled).
 	$effect(() => {
 		if (!show_network_dialog) {
 			network_hovered_id = null;
 			network_selected_id = null;
 			network_highlight.set(null);
 			network_influenced_objectives = new Set();
+			network_whatif_runner.cancel();
+			network_stale = false;
+			network_evidence = {};
+			network_posteriors = structuredClone(sampleIrrigationBaselinePosteriors);
+			network_committed_evidence = {};
+			network_committed_posteriors = undefined;
 		}
 	});
 
@@ -1334,8 +1417,12 @@
 				<Dialog.Description>
 					Preview of the reusable graphical-model network component embedded in CUMULUS, ahead of
 					the backend compiler (plan phases 4-7). This shows a sample irrigation diagram, not this
-					problem's actual structure -- evidence, posteriors and the policy below are fixed demo
-					data, not a live solve. The "Reference point" panel on the right is a stand-in for a real
+					problem's actual structure -- the policy below is fixed demo data, but posteriors now
+					come from a deterministic mock what-if (not a live solve) with artificial latency, so
+					toggling a state chip exercises the same debounce/cancel/staleness-dimming a real
+					`/graphical/whatif` call would. Try pinning "Irrigate" (with weather/soil moisture left
+					alone) to see "Weather" report itself unaffected -- it's d-separated from that evidence
+					in this diagram. The "Reference point" panel on the right is a stand-in for a real
 					reference-point widget, proving the phase C cross-highlight contract.
 				</Dialog.Description>
 			</Dialog.Header>
@@ -1360,12 +1447,16 @@
 					<NetworkView
 						bind:model={network_model}
 						bind:evidence={network_evidence}
-						posteriors={NETWORK_DEMO_POSTERIORS}
+						posteriors={network_posteriors}
+						ghostPosteriors={network_ghost_posteriors}
+						committedEvidence={network_committed_evidence}
+						stale={network_stale}
 						policy={network_decision_mode === 'solver' ? NETWORK_DEMO_POLICY : undefined}
 						decisionMode={network_decision_mode}
 						highlight={$network_highlight}
 						onNodeHover={handle_network_hover}
 						onNodeSelect={handle_network_select}
+						onCommitEvidence={handle_network_commit}
 					>
 						{#snippet nodeChrome({ id })}
 							<button

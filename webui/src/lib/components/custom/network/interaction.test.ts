@@ -1,10 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import {
+	filterChanceEvidence,
 	isNodeEditable,
 	isStatePinned,
 	mergeHighlightSets,
 	toggleEvidenceState
 } from './interaction';
+import type { NetworkModel } from './types';
 
 describe('isNodeEditable', () => {
 	it('chance nodes are always editable', () => {
@@ -62,6 +64,35 @@ describe('isStatePinned', () => {
 	it('is not pinned otherwise', () => {
 		expect(isStatePinned({ evidenceState: 'dry' }, 'wet')).toBe(false);
 		expect(isStatePinned({}, 'dry')).toBe(false);
+	});
+});
+
+describe('filterChanceEvidence', () => {
+	const model: NetworkModel = {
+		nodes: [
+			{ id: 'weather', label: 'Weather', kind: 'chance', states: ['dry', 'wet'] },
+			{ id: 'irrigate', label: 'Irrigate', kind: 'decision', states: ['none', 'light'] },
+			{ id: 'profit', label: 'Profit', kind: 'objective' }
+		],
+		edges: []
+	};
+
+	it('keeps only chance-node evidence entries', () => {
+		expect(filterChanceEvidence(model, { weather: 'dry', irrigate: 'light' })).toEqual({
+			weather: 'dry'
+		});
+	});
+
+	it('drops evidence for ids not present in the model at all', () => {
+		expect(filterChanceEvidence(model, { unknown_id: 'x' })).toEqual({});
+	});
+
+	it('returns an empty map unchanged', () => {
+		expect(filterChanceEvidence(model, {})).toEqual({});
+	});
+
+	it('is a no-op when every entry is already chance-node evidence', () => {
+		expect(filterChanceEvidence(model, { weather: 'wet' })).toEqual({ weather: 'wet' });
 	});
 });
 

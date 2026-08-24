@@ -94,16 +94,24 @@ export function ancestralSet(
  * graph" construction: restrict to the ancestral closure of x ∪ y ∪ z, marry parents of every
  * node in that closure (moralization), drop z, and check reachability between x and y in the
  * resulting undirected graph. No path ⇒ d-separated.
+ *
+ * `adjacency` may be passed in (e.g. built once per `model` by a caller doing many queries, the
+ * same pattern `ancestors`/`descendants`/`ancestralSet` already use) instead of being rebuilt from
+ * `model` on every call -- previously this function always rebuilt it twice internally (once for
+ * `ancestralSet`'s own default, once again for `parents` below) regardless of what a caller had
+ * already computed, which mattered once `explainNoChange` (`null-explanation.ts`) started calling
+ * this once per node on every reconciliation.
  */
 export function dSeparated(
 	model: Pick<NetworkModel, 'nodes' | 'edges'>,
 	x: string[],
 	y: string[],
-	z: string[] = []
+	z: string[] = [],
+	adjacency: Adjacency = buildAdjacency(model)
 ): boolean {
 	const zSet = new Set(z);
-	const closure = ancestralSet(model, [...x, ...y, ...z]);
-	const { parents } = buildAdjacency(model);
+	const closure = ancestralSet(model, [...x, ...y, ...z], adjacency);
+	const { parents } = adjacency;
 
 	// Undirected adjacency restricted to `closure`, plus moralization edges between every pair of
 	// a common child's parents that both lie in `closure`.

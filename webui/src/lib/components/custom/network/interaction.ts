@@ -5,7 +5,19 @@
  * (none exists in this repo yet; `dag-algorithms.test.ts` is the precedent this follows).
  */
 
-import type { DecisionMode, NetworkEvidence, NetworkNodeKind } from './types';
+import type { DecisionMode, NetworkEvidence, NetworkModel, NetworkNodeKind } from './types';
+
+/**
+ * The one-line explanation `NetworkView` shows next to its evidence controls (phase D). The real
+ * backend (`WhatIfRequest.evidence`, `desdeo/api/routers/graphical.py`) only ever calls pyAgrum's
+ * `setEvidence` — conditioning/observation, never a do-operator intervention — and has no
+ * soft-evidence/likelihood parameter at all. Rather than build a mode toggle or a "soft evidence"
+ * slider the backend can't honour, this is said plainly in the UI instead: see `NetworkEvidence`'s
+ * own doc comment in `types.ts` for the full reasoning, and the plan's phase D findings for why
+ * this was chosen over a visibly-disabled affordance.
+ */
+export const EVIDENCE_MODE_NOTE =
+	'Evidence here is observational (conditioning on what is known), not a causal intervention — setting a state updates belief given it, it does not simulate changing it.';
 
 /** Minimal shape `isStatePinned` needs off a node's data — matches the relevant slice of
  *  `NetworkNodeData` without importing it (that type lives in `view-types.ts`, the rendering-only
@@ -25,6 +37,26 @@ interface PinnableNodeData {
  */
 export function isNodeEditable(kind: NetworkNodeKind, decisionMode: DecisionMode): boolean {
 	return kind === 'chance' || (kind === 'decision' && decisionMode === 'manual');
+}
+
+/**
+ * Restricts `evidence` to chance-node ids only, per `model.nodes`' own `kind`. The real
+ * `/graphical/whatif` endpoint (`desdeo/api/routers/graphical.py`) hard-rejects (400) any evidence
+ * key that isn't one of the compiled `DiscreteNetwork`'s chance nodes — a decision node picked
+ * while exploring `decisionMode: 'manual'` is a real, clickable state per `isNodeEditable` above,
+ * but posting it to `/whatif` would 400 the whole request. This is also exactly the constraint the
+ * plan's own phase E entry names ("what-if inside method UIs is then restricted to chance nodes ...
+ * 'if A happens' is a question about the world, not about what we choose") — enforced here at the
+ * wire boundary (`NetworkPanel`'s calls into `fetchWhatIf`) rather than by disallowing the click
+ * itself, so a decision pick still shows locally (evidence pin, `isStatePinned`) without ever being
+ * sent to the backend as if it were an observation.
+ */
+export function filterChanceEvidence(
+	model: Pick<NetworkModel, 'nodes'>,
+	evidence: NetworkEvidence
+): NetworkEvidence {
+	const chanceIds = new Set(model.nodes.filter((n) => n.kind === 'chance').map((n) => n.id));
+	return Object.fromEntries(Object.entries(evidence).filter(([id]) => chanceIds.has(id)));
 }
 
 /**

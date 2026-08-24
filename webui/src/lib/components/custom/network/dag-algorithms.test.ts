@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { activeTrailNodes, ancestors, dSeparated, descendants } from './dag-algorithms';
+import {
+	activeTrailNodes,
+	ancestors,
+	buildAdjacency,
+	dSeparated,
+	descendants
+} from './dag-algorithms';
 import type { NetworkModel } from './types';
 
 function model(edges: [string, string][], extraNodeIds: string[] = []): NetworkModel {
@@ -65,6 +71,20 @@ describe('dSeparated', () => {
 		expect(dSeparated(collider, ['A'], ['B'], [])).toBe(true); // blocked collider
 		expect(dSeparated(collider, ['A'], ['B'], ['C'])).toBe(false); // opened by evidence on C
 		expect(dSeparated(collider, ['A'], ['B'], ['D'])).toBe(false); // opened by evidence on a descendant
+	});
+
+	it('gives identical results whether given a precomputed adjacency or not', () => {
+		const chain = model([
+			['A', 'B'],
+			['B', 'C']
+		]);
+		const adjacency = buildAdjacency(chain);
+		expect(dSeparated(chain, ['A'], ['C'], [], adjacency)).toBe(
+			dSeparated(chain, ['A'], ['C'], [])
+		);
+		expect(dSeparated(chain, ['A'], ['C'], ['B'], adjacency)).toBe(
+			dSeparated(chain, ['A'], ['C'], ['B'])
+		);
 	});
 });
 

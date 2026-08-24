@@ -10,8 +10,12 @@
 	import { Handle, Position, type NodeProps } from '@xyflow/svelte';
 	import IconPin from '@lucide/svelte/icons/pin';
 	import IconCheck from '@lucide/svelte/icons/check';
+	import IconArrowUp from '@lucide/svelte/icons/arrow-up';
+	import IconArrowDown from '@lucide/svelte/icons/arrow-down';
+	import IconInfo from '@lucide/svelte/icons/info';
 	import { NODE_KIND_STYLE } from '../node-style';
 	import { isStatePinned } from '../interaction';
+	import { BAR_TRANSITION_MS, computeDelta, dominantDeltaIndex } from '../whatif';
 	import type { NetworkNodeData } from '../view-types';
 	import type { NetworkNodeKind } from '../types';
 
@@ -23,6 +27,15 @@
 	let kind = $derived(props.type as NetworkNodeKind);
 	let style = $derived(NODE_KIND_STYLE[kind]);
 	let Icon = $derived(style.icon);
+
+	// Ghost/delta (phase D): `delta[i]` is this node's posterior[i] minus its ghost (prior-or-
+	// last-committed) baseline -- computed here, from the two raw arrays `NetworkView` already
+	// puts on `nodeData`, rather than threaded through as a third precomputed array, so this stays
+	// the one place that owns "what does a bar look like" instead of splitting that across two
+	// components. `dominant` is the single largest-magnitude per-state change worth calling out;
+	// see `dominantDeltaIndex`'s own doc comment for why only one, not a full per-state list.
+	let delta = $derived(computeDelta(nodeData.ghostPosterior, nodeData.posterior));
+	let dominant = $derived(dominantDeltaIndex(delta));
 
 	// Fully static -- pulled out of the template (rather than left as an inline `class="..."`
 	// string) purely to keep that line under the project's 100-col printWidth.
@@ -48,11 +61,34 @@
 			text-[10px] leading-none transition-colors ${tone} ${interactive}`;
 	}
 
-	/** Class string for one bar segment at `'normal'` detail when a posterior is available. */
+	/** Class string for one bar segment at `'normal'` detail when a posterior is available.
+	 *  `transition-[width]` (alongside the existing `transition-colors`) is what animates a
+	 *  posterior change (phase D: 200-300ms, "motion is what communicates change") -- applied to
+	 *  `width` only, never to a node's canvas `position`, which is never animated. The actual
+	 *  duration is set via `style:transition-duration` (see the two call sites below) from
+	 *  `BAR_TRANSITION_MS`, not hardcoded in this class string, so that constant stays load-bearing
+	 *  rather than a value nothing reads. */
 	function posteriorBarClass(pinned: boolean, editable: boolean): string {
 		const tone = pinned ? 'bg-primary' : 'bg-primary/40';
 		const interactive = editable ? 'cursor-pointer hover:bg-primary/70' : 'cursor-default';
-		return `h-full transition-colors ${tone} ${interactive}`;
+		return `h-full transition-[width,background-color] ${tone} ${interactive}`;
+	}
+
+	/** Tooltip text for one state -- current probability, plus the signed change from the ghost
+	 *  baseline when both are available. "Baseline" (not "prior"): the ghost baseline is the
+	 *  unconditioned prior only until the DM commits some evidence, after which it's that committed
+	 *  scenario instead -- see `NetworkView`'s `ghostPosteriors` doc comment. Delta is surfaced here
+	 *  (plain text, always present regardless of color vision) as well as via the visual
+	 *  dominant-delta callout below, so the "pair colour with shape/position, never colour alone"
+	 *  rule (phase D) has a fully-accessible fallback for every state, not just the single dominant
+	 *  one. */
+	function stateTitle(state: string, prob: number | undefined, ghost: number | undefined): string {
+		if (prob == null) return state;
+		const pct = Math.round(prob * 100);
+		if (ghost == null) return `${state}: ${pct}%`;
+		const deltaPct = Math.round((prob - ghost) * 100);
+		const sign = deltaPct > 0 ? '+' : '';
+		return `${state}: ${pct}% (baseline ${Math.round(ghost * 100)}%, ${sign}${deltaPct}pp)`;
 	}
 
 	// Diamond uses clip-path on a background layer rather than rotating the whole node, so the
@@ -86,7 +122,9 @@
 	{/if}
 
 	{#if nodeData.evidenceState}
-		<div class={EVIDENCE_BADGE_CLASS} title="Evidence: {nodeData.evidenceState}">
+		<!-- "Observed", not "set to" -- this is conditioning evidence (pyAgrum `setEvidence`),
+		     never a causal intervention; see EVIDENCE_MODE_NOTE in interaction.ts. -->
+		<div class={EVIDENCE_BADGE_CLASS} title="Observed: {nodeData.evidenceState}">
 			<IconPin class="size-2.5" />
 		</div>
 	{/if}
@@ -116,18 +154,30 @@
 			<div class="flex max-w-40 flex-wrap justify-center gap-1">
 				{#each nodeData.states as state, index (state)}
 					{@const prob = nodeData.posterior?.[index]}
+					{@const ghost = nodeData.ghostPosterior?.[index]}
 					{@const pinned = isStatePinned(nodeData, state)}
 					<button
 						type="button"
 						disabled={!nodeData.editable}
 						class={expandedChipClass(pinned, nodeData.editable)}
-						title={prob != null ? `${state}: ${Math.round(prob * 100)}%` : state}
+						title={stateTitle(state, prob, ghost)}
 						onclick={(event) => handleStateClick(event, state)}
 					>
+						{#if ghost != null}
+							<!-- Ghost mark: a dashed *line* at the prior/baseline width, distinct in
+							     shape (a line vs. an area fill) from the solid current-value fill
+							     below it -- not just a paler shade of the same color -- so the two
+							     stay distinguishable without relying on color vision (phase D). -->
+							<span
+								class="border-foreground/50 pointer-events-none absolute inset-y-0 border-l border-dashed"
+								style:left="{Math.round(ghost * 100)}%"
+							></span>
+						{/if}
 						{#if prob != null}
 							<span
-								class="bg-primary/20 pointer-events-none absolute inset-y-0 left-0"
+								class="bg-primary/20 pointer-events-none absolute inset-y-0 left-0 transition-[width]"
 								style:width="{Math.round(prob * 100)}%"
+								style:transition-duration="{BAR_TRANSITION_MS}ms"
 							></span>
 						{/if}
 						<span class="relative">{state}</span>
@@ -135,34 +185,56 @@
 				{/each}
 			</div>
 		{:else if nodeData.posterior}
-			<div
-				class="bg-muted/50 flex h-1.5 w-24 overflow-hidden rounded-full"
-				title="Posterior distribution"
-			>
-				{#each nodeData.states as state, index (state)}
-					{@const prob = nodeData.posterior[index] ?? 0}
-					{@const pinned = isStatePinned(nodeData, state)}
-					<button
-						type="button"
-						disabled={!nodeData.editable}
-						class={posteriorBarClass(pinned, nodeData.editable)}
-						style:width="{Math.round(prob * 100)}%"
-						title="{state}: {Math.round(prob * 100)}%"
-						onclick={(event) => handleStateClick(event, state)}
-					></button>
-				{/each}
+			<div class="flex flex-col items-center gap-0.5">
+				<div
+					class="bg-muted/50 flex h-1.5 w-24 overflow-hidden rounded-full"
+					title="Posterior distribution"
+				>
+					{#each nodeData.states as state, index (state)}
+						{@const prob = nodeData.posterior[index] ?? 0}
+						{@const ghost = nodeData.ghostPosterior?.[index]}
+						{@const pinned = isStatePinned(nodeData, state)}
+						<button
+							type="button"
+							disabled={!nodeData.editable}
+							class={posteriorBarClass(pinned, nodeData.editable)}
+							style:width="{Math.round(prob * 100)}%"
+							style:transition-duration="{BAR_TRANSITION_MS}ms"
+							title={stateTitle(state, prob, ghost)}
+							onclick={(event) => handleStateClick(event, state)}
+						></button>
+					{/each}
+				</div>
+				{#if nodeData.ghostPosterior}
+					<!-- Ghost bar: the same segmented layout, one tier down, outlined rather than
+					     filled -- the whole-bar baseline this posterior is diffed against (phase D
+					     item 1: "without a baseline a posterior conveys nothing"). -->
+					<div
+						class="border-muted-foreground/50 flex h-1 w-24 overflow-hidden rounded-full border border-dashed"
+						title="Prior/baseline distribution"
+					>
+						{#each nodeData.states as state, index (state)}
+							{@const ghostProb = nodeData.ghostPosterior[index] ?? 0}
+							<span
+								class="border-muted-foreground/40 h-full border-r last:border-r-0"
+								style:width="{Math.round(ghostProb * 100)}%"
+								title={state}
+							></span>
+						{/each}
+					</div>
+				{/if}
 			</div>
 		{:else if nodeData.editable}
 			<!-- No posterior yet (e.g. a decision node pre-solve), but still editable -- an
 			     equal-width segment row keeps the click affordance available at this detail level
 			     too, rather than only at 'expanded'. Plain text below is for genuinely
 			     non-interactive nodes (objective/deterministic, or a decision in 'solver' mode). -->
-			<div class="bg-muted/50 flex h-1.5 w-24 overflow-hidden rounded-full gap-px">
+			<div class="bg-muted/50 flex h-1.5 w-24 gap-px overflow-hidden rounded-full">
 				{#each nodeData.states as state (state)}
 					{@const pinned = isStatePinned(nodeData, state)}
 					<button
 						type="button"
-						class="h-full flex-1 cursor-pointer transition-colors hover:bg-primary/70 {pinned
+						class="hover:bg-primary/70 h-full flex-1 cursor-pointer transition-colors {pinned
 							? 'bg-primary'
 							: 'bg-primary/30'}"
 						title={state}
@@ -173,6 +245,35 @@
 		{:else}
 			<span class="text-muted-foreground text-[10px] leading-none">
 				{nodeData.states.length} states
+			</span>
+		{/if}
+
+		{#if dominant !== null && delta}
+			{@const d = delta[dominant]}
+			<!-- Signed delta callout (phase D item 1/6): an up/down *arrow shape* pairs with the
+			     sign/color rather than relying on color alone, and the sign is spelled out in text
+			     too ("+"/no prefix for negative, since Math.round already carries the "-"). -->
+			<span
+				class="flex items-center gap-0.5 text-[10px] leading-none font-medium {d > 0
+					? 'text-emerald-600 dark:text-emerald-400'
+					: 'text-rose-600 dark:text-rose-400'}"
+				title="Largest change since the ghost baseline"
+			>
+				{#if d > 0}
+					<IconArrowUp class="size-2.5" />
+				{:else}
+					<IconArrowDown class="size-2.5" />
+				{/if}
+				{nodeData.states[dominant]}
+				{d > 0 ? '+' : ''}{Math.round(d * 100)}%
+			</span>
+		{:else if nodeData.nullExplanation}
+			<span
+				class="text-muted-foreground flex items-center gap-0.5 text-[10px] leading-none"
+				title={nodeData.nullExplanation}
+			>
+				<IconInfo class="size-2.5" />
+				unaffected
 			</span>
 		{/if}
 	{/if}

@@ -17,11 +17,20 @@
 	import { Button } from '$lib/components/ui/button';
 	import { SegmentedControl } from '$lib/components/custom/segmented-control';
 	import IconRefreshCw from '@lucide/svelte/icons/refresh-cw';
+	import IconCheck from '@lucide/svelte/icons/check';
+	import IconInfo from '@lucide/svelte/icons/info';
 	import NetworkTable from './NetworkTable.svelte';
 	import { NETWORK_NODE_TYPES } from './nodes';
 	import { computeElkLayout, layoutCoversModel } from './layout';
 	import { computeDetailLevel } from './lod';
-	import { isNodeEditable, mergeHighlightSets, toggleEvidenceState } from './interaction';
+	import {
+		EVIDENCE_MODE_NOTE,
+		isNodeEditable,
+		mergeHighlightSets,
+		toggleEvidenceState
+	} from './interaction';
+	import { computeDelta, hasEvidenceDiverged } from './whatif';
+	import { explainNoChange } from './null-explanation';
 	import { ancestralSet, buildAdjacency, type Adjacency } from './dag-algorithms';
 	import type {
 		DecisionMode,
@@ -49,9 +58,29 @@
 		 *  the wire shape a real compiled-diagram what-if response fills in later, not a live
 		 *  computation done here). */
 		posteriors?: NetworkPosteriors;
+		/** Baseline distribution each of `posteriors`' bars is diffed against — the prior (no
+		 *  evidence at all) or, once the DM has committed some evidence via `onCommitEvidence`,
+		 *  that committed evidence's own posteriors. Entirely caller-owned (phase D): this
+		 *  component never fetches or computes it itself, only renders the ghost mark/signed delta
+		 *  it implies (see `GraphNode`'s `delta`/`ghostPosterior` handling) and decides whether
+		 *  `evidence` currently diverges from `committedEvidence` for the Commit button below. */
+		ghostPosteriors?: NetworkPosteriors;
+		/** The evidence the caller currently considers "accepted" — e.g. already folded into a
+		 *  method's own reference-point ranges. Compared against `evidence` (via
+		 *  `hasEvidenceDiverged`) purely to decide whether there's anything exploratory left to
+		 *  commit; this component never mutates it itself. Defaults to `{}` (nothing committed
+		 *  yet), so a caller that never wires up commit machinery still gets a correctly-disabled
+		 *  Commit button (nothing to diverge from) rather than a crash. */
+		committedEvidence?: NetworkEvidence;
 		/** A solved policy's chosen state per decision node, shown read-only in
 		 *  `decisionMode: 'solver'`. */
 		policy?: NetworkPolicy;
+		/** True while a what-if refresh triggered by the current `evidence` is in flight (or
+		 *  debounced, about to be) — dims the whole canvas+table rather than let a partial update
+		 *  (some node's bars already refreshed, others not yet) read as a bug. Entirely
+		 *  caller-driven: this component owns no fetching of its own (see `NetworkPanel`, or the
+		 *  Cumulus demo's own debounced mock, for what actually sets this). */
+		stale?: boolean;
 		/** `'solver'` (default): decision nodes display `policy`'s choice, read-only. `'manual'`:
 		 *  decision nodes become clickable like chance nodes, writing the chosen state into
 		 *  `evidence` instead. */
@@ -71,13 +100,25 @@
 		onNodeSelect?: (id: string | null) => void;
 		onNodeHover?: (id: string | null) => void;
 		onEvidenceChange?: (evidence: NetworkEvidence) => void;
+		/** Fired when the DM clicks "Commit evidence" — the explicit exploratory-vs-committed
+		 *  boundary the plan's phase D calls for. This component does nothing else on commit
+		 *  (doesn't touch `evidence`, `ghostPosteriors`, or `committedEvidence` itself): promoting
+		 *  the current evidence/posteriors into the new baseline, or triggering a real method's own
+		 *  range recomputation, is entirely the caller's decision to make — see the plan's phase D
+		 *  findings for why ("hold ranges fixed, show clipping" was chosen over silent
+		 *  recompute-and-warn, precisely because no such recompute machinery exists yet to make a
+		 *  "warn" claim honest). */
+		onCommitEvidence?: (evidence: NetworkEvidence) => void;
 	}
 
 	let {
 		model = $bindable(),
 		evidence = $bindable({}),
 		posteriors,
+		ghostPosteriors,
+		committedEvidence = {},
 		policy,
+		stale = false,
 		decisionMode = 'solver',
 		highlight = null,
 		nodeChrome,
@@ -85,7 +126,8 @@
 		class: className = '',
 		onNodeSelect,
 		onNodeHover,
-		onEvidenceChange
+		onEvidenceChange,
+		onCommitEvidence
 	}: Props = $props();
 
 	let containerEl = $state<HTMLDivElement | null>(null);
@@ -119,6 +161,15 @@
 	let flowNodes = $state.raw<NetworkFlowNode[]>([]);
 	let flowEdges = $state.raw<NetworkFlowEdge[]>([]);
 
+	// Whether there's anything exploratory left to commit -- the Commit button below is disabled
+	// once `evidence` matches `committedEvidence` exactly (nothing new to accept), which is also
+	// true before any evidence has ever been set at all.
+	let diverged = $derived(hasEvidenceDiverged(evidence, committedEvidence));
+
+	function handleCommit() {
+		onCommitEvidence?.(evidence);
+	}
+
 	function highlightStateFor(id: string, highlights: Set<string> | null): HighlightState {
 		if (!highlights) return 'normal';
 		return highlights.has(id) ? 'active' : 'dimmed';
@@ -138,8 +189,10 @@
 		const layout = model.layout;
 		const detail = detailLevel;
 		const evidenceSnapshot = evidence;
+		const committedSnapshot = committedEvidence;
 		const policySnapshot = policy;
 		const posteriorSnapshot = posteriors;
+		const ghostSnapshot = ghostPosteriors;
 		const mode = decisionMode;
 		const chrome = nodeChrome;
 
@@ -148,28 +201,54 @@
 			// highlight-patch effect below is what keeps it in sync as it changes.
 			const highlights = highlightedIds;
 			const prevPositions = new Map(flowNodes.map((n) => [n.id, n.position]));
-			flowNodes = nodes.map((n) => ({
-				id: n.id,
-				type: n.kind,
-				position: prevPositions.get(n.id) ?? layout?.positions[n.id] ?? { x: 0, y: 0 },
-				data: {
-					kind: n.kind,
-					label: n.label,
-					states: n.states,
-					description: n.description,
-					detail,
-					highlight: highlightStateFor(n.id, highlights),
-					editable: isNodeEditable(n.kind, mode),
-					evidenceState: evidenceSnapshot[n.id],
-					// Only meaningful read-only in 'solver' mode -- in 'manual' mode the node is
-					// interactive instead, and shouldn't also show a (possibly stale) solved
-					// policy's checkmark alongside its clickable states.
-					policyState: n.kind === 'decision' && mode === 'solver' ? policySnapshot?.[n.id] : undefined,
-					posterior: posteriorSnapshot?.[n.id],
-					chrome,
-					onStateClick: (state: string) => handleStateClick(n.id, state)
-				}
-			}));
+			flowNodes = nodes.map((n) => {
+				const posterior = posteriorSnapshot?.[n.id];
+				const ghostPosterior = ghostSnapshot?.[n.id];
+				return {
+					id: n.id,
+					type: n.kind,
+					position: prevPositions.get(n.id) ?? layout?.positions[n.id] ?? { x: 0, y: 0 },
+					data: {
+						kind: n.kind,
+						label: n.label,
+						states: n.states,
+						description: n.description,
+						detail,
+						highlight: highlightStateFor(n.id, highlights),
+						editable: isNodeEditable(n.kind, mode),
+						evidenceState: evidenceSnapshot[n.id],
+						// Only meaningful read-only in 'solver' mode -- in 'manual' mode the node is
+						// interactive instead, and shouldn't also show a (possibly stale) solved
+						// policy's checkmark alongside its clickable states.
+						policyState:
+							n.kind === 'decision' && mode === 'solver' ? policySnapshot?.[n.id] : undefined,
+						posterior,
+						ghostPosterior,
+						// Only worth explaining a *zero* delta -- explainNoChange itself no-ops when
+						// `computeDelta` finds an actual change (or nothing to compare at all).
+						// `committedSnapshot` is the conditioning set: `ghostPosterior` already
+						// reflects it, so the d-separation query is "is nodeId separated from the
+						// evidence *added since the commit*, given the commit" -- see
+						// `explainNoChange`'s own doc comment for why an unconditioned query is
+						// wrong the moment anything has ever been committed. `adjacency` (already
+						// `$derived.by` off `model` above) is passed through so this doesn't rebuild
+						// it from scratch per node, per reconciliation.
+						// `?? undefined`: NetworkNodeData's contract uses "absent" (not `null`) for
+						// "nothing to explain", matching every other optional field on it.
+						nullExplanation:
+							explainNoChange(
+								model,
+								n.id,
+								evidenceSnapshot,
+								committedSnapshot,
+								computeDelta(ghostPosterior, posterior),
+								adjacency
+							) ?? undefined,
+						chrome,
+						onStateClick: (state: string) => handleStateClick(n.id, state)
+					}
+				};
+			});
 			flowEdges = edges.map((e) => ({ id: e.id, source: e.source, target: e.target }));
 		});
 	});
@@ -251,7 +330,7 @@
 </script>
 
 <div class="flex h-full min-h-0 flex-col gap-2 {className}">
-	<div class="flex items-center justify-between gap-2">
+	<div class="flex flex-wrap items-center justify-between gap-2">
 		<SegmentedControl
 			size="sm"
 			bind:value={viewMode}
@@ -261,10 +340,43 @@
 				{ value: 'table', label: 'Table' }
 			]}
 		/>
-		<Button variant="outline" size="sm" onclick={relayout} disabled={relayouting}>
-			<IconRefreshCw class="size-3.5 {relayouting ? 'animate-spin' : ''}" />
-			Re-layout
-		</Button>
+		<div class="flex items-center gap-2">
+			<!-- Evidence-mode disclosure (phase D item 2): the backend only ever conditions on
+			     evidence (pyAgrum `setEvidence`) -- never a causal intervention -- and has no
+			     soft-evidence/likelihood parameter. Said plainly here rather than building a mode
+			     toggle or a "soft evidence" affordance the backend can't actually honour. Always
+			     visible (not gated to wider viewports -- the toolbar already `flex-wrap`s instead of
+			     needing to hide anything to fit) since this is a safety disclosure, not decoration:
+			     the evidence chips/pins/Commit button stay fully interactive at every width, so the
+			     note explaining what that evidence actually means has to too. `aria-label` (not just
+			     `title`, which a touch UI has no way to trigger) carries the full sentence as this
+			     element's accessible name; the short visible text is what a sighted user reads
+			     without needing to hover. -->
+			<span
+				class="text-muted-foreground flex items-center gap-1 text-xs"
+				title={EVIDENCE_MODE_NOTE}
+				aria-label={EVIDENCE_MODE_NOTE}
+			>
+				<IconInfo class="size-3.5 shrink-0" />
+				Observational evidence only
+			</span>
+			<Button
+				variant="outline"
+				size="sm"
+				disabled={!diverged || stale}
+				onclick={handleCommit}
+				title={stale
+					? 'Waiting for the current evidence to finish refreshing before it can be committed.'
+					: 'Accept the current evidence as the new baseline for future ghost/delta comparisons.'}
+			>
+				<IconCheck class="size-3.5" />
+				Commit evidence
+			</Button>
+			<Button variant="outline" size="sm" onclick={relayout} disabled={relayouting}>
+				<IconRefreshCw class="size-3.5 {relayouting ? 'animate-spin' : ''}" />
+				Re-layout
+			</Button>
+		</div>
 	</div>
 
 	<!--
@@ -274,42 +386,60 @@
 		time the user toggled modes — this way canvas zoom/pan state and the ResizeObserver both
 		survive mode switches.
 	-->
-	<div class="flex min-h-0 flex-1 flex-col gap-2">
+	<div class="relative flex min-h-0 flex-1 flex-col gap-2">
+		<!-- Dims the *whole* canvas+table pane, not just the nodes whose bars are about to change --
+		     a partial update (some nodes refreshed, others not yet) reads as a bug, so staleness is
+		     shown before any per-node data actually changes (see `stale`'s own doc comment). -->
 		<div
-			bind:this={containerEl}
-			class="border-border min-h-[180px] rounded-md border"
-			class:hidden={viewMode === 'table'}
-			class:flex-1={viewMode !== 'split'}
-			style={viewMode === 'split' ? 'flex: 6 1 0;' : ''}
+			class="pointer-events-none absolute inset-0 z-20 flex items-start justify-center pt-2 transition-opacity duration-300"
+			class:opacity-0={!stale}
+			class:opacity-100={stale}
+			aria-hidden={!stale}
 		>
-			<SvelteFlow
-				bind:nodes={flowNodes}
-				bind:edges={flowEdges}
-				bind:viewport
-				nodeTypes={NETWORK_NODE_TYPES}
-				fitView
-				minZoom={0.2}
-				maxZoom={2}
-				onnodeclick={handleNodeClick}
-				onnodepointerenter={handleNodePointerEnter}
-				onnodepointerleave={handleNodePointerLeave}
-			>
-				<Background />
-				<Controls showLock={false} />
-			</SvelteFlow>
+			<span class="bg-card text-muted-foreground rounded-md border px-2 py-1 text-xs shadow-sm">
+				Updating…
+			</span>
 		</div>
 		<div
-			class="min-h-0 overflow-auto"
-			class:hidden={viewMode === 'canvas'}
-			class:flex-1={viewMode !== 'split'}
-			style={viewMode === 'split' ? 'flex: 4 1 0;' : ''}
+			class="flex min-h-0 flex-1 flex-col gap-2 transition-opacity duration-300"
+			class:opacity-50={stale}
 		>
-			<NetworkTable
-				{model}
-				{highlightedIds}
-				onRowHover={handleTableHover}
-				onRowSelect={handleTableSelect}
-			/>
+			<div
+				bind:this={containerEl}
+				class="border-border min-h-[180px] rounded-md border"
+				class:hidden={viewMode === 'table'}
+				class:flex-1={viewMode !== 'split'}
+				style={viewMode === 'split' ? 'flex: 6 1 0;' : ''}
+			>
+				<SvelteFlow
+					bind:nodes={flowNodes}
+					bind:edges={flowEdges}
+					bind:viewport
+					nodeTypes={NETWORK_NODE_TYPES}
+					fitView
+					minZoom={0.2}
+					maxZoom={2}
+					onnodeclick={handleNodeClick}
+					onnodepointerenter={handleNodePointerEnter}
+					onnodepointerleave={handleNodePointerLeave}
+				>
+					<Background />
+					<Controls showLock={false} />
+				</SvelteFlow>
+			</div>
+			<div
+				class="min-h-0 overflow-auto"
+				class:hidden={viewMode === 'canvas'}
+				class:flex-1={viewMode !== 'split'}
+				style={viewMode === 'split' ? 'flex: 4 1 0;' : ''}
+			>
+				<NetworkTable
+					{model}
+					{highlightedIds}
+					onRowHover={handleTableHover}
+					onRowSelect={handleTableSelect}
+				/>
+			</div>
 		</div>
 	</div>
 </div>

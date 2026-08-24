@@ -64,9 +64,18 @@ export interface NetworkModel {
  *  settable by the DM ('manual') — see the plan's frontend phase B/E split. */
 export type DecisionMode = 'solver' | 'manual';
 
-/** Hard evidence only for now: node id -> the single state label pinned as observed/set. Soft
- *  evidence (likelihoods) and an explicit observe-vs-intervene mode are phase D's job — this is
- *  just the wire shape phase B commits to so callers can start binding against it. */
+/**
+ * Hard evidence only: node id -> the single state label pinned as observed. This is the *only*
+ * evidence mode the real backend supports (phase D, reconciled against `desdeo/api/routers/
+ * graphical.py`, backend phase 7): `WhatIfRequest.evidence: dict[str, str]` feeds straight into
+ * pyAgrum's `setEvidence`, which is conditioning/observation only — there is no soft-evidence
+ * (likelihood) parameter and no do-operator intervention anywhere in that endpoint. Building a
+ * soft-evidence or intervene affordance in this component would silently promise a capability the
+ * backend can't perform, so phase D deliberately does not add one; `NetworkView`'s evidence note
+ * (see `EVIDENCE_MODE_NOTE` in `interaction.ts`) says so explicitly in the UI instead of leaving
+ * it to be inferred. Revisit this type (and add an explicit mode discriminator) only once/if the
+ * backend actually grows a second evidence kind.
+ */
 export type NetworkEvidence = Record<string, string>;
 
 /** Node id -> per-state probability, aligned index-for-index with that node's `states`. A missing
@@ -77,9 +86,18 @@ export type NetworkPosteriors = Record<string, number[]>;
 /** Decision node id -> the state a solved policy chose for it. */
 export type NetworkPolicy = Record<string, string>;
 
-/** Shape of a `POST /graphical/whatif` response (backend phase 7, not built yet) — what
- *  `<NetworkPanel>`'s `fetchWhatIf` resolves to. */
+/** Objective node id -> expected utility under the currently applied evidence (`WhatIfResponse.
+ *  utilities`, keyed by node id the same way `NetworkPosteriors`/`NetworkPolicy` are — see
+ *  `defaultFetchWhatIf` in `NetworkPanel.svelte` for the `util_<symbol>` remap this requires
+ *  against the real endpoint). Not rendered inline on the (deliberately posterior-free, per phase
+ *  C) objective node shape — threaded through to a caller via `NetworkPanel`'s `onWhatIfResult`
+ *  instead, for a method UI's own objective-value display to consume. */
+export type NetworkUtilities = Record<string, number>;
+
+/** Shape of a `POST /graphical/whatif` response (backend phase 7; see `WhatIfResponse` in
+ *  `desdeo/api/routers/graphical.py`) — what `<NetworkPanel>`'s `fetchWhatIf` resolves to. */
 export interface WhatIfResult {
 	posteriors: NetworkPosteriors;
 	policy?: NetworkPolicy;
+	utilities?: NetworkUtilities;
 }
