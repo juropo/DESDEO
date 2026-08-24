@@ -30,6 +30,7 @@ from desdeo.problem.schema import (
     TensorVariable,
     VariableTypeEnum,
 )
+from desdeo.tools.utils import guess_best_solver, payoff_table_method
 
 # ── Physical parameters ───────────────────────────────────────────────────────
 DEMAND_MW = 1.0
@@ -119,10 +120,93 @@ def load_district_heating_data(data_dir: Path | str, year: int) -> tuple[np.ndar
     return df["total_price"].to_numpy(), df["total_gas_price"].to_numpy()
 
 
+def load_district_heating_prices(data_dir: Path | str, year: int) -> tuple[np.ndarray, np.ndarray]:
+    """Load hourly all-in electricity and gas prices for *year* from whichever file is available.
+
+    Prefers the raw ``Electricity_price_FI_<year>.xlsx`` / ``Gas_Prices.xlsx`` inputs. If
+    those are not present, reads the same all-in prices from the ``<year>_both_boilers``
+    sheet of ``all_years_results.xlsx``, which the original study wrote out alongside the
+    dispatch results.
+
+    Args:
+        data_dir: directory containing the Jenni dataset.
+        year:     calendar year to extract.
+
+    Returns:
+        Tuple ``(spot_prices, gas_prices)`` of NumPy float64 arrays of shape ``(T,)``.
+
+    Raises:
+        FileNotFoundError: if neither the raw price files nor the results workbook is found.
+    """
+    data_dir = Path(data_dir)
+
+    elec_file = data_dir / f"Electricity_price_FI_{year}.xlsx"
+    gas_file = data_dir / "Gas_Prices.xlsx"
+    if elec_file.is_file() and gas_file.is_file():
+        return load_district_heating_data(data_dir, year)
+
+    results_file = data_dir / "all_years_results.xlsx"
+    if results_file.is_file():
+        df = pd.read_excel(results_file, sheet_name=f"{year}_both_boilers")
+        return df["spot_price"].to_numpy(dtype=float), df["gas_price"].to_numpy(dtype=float)
+
+    raise FileNotFoundError(
+        f"No district heating price data for {year} in {data_dir}: expected either "
+        f"'{elec_file.name}' and '{gas_file.name}', or 'all_years_results.xlsx'."
+    )
+
+
+def solve_ideal_and_nadir(problem: Problem) -> tuple[dict[str, float], dict[str, float]]:
+    """Solve the ideal and nadir points of a bi-objective minimization problem.
+
+    The ideal point comes from the payoff table method. Its nadir estimate is not used
+    as-is: each single-objective solve of the payoff table is indifferent to the other
+    objective, so it may return a dominated corner point and overstate the nadir. Here,
+    each corner is re-solved lexicographically — the other objective is constrained to
+    its ideal value, then the objective of interest is minimized — which gives the exact
+    nadir for two objectives.
+
+    Args:
+        problem: a bi-objective problem whose objectives are both minimized.
+
+    Returns:
+        Tuple ``(ideal, nadir)`` of dicts keyed by objective symbol.
+    """
+    if len(problem.objectives) != 2 or any(o.maximize for o in problem.objectives):
+        raise ValueError("solve_ideal_and_nadir expects exactly two objectives, both minimized.")
+
+    solver = guess_best_solver(problem)
+    ideal, nadir = payoff_table_method(problem, solver)
+
+    symbols = [o.symbol for o in problem.objectives]
+    for target, other in (symbols, reversed(symbols)):
+        # Constrain the other objective to its ideal value, then minimize the target:
+        # the worst value the target takes on the Pareto front.
+        tolerance = 1e-6 * max(1.0, abs(ideal[other]))
+        constrained = problem.add_constraints(
+            [
+                Constraint(
+                    name=f"{other} fixed at its ideal value",
+                    symbol=f"lex_{other}",
+                    func=["Subtract", other, ideal[other] + tolerance],
+                    cons_type=ConstraintTypeEnum.LTE,
+                    is_linear=True,
+                    is_convex=True,
+                    is_twice_differentiable=True,
+                )
+            ]
+        )
+        result = guess_best_solver(constrained)(constrained).solve(f"{target}_min")
+        nadir[target] = result.optimal_objectives[target]
+
+    return ideal, nadir
+
+
 def district_heating_problem(
     spot_prices: np.ndarray,
     gas_prices: np.ndarray,
     initial_storage_level: float = 0.0,
+    with_ideal_and_nadir: bool = True,
 ) -> Problem:
     """Build a bi-objective MILP for district heating scheduling.
 
@@ -168,6 +252,9 @@ def district_heating_problem(
         spot_prices: hourly all-in electricity prices (EUR/MWh), shape ``(T,)``.
         gas_prices:  hourly all-in gas prices (EUR/MWh), shape ``(T,)``.
         initial_storage_level: initial heat in storage (MWh), default 0.
+        with_ideal_and_nadir: solve the ideal and nadir points and store them on the
+            objectives, default True. Requires a MILP solver; set to False to build the
+            problem without solving anything.
 
     Returns:
         A DESDEO :class:`~desdeo.problem.schema.Problem` (MILP).
@@ -441,7 +528,7 @@ def district_heating_problem(
         ),
     ]
 
-    return Problem(
+    problem = Problem(
         name="District heating: electric/gas boilers with thermal storage",
         description=(
             "Bi-objective MILP for scheduling a 2 MW electric boiler, a 1 MW gas boiler, "
@@ -475,3 +562,9 @@ def district_heating_problem(
             dis_bigm,
         ],
     )
+
+    if not with_ideal_and_nadir:
+        return problem
+
+    ideal, nadir = solve_ideal_and_nadir(problem)
+    return problem.update_ideal_and_nadir(ideal, nadir)
