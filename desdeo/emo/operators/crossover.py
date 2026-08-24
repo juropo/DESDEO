@@ -24,7 +24,7 @@ from desdeo.tools.patterns import Publisher, Subscriber
 class BaseCrossover(Subscriber):
     """A base class for crossover operators."""
 
-    def __init__(self, problem: Problem, verbosity: int, publisher: Publisher):
+    def __init__(self, problem: Problem, verbosity: int, publisher: Publisher, seed: int):
         """Initialize a crossover operator."""
         super().__init__(verbosity=verbosity, publisher=publisher)
         self.problem = problem
@@ -34,6 +34,11 @@ class BaseCrossover(Subscriber):
 
         self.variable_types = [var.variable_type for var in problem.get_flattened_variables()]
         self.variable_combination: VariableDomainTypeEnum = problem.variable_domain
+
+        self.parent_population: pl.DataFrame
+        self.offspring_population: pl.DataFrame
+        self.rng = np.random.default_rng(seed)
+        self.seed = seed
 
     @abstractmethod
     def do(self, *, population: pl.DataFrame, to_mate: list[int] | None = None) -> pl.DataFrame:
@@ -50,11 +55,25 @@ class BaseCrossover(Subscriber):
             pl.DataFrame: the offspring resulting from the crossover.
         """
 
+    def get_parents(self, population: pl.DataFrame, to_mate: list[int] | None = None) -> pl.DataFrame:
+        """Just get the relevant parents from the population and set the parent population."""
+        pop_size = population.shape[0]
+        if to_mate is None:
+            shuffled_ids = list(range(pop_size))
+            self.rng.shuffle(shuffled_ids)
+        else:
+            shuffled_ids = copy.copy(to_mate)
+
+        if len(shuffled_ids) % 2 == 1:
+            shuffled_ids.append(shuffled_ids[0])
+        self.parent_population = population[shuffled_ids]
+        return self.parent_population
+
 
 class SimulatedBinaryCrossover(BaseCrossover):
     """A class for creating a simulated binary crossover operator.
 
-    Reference:
+    Reference for unbounded version:
         Kalyanmoy Deb and Ram Bhushan Agrawal. 1995. Simulated binary crossover for continuous search space.
             Complex Systems 9, 2 (1995), 115-148.
     """
@@ -86,7 +105,9 @@ class SimulatedBinaryCrossover(BaseCrossover):
         verbosity: int,
         publisher: Publisher,
         xover_probability: float = 1.0,
+        uniform_xover_probability: float = 0.5,
         xover_distribution: float = 30,
+        bounded: bool = False,
     ):
         """Initialize a simulated binary crossover operator.
 
@@ -96,13 +117,21 @@ class SimulatedBinaryCrossover(BaseCrossover):
             verbosity (int): the verbosity level of the component. The keys in `provided_topics` tell what
                 topics are provided by the operator at each verbosity level. Recommended to be set to 1.
             publisher (Publisher): the publisher to which the operator will publish messages.
-            xover_probability (float, optional): the crossover probability
-                parameter. Ranges between 0 and 1.0. Defaults to 1.0.
-            xover_distribution (float, optional): the crossover distribution
-                parameter. Must be positive. Defaults to 30.
+            xover_probability (float, optional): the crossover probability parameter.
+                This parameter decides whether the decision variable components of the parents are swapped for the
+                offspring or not. Ranges between 0 and 1.0. Defaults to 1.0.
+            uniform_xover_probability (float, optional): the uniform crossover probability parameter.
+                This parameter decides whether the decision variable components of the parents are swapped for the
+                offspring or not. Ranges between 0 and 1.0. Defaults to 0.5. Only operates on variables that
+                have already been selected for crossover by the xover_probability parameter.
+            xover_distribution (float, optional): the crossover distribution parameter. Must be positive.
+                This parameter controls the distribution of the offspring. A larger value results in a distribution
+                that is more concentrated around the parents, while a smaller value results in a distribution that is
+                more spread out. Defaults to 30.
+            bounded (bool, optional): whether to bound the offspring to the variable bounds. Defaults to False.
         """
         # Subscribes to no topics, so no need to stroe/pass the topics to the super class.
-        super().__init__(problem, verbosity=verbosity, publisher=publisher)
+        super().__init__(problem, verbosity=verbosity, publisher=publisher, seed=seed)
         self.problem = problem
 
         if not 0 <= xover_probability <= 1:
@@ -111,10 +140,8 @@ class SimulatedBinaryCrossover(BaseCrossover):
             raise ValueError("Crossover distribution must be positive.")
         self.xover_probability = xover_probability
         self.xover_distribution = xover_distribution
-        self.parent_population: pl.DataFrame
-        self.offspring_population: pl.DataFrame
-        self.rng = np.random.default_rng(seed)
-        self.seed = seed
+        self.uniform_xover_probability = uniform_xover_probability
+        self.bounded = bounded
 
     def do(
         self,
@@ -134,23 +161,41 @@ class SimulatedBinaryCrossover(BaseCrossover):
         Returns:
             pl.DataFrame: the offspring resulting from the crossover.
         """
-        self.parent_population = population
-        pop_size = self.parent_population.shape[0]
-        num_var = len(self.variable_symbols)
-
-        parent_decvars = self.parent_population[self.variable_symbols].to_numpy()
-
-        if to_mate is None:
-            shuffled_ids = list(range(pop_size))
-            self.rng.shuffle(shuffled_ids)
+        if self.bounded:
+            self.offspring_population = self.bounded_offsprings(population=population, to_mate=to_mate)
         else:
-            shuffled_ids = to_mate
-        mating_pop = parent_decvars[shuffled_ids]
-        mate_size = len(shuffled_ids)
+            self.offspring_population = self.unbounded_offsprings(population=population, to_mate=to_mate)
+        self.notify()
 
-        if len(shuffled_ids) % 2 == 1:
-            mating_pop = np.vstack((mating_pop, mating_pop[0]))
-            mate_size += 1
+        return self.offspring_population
+
+    def unbounded_offsprings(
+        self,
+        *,
+        population: pl.DataFrame,
+        to_mate: list[int] | None = None,
+    ) -> pl.DataFrame:
+        """Perform the unbounded simulated binary crossover operation.
+
+        Implementation based on Deb, Kalyanmoy, and Ram Bhushan Agrawal. "Simulated binary crossover for
+        continuous search space." Complex systems 9.2 (1995): 115-148. This implementation is similar to PlatEMO,
+        however, differs from deap (potentially incorrect implementation) and pymoo (they implement truncated/bounded
+        simulated binary crossover, but call it simulated binary crossover).
+
+        Args:
+            population (pl.DataFrame): the population to perform the crossover with. The DataFrame
+                contains the decision vectors, the target vectors, and the constraint vectors.
+            to_mate (list[int] | None): the indices of the population members that should
+                participate in the crossover. If `None`, the whole population is subject
+                to the crossover.
+
+        Returns:
+            pl.DataFrame: the offspring resulting from the crossover.
+        """
+        mating_pop = self.get_parents(population=population, to_mate=to_mate)
+        mating_pop = mating_pop[self.variable_symbols].to_numpy()
+        mate_size = mating_pop.shape[0]
+        num_var = mating_pop.shape[1]
 
         offspring = np.zeros_like(mating_pop)
 
@@ -159,19 +204,156 @@ class SimulatedBinaryCrossover(BaseCrossover):
         for i in range(0, mate_size, 2):
             beta = np.zeros(num_var)
             miu = self.rng.random(num_var)
-            beta[miu <= HALF] = (2 * miu[miu <= HALF]) ** (1 / (self.xover_distribution + 1))
-            beta[miu > HALF] = (2 - 2 * miu[miu > HALF]) ** (-1 / (self.xover_distribution + 1))
-            beta = beta * ((-1) ** self.rng.integers(low=0, high=2, size=num_var))
+            # Simulated binary crossover (SBX) operator tries to mimic the behavior of single-point crossover by
+            # trying to attain similar distribution of offspring as single-point crossover.
+            # The distribution itself can be contracting or expanding.
+            # beta is calculated such that the integral (over (0, beta)) of the distribution matches the random number
+            # mu. At mu <= 0.5, the distribution is contracting, and at mu > 0.5, the distribution is expanding.
+            # You can integrate equations 18 and 19 from the reference in the docstring to see how the equations below
+            # are derived. Integrate 18 from 0 to beta, and set it equal to mu. Solve for beta.
+            # for 19, first integrate 18 from 0 to 1 (which is equal to 0.5 so you don't actually need to integrate it)
+            # Then add the integral of 19 from 1 to beta, and set it equal to mu. Solve for beta.
+            beta[miu <= HALF] = (2 * miu[miu <= HALF]) ** (1 / (self.xover_distribution + 1))  # 18
+            beta[miu > HALF] = (2 - 2 * miu[miu > HALF]) ** (-1 / (self.xover_distribution + 1))  # 18 + 19
+            # if beta is negative, the offspring 1 gets decision var component closer to parent 2 and vice versa.
+            # In this implementation, there is an equal chance of beta being negative or positive.
+            # TBH, this is more similar to uniform crossover than single-point crossover.
+            binary_mask = self.rng.random(num_var) <= self.uniform_xover_probability
+            binary_mask = (binary_mask * 2) - 1  # Convert to -1 or 1
+            beta = beta * binary_mask
+            # If beta = 1, no crossover occurs and the dec var components are basically copied from the parents.
             beta[self.rng.random(num_var) > self.xover_probability] = 1
+            # Note that when mu < 0.5, abs(beta) ends up being less than 1, resulting in a contracting crossover.
+            # The opposite is true when mu > 0.5, resulting in an expanding crossover.
             avg = (mating_pop[i] + mating_pop[i + 1]) / 2
             diff = (mating_pop[i] - mating_pop[i + 1]) / 2
-            offspring[i] = avg + beta * diff
-            offspring[i + 1] = avg - beta * diff
+            offspring[i] = avg - beta * diff
+            offspring[i + 1] = avg + beta * diff
+        return pl.from_numpy(offspring, schema=self.variable_symbols)
 
-        self.offspring_population = pl.from_numpy(offspring, schema=self.variable_symbols)
-        self.notify()
+    def bounded_offsprings(
+        self,
+        *,
+        population: pl.DataFrame,
+        to_mate: list[int] | None = None,
+    ) -> pl.DataFrame:
+        """Perform the bounded simulated binary crossover operation.
 
-        return self.offspring_population
+        This implementation is similar to pymoo and boundedSBX in deap. One of the first papers I can find that actually
+        describes how to calculate it is [1].
+
+        The basic idea is as follows:
+
+        1. Take the probability distributions of the unbounded SBX operator. There are two: one for the contracting case
+            (mu <= 0.5, beta <= 1) and one for the expanding case (mu > 0.5, beta > 1).
+        2. Assume that we are bounded on the lower side. Calculate a maximum value of beta such that any potential
+            offspring will not be below the lower bound. This is done by solving for beta in the equation:
+            c = (p1+p2)/2 - beta*(p1-p2)/2, where c is the child (or in this case, the lower bound), p1 and p2
+            are parents. Thus, beta_max = (p1+p2-2*c)/(p1-p2). This is the maximum value of beta such that the child
+            will still be above the lower bound. In most implementations, this is called beta_q, and the equation is
+            slightly rearranged to be beta_q = 1 + 2*(p1-x_L)/(p2-p1), where p1<p2.
+        3. Now, integrate equations 18 + 19 from the original SBX paper. Integrating from 0 to infinity gives 1. So,
+            integrate from 0 to beta_max, we get a normalization factor.
+        4. The normalization factor turns out to be F = alpha / 2. where:
+            alpha = 2 - (1 / beta_max) ** (self.xover_distribution + 1)
+        5. Now, integrate the normalized version of equation 18 from beta = 0 to 1. This used to be equal to 0.5, but
+            now it equals 0.5 / F = 1 / alpha. This is now the new threshold for the contracting case. Integrate
+            between 0 and beta_max and set it equal to mu, if mu <= 1 / alpha.
+        6. For the expanding case, integrate the normalized version of equation 19 from beta = 1 to beta_max.
+        7. Use steps 2-6 for the child: c = (p1+p2)/2 - beta*(p1-p2)/2.
+        8. Repeat steps 2-6 but with the upper bound for the child: c = (p1+p2)/2 + beta*(p1-p2)/2.
+
+        Interestingly enough, the resulting equations are are just a generalization of the unbounded case.
+        If beta_max = infinity, then alpha = 2, and the equations reduce to the unbounded case. So, this piece of
+        code can handle the unbounded case as well, but I have kept the unbounded case separate for clarity.
+
+        Args:
+            population (pl.DataFrame): the population to perform the crossover with. The DataFrame
+                contains the decision vectors, the target vectors, and the constraint vectors.
+            to_mate (list[int] | None): the indices of the population members that should
+                participate in the crossover. If `None`, the whole population is subject
+                to the crossover.
+
+        Returns:
+            pl.DataFrame: the offspring resulting from the crossover.
+
+        References:
+            [1] "Deb, K., & Gulati, S. (2001). Design of truss-structures for minimum weight
+                using genetic algorithms". Finite Elements in Analysis and Design, 37(5), 447-465.
+                https://doi.org/10.1016/S0168-874X(00)00057-3
+
+        """
+        mating_pop = self.get_parents(population=population, to_mate=to_mate)
+        mating_pop = mating_pop[self.variable_symbols].to_numpy()
+        mate_size = mating_pop.shape[0]
+        num_var = mating_pop.shape[1]
+
+        offspring = np.zeros_like(mating_pop)
+
+        # TODO(@light-weaver): Extract into a numba jitted function.
+        for i in range(0, mate_size, 2):
+            beta = np.zeros(num_var)
+            miu = self.rng.random(num_var)
+            # Apply crossover only for certain decision variables
+            sbx_mask = self.rng.random(num_var) <= self.xover_probability
+            # Apply binary crossover only for certain decision variables
+            binary_mask = self.rng.random(num_var) <= self.uniform_xover_probability
+            binary_mask = binary_mask & sbx_mask  # Only apply binary crossover where SBX is applied
+            avg = (mating_pop[i] + mating_pop[i + 1]) / 2
+            diff = (mating_pop[i] - mating_pop[i + 1]) / 2
+
+            x1 = np.minimum(mating_pop[i], mating_pop[i + 1])
+            x2 = np.maximum(mating_pop[i], mating_pop[i + 1])
+
+            # Offspring 1 calculations
+            with np.errstate(divide="ignore", invalid="ignore"):  # Handles x1 == x2 case
+                beta_max = 1 + 2 * (x1 - self.lower_bounds) / (x2 - x1)
+            beta_max[np.isnan(beta_max)] = np.inf  # Handles x1 == x2 == lower_bound case
+
+            # Technically, this code can handle the unbounded case by setting alpha to an array of 2s.
+            alpha = 2 - (1 / beta_max) ** (self.xover_distribution + 1)
+
+            SPLIT_POINT1 = 1 / alpha  # NOQA: N806
+            beta[miu <= SPLIT_POINT1] = (alpha[miu <= SPLIT_POINT1] * miu[miu <= SPLIT_POINT1]) ** (
+                1 / (self.xover_distribution + 1)
+            )
+            beta[miu > SPLIT_POINT1] = (2 - alpha[miu > SPLIT_POINT1] * miu[miu > SPLIT_POINT1]) ** (
+                -1 / (self.xover_distribution + 1)
+            )
+            # Turning beta negative does not work for truncated SBX. Manually swap the offspring instead.
+            # beta = beta * ((-1) ** self.rng.integers(low=0, high=2, size=num_var))
+            # If beta = 1, no crossover occurs and the dec var components are basically copied from the parents.
+            # beta[self.rng.random(num_var) > self.xover_probability] = 1
+            beta[~sbx_mask] = 1  # No crossover for decision variables where SBX is not applied
+            offspring[i] = avg - beta * diff
+
+            # Offspring 2 calculations
+            with np.errstate(divide="ignore", invalid="ignore"):  # Handles x1 == x2 case
+                beta_max = 1 + 2 * (self.upper_bounds - x2) / (x2 - x1)
+            beta_max[np.isnan(beta_max)] = np.inf  # Handles x1 == x2 == upper_bound case
+            # The error states only occur when x1==x2, which means that the parents are equal, and thus the offspring
+            # will be equal to the parents. So, np.inf is fine.
+
+            alpha = 2 - (1 / beta_max) ** (self.xover_distribution + 1)
+
+            SPLIT_POINT2 = 1 / alpha  # NOQA: N806
+            beta[miu <= SPLIT_POINT2] = (alpha[miu <= SPLIT_POINT2] * miu[miu <= SPLIT_POINT2]) ** (
+                1 / (self.xover_distribution + 1)
+            )
+            beta[miu > SPLIT_POINT2] = (2 - alpha[miu > SPLIT_POINT2] * miu[miu > SPLIT_POINT2]) ** (
+                -1 / (self.xover_distribution + 1)
+            )
+            # Turning beta negative does not work for truncated SBX. Manually swap the offspring instead.
+            # beta = beta * ((-1) ** self.rng.integers(low=0, high=2, size=num_var))
+            # If beta = 1, no crossover occurs and the dec var components are basically copied from the parents.
+            beta[~sbx_mask] = 1  # No crossover for decision variables where SBX is not applied
+            offspring[i + 1] = avg + beta * diff
+            # Swap the offspring for decision variables where binary crossover is applied
+            offspring[i, binary_mask], offspring[i + 1, binary_mask] = (
+                offspring[i + 1, binary_mask].copy(),
+                offspring[i, binary_mask].copy(),
+            )
+        return pl.from_numpy(offspring, schema=self.variable_symbols)
 
     def update(self, *_, **__):
         """Do nothing. This is just the basic SBX operator."""
@@ -233,13 +415,7 @@ class SinglePointBinaryCrossover(BaseCrossover):
                 topics are provided by the operator at each verbosity level.
             publisher (Publisher): the publisher to which the operator will publish messages.
         """
-        super().__init__(problem, verbosity=verbosity, publisher=publisher)
-        self.seed = seed
-
-        self.parent_population: pl.DataFrame
-        self.offspring_population: pl.DataFrame
-        self.rng = np.random.default_rng(seed)
-        self.seed = seed
+        super().__init__(problem, verbosity=verbosity, publisher=publisher, seed=seed)
 
     @property
     def provided_topics(self) -> dict[int, Sequence[CrossoverMessageTopics]]:
@@ -297,8 +473,8 @@ class SinglePointBinaryCrossover(BaseCrossover):
 
         # split the population into parents, one with members with even numbered indices, the
         # other with uneven numbered indices
-        parents1 = mating_pop[[shuffled_ids[i] for i in range(0, mating_pop_size, 2)]]
-        parents2 = mating_pop[[shuffled_ids[i] for i in range(1, mating_pop_size, 2)]]
+        parents1 = mating_pop[0::2, :]
+        parents2 = mating_pop[1::2, :]
 
         cross_over_points = self.rng.integers(1, num_var - 1, mating_pop_size // 2)
 
@@ -374,13 +550,7 @@ class UniformIntegerCrossover(BaseCrossover):
                 topics are provided by the operator at each verbosity level. Recommended to be set to 1.
             publisher (Publisher): the publisher to which the operator will publish messages.
         """
-        super().__init__(problem, verbosity=verbosity, publisher=publisher)
-        self.seed = seed
-
-        self.parent_population: pl.DataFrame
-        self.offspring_population: pl.DataFrame
-        self.rng = np.random.default_rng(seed)
-        self.seed = seed
+        super().__init__(problem, verbosity=verbosity, publisher=publisher, seed=seed)
 
     @property
     def provided_topics(self) -> dict[int, Sequence[CrossoverMessageTopics]]:
@@ -438,8 +608,8 @@ class UniformIntegerCrossover(BaseCrossover):
 
         # split the population into parents, one with members with even numbered indices, the
         # other with uneven numbered indices
-        parents1 = mating_pop[[shuffled_ids[i] for i in range(0, mating_pop_size, 2)]]
-        parents2 = mating_pop[[shuffled_ids[i] for i in range(1, mating_pop_size, 2)]]
+        parents1 = mating_pop[0::2, :]
+        parents2 = mating_pop[1::2, :]
 
         mask = self.rng.choice([True, False], size=num_var)
 
@@ -504,13 +674,7 @@ class UniformMixedIntegerCrossover(BaseCrossover):
                 topics are provided by the operator at each verbosity level. Recommended to be set to 1.
             publisher (Publisher): the publisher to which the operator will publish messages.
         """
-        super().__init__(problem, verbosity=verbosity, publisher=publisher)
-        self.seed = seed
-
-        self.parent_population: pl.DataFrame
-        self.offspring_population: pl.DataFrame
-        self.rng = np.random.default_rng(seed)
-        self.seed = seed
+        super().__init__(problem, verbosity=verbosity, publisher=publisher, seed=seed)
 
     @property
     def provided_topics(self) -> dict[int, Sequence[CrossoverMessageTopics]]:
@@ -568,8 +732,8 @@ class UniformMixedIntegerCrossover(BaseCrossover):
 
         # split the population into parents, one with members with even numbered indices, the
         # other with uneven numbered indices
-        parents1 = mating_pop[[shuffled_ids[i] for i in range(0, mating_pop_size, 2)]]
-        parents2 = mating_pop[[shuffled_ids[i] for i in range(1, mating_pop_size, 2)]]
+        parents1 = mating_pop[0::2, :]
+        parents2 = mating_pop[1::2, :]
 
         mask = self.rng.choice([True, False], size=num_var)
 
@@ -648,9 +812,15 @@ class BlendAlphaCrossover(BaseCrossover):
         publisher: Publisher,
         seed: int,
         alpha: float = 0.5,
-        xover_probability: float = 1.0,
+        repeats: int = 2,
+        sample_each_component: bool = True,
     ):
         """Initialize the blend alpha crossover operator.
+
+        Details here: Eshelman, L. J., & Schaffer, J. D. (1993). Real-Coded Genetic Algorithms and Interval-Schemata.
+        In L. D. Whitley (Ed.), Foundations of Genetic Algorithms (Vol. 2, pp. 187-202). Elsevier.
+        https://doi.org/10.1016/B978-0-08-094832-4.50018-0
+
 
         Args:
             problem (Problem): the problem object.
@@ -661,27 +831,24 @@ class BlendAlphaCrossover(BaseCrossover):
             alpha (float, optional): non-negative blending factor 'alpha' that controls the extent to which
                 offspring may be sampled outside the interval defined by each pair of parent
                 genes. alpha = 0 restricts children strictly within the
-                parents range, larger alpha allows some outliers. Defaults to 0.5.
-            xover_probability (float, optional): the crossover probability parameter.
-                Ranges between 0 and 1.0. Defaults to 1.0.
+                parents range, larger alpha allows outliers. Defaults to 0.5.
+            repeats (int, optional): the number of times to repeat the crossover operation for a given pair of parents.
+                Defaults to 2. Note that a value of 1 means that only one child will be generated for each pair of
+                parents.
+            sample_each_component (bool, optional): whether to sample each component of the offspring independently.
+                If `True`, a new random number is generated for each component of the offspring. If `False`, a single
+                random number is generated for the entire offspring. Defaults to `True`.
         """
-        super().__init__(problem=problem, verbosity=verbosity, publisher=publisher)
+        super().__init__(problem=problem, verbosity=verbosity, publisher=publisher, seed=seed)
 
         if problem.variable_domain is not VariableDomainTypeEnum.continuous:
             raise ValueError("BlendAlphaCrossover only works on continuous problems.")
-
-        if not 0 <= xover_probability <= 1:
-            raise ValueError("Crossover probability must be in [0,1].")
         if alpha < 0:
             raise ValueError("Alpha must be non-negative.")
 
         self.alpha = alpha
-        self.xover_probability = xover_probability
-        self.seed = seed
-        self.rng = np.random.default_rng(self.seed)
-
-        self.parent_population: pl.DataFrame | None = None
-        self.offspring_population: pl.DataFrame | None = None
+        self.repeats = repeats
+        self.sample_each_component = sample_each_component
 
     def do(
         self,
@@ -689,7 +856,7 @@ class BlendAlphaCrossover(BaseCrossover):
         population: pl.DataFrame,
         to_mate: list[int] | None = None,
     ) -> pl.DataFrame:
-        """Perform BLX-alpha crossover.
+        """Perform BLX-alpha crossover _correctly_.
 
         Args:
             population (pl.DataFrame): the population to perform the crossover with. The DataFrame
@@ -701,52 +868,42 @@ class BlendAlphaCrossover(BaseCrossover):
         Returns:
             pl.DataFrame: the offspring resulting from the crossover.
         """
-        self.parent_population = population
-        pop_size = population.shape[0]
-        num_var = len(self.variable_symbols)
+        mating_pop = self.get_parents(population=population, to_mate=to_mate)
+        mating_pop = mating_pop[self.variable_symbols].to_numpy()
+        mating_pop_size = mating_pop.shape[0]
+        original_pop_size = len(to_mate) if to_mate is not None else population.shape[0]
+        num_var = mating_pop.shape[1]
 
-        parent_decision_vars = population[self.variable_symbols].to_numpy()
-        if to_mate is None:
-            shuffled_ids = list(range(pop_size))
-            self.rng.shuffle(shuffled_ids)
+        offspring_size = mating_pop_size / 2 * self.repeats
+        offsprings = np.zeros((int(offspring_size), num_var))
+
+        if self.sample_each_component:
+            offspring_randoms = self.rng.random((int(offspring_size), num_var))
         else:
-            shuffled_ids = copy.copy(to_mate)
+            offspring_randoms = self.rng.random((int(offspring_size), 1))
 
-        mating_pop_size = len(shuffled_ids)
-        original_pop_size = mating_pop_size
-        if mating_pop_size % 2 == 1:
-            shuffled_ids.append(shuffled_ids[0])
-            mating_pop_size += 1
+        for i in range(0, mating_pop_size, 2):
+            p1 = mating_pop[i]
+            p2 = mating_pop[i + 1]
 
-        mating_pop = parent_decision_vars[shuffled_ids]
+            c_min = np.minimum(p1, p2)
+            c_max = np.maximum(p1, p2)
+            span = c_max - c_min
 
-        parents1 = mating_pop[0::2, :]
-        parents2 = mating_pop[1::2, :]
+            lower = c_min - self.alpha * span
+            upper = c_max + self.alpha * span
+            lower = np.maximum(lower, self.lower_bounds)
+            upper = np.minimum(upper, self.upper_bounds)
 
-        c_min = np.array(self.lower_bounds)
-        c_max = np.array(self.upper_bounds)
-        span = c_max - c_min
+            for j in range(self.repeats):
+                idx = (i // 2) * self.repeats + j
+                offsprings[idx] = lower + offspring_randoms[idx] * (upper - lower)
 
-        lower = c_min - self.alpha * span
-        upper = c_max + self.alpha * span
-
-        uniform_1 = self.rng.random((mating_pop_size // 2, num_var))
-        uniform_2 = self.rng.random((mating_pop_size // 2, num_var))
-
-        offspring1 = lower + uniform_1 * (upper - lower)
-        offspring2 = lower + uniform_2 * (upper - lower)
-
-        mask = self.rng.random(mating_pop_size // 2) > self.xover_probability
-        offspring1[mask, :] = parents1[mask, :]
-        offspring2[mask, :] = parents2[mask, :]
-
-        offspring = np.vstack((offspring1, offspring2))
+        # If the original mating pop size is odd, we need to remove the last offspring to maintain the correct size.
         if original_pop_size % 2 == 1:
-            offspring = offspring[:-1, :]
+            offsprings = offsprings[:-1, :]
 
-        self.offspring_population = pl.from_numpy(offspring, schema=self.variable_symbols).select(
-            pl.all().cast(pl.Float64)
-        )
+        self.offspring_population = pl.from_numpy(offsprings, schema=self.variable_symbols)
         self.notify()
         return self.offspring_population
 
@@ -759,13 +916,6 @@ class BlendAlphaCrossover(BaseCrossover):
             return []
         msgs: list[Message] = []
         if self.verbosity >= 1:
-            msgs.append(
-                FloatMessage(
-                    topic=CrossoverMessageTopics.XOVER_PROBABILITY,
-                    source=self.__class__.__name__,
-                    value=self.xover_probability,
-                )
-            )
             msgs.append(
                 FloatMessage(
                     topic=CrossoverMessageTopics.ALPHA,
@@ -832,16 +982,12 @@ class SingleArithmeticCrossover(BaseCrossover):
             xover_probability (float): probability of performing crossover.
             seed (int): random seed for reproducibility.
         """
-        super().__init__(problem=problem, verbosity=verbosity, publisher=publisher)
+        super().__init__(problem=problem, verbosity=verbosity, publisher=publisher, seed=seed)
 
         if not 0 <= xover_probability <= 1:
             raise ValueError("Crossover probability must be in [0, 1].")
 
         self.xover_probability = xover_probability
-        self.seed = seed
-        self.parent_population: pl.DataFrame | None = None
-        self.offspring_population: pl.DataFrame | None = None
-        self.rng = np.random.default_rng(self.seed)
 
     def do(self, *, population: pl.DataFrame, to_mate: list[int] | None = None) -> pl.DataFrame:
         """Perform Single Arithmetic Crossover.
@@ -856,26 +1002,11 @@ class SingleArithmeticCrossover(BaseCrossover):
         Returns:
             pl.DataFrame: the offspring resulting from the crossover.
         """
-        self.parent_population = population
-        pop_size = population.shape[0]
-        num_vars = len(self.variable_symbols)
-
-        parents = population[self.variable_symbols].to_numpy()
-
-        if to_mate is None:
-            mating_indices = list(range(pop_size))
-            self.rng.shuffle(mating_indices)
-        else:
-            mating_indices = copy.copy(to_mate)
-
-        mating_pop_size = len(mating_indices)
-        original_pop_size = mating_pop_size
-
-        if mating_pop_size % 2 == 1:
-            mating_indices.append(mating_indices[0])
-            mating_pop_size += 1
-
-        mating_pool = parents[mating_indices, :]
+        mating_pool = self.get_parents(population=population, to_mate=to_mate)
+        mating_pool = mating_pool[self.variable_symbols].to_numpy()
+        mating_pop_size = mating_pool.shape[0]
+        num_vars = mating_pool.shape[1]
+        original_pop_size = len(to_mate) if to_mate is not None else population.shape[0]
 
         parents1 = mating_pool[0::2, :]
         parents2 = mating_pool[1::2, :]
@@ -954,16 +1085,18 @@ class SingleArithmeticCrossover(BaseCrossover):
 
 
 class LocalCrossover(BaseCrossover):
-    """Local Crossover for continuous problems."""
+    """Local Crossover for continuous problems.
+
+    Reference: D. Dumitrescu, B. Lazzerini, L. C. Jain, and A. Dumitrescu, Evolutionary Computation.
+        CRC Press, Florida, USA, 2000
+    """
 
     @property
     def provided_topics(self) -> dict[int, Sequence[CrossoverMessageTopics]]:
         """The message topics provided by the local crossover operator."""
         return {
             0: [],
-            1: [
-                CrossoverMessageTopics.XOVER_PROBABILITY,
-            ],
+            1: [],
             2: [
                 CrossoverMessageTopics.XOVER_PROBABILITY,
                 CrossoverMessageTopics.PARENTS,
@@ -982,7 +1115,6 @@ class LocalCrossover(BaseCrossover):
         verbosity: int,
         publisher: Publisher,
         seed: int,
-        xover_probability: float = 1.0,
     ):
         """Initialize the local crossover operator.
 
@@ -991,19 +1123,9 @@ class LocalCrossover(BaseCrossover):
             verbosity (int): the verbosity level of the component. The keys in `provided_topics` tell what
                 topics are provided by the operator at each verbosity level. Recommended to be set to 1.
             publisher (Publisher): the publisher to which the operator will publish messages.
-            xover_probability (float): probability of performing crossover.
             seed (int): random seed for reproducibility.
         """
-        super().__init__(problem=problem, verbosity=verbosity, publisher=publisher)
-
-        if not 0 <= xover_probability <= 1:
-            raise ValueError("Crossover probability must be in [0, 1].")
-
-        self.xover_probability = xover_probability
-        self.seed = seed
-        self.rng = np.random.default_rng(self.seed)
-        self.parent_population: pl.DataFrame | None = None
-        self.offspring_population: pl.DataFrame | None = None
+        super().__init__(problem=problem, verbosity=verbosity, publisher=publisher, seed=seed)
 
     def do(self, *, population: pl.DataFrame, to_mate: list[int] | None = None) -> pl.DataFrame:
         """Perform Local Crossover.
@@ -1018,38 +1140,21 @@ class LocalCrossover(BaseCrossover):
         Returns:
             pl.DataFrame: the offspring resulting from the crossover.
         """
-        self.parent_population = population
-        pop_size = population.shape[0]
-        num_var = len(self.variable_symbols)
+        mating_pop = self.get_parents(population=population, to_mate=to_mate)
+        mating_pop = mating_pop[self.variable_symbols].to_numpy()
+        mating_pop_size = mating_pop.shape[0]
+        num_var = mating_pop.shape[1]
 
-        parent_decision_vars = population[self.variable_symbols].to_numpy()
-
-        if to_mate is None:
-            shuffled_ids = list(range(pop_size))
-            self.rng.shuffle(shuffled_ids)
-        else:
-            shuffled_ids = to_mate.copy()
-
-        mating_pop_size = len(shuffled_ids)
-        if mating_pop_size % 2 == 1:
-            shuffled_ids.append(shuffled_ids[0])
-            mating_pop_size += 1
-
-        mating_pop = parent_decision_vars[shuffled_ids]
         parents1 = mating_pop[0::2]
         parents2 = mating_pop[1::2]
 
         offspring = np.empty((mating_pop_size, num_var))
 
         for i in range(mating_pop_size // 2):
-            if self.rng.random() < self.xover_probability:
-                alpha = self.rng.random(num_var)
+            alpha = self.rng.random(num_var)
 
-                offspring[2 * i] = alpha * parents1[i] + (1 - alpha) * parents2[i]
-                offspring[2 * i + 1] = (1 - alpha) * parents1[i] + alpha * parents2[i]
-            else:
-                offspring[2 * i] = parents1[i]
-                offspring[2 * i + 1] = parents2[i]
+            offspring[2 * i] = alpha * parents1[i] + (1 - alpha) * parents2[i]
+            offspring[2 * i + 1] = (1 - alpha) * parents1[i] + alpha * parents2[i]
 
         self.offspring_population = pl.from_numpy(offspring, schema=self.variable_symbols).select(
             pl.all().cast(pl.Float64)
@@ -1068,14 +1173,6 @@ class LocalCrossover(BaseCrossover):
 
         msgs: list[Message] = []
 
-        if self.verbosity >= 1:
-            msgs.append(
-                FloatMessage(
-                    topic=CrossoverMessageTopics.XOVER_PROBABILITY,
-                    source=self.__class__.__name__,
-                    value=self.xover_probability,
-                )
-            )
         if self.verbosity >= 2:  # noqa: PLR2004
             msgs.extend(
                 [
@@ -1142,7 +1239,7 @@ class BoundedExponentialCrossover(BaseCrossover):
             xover_probability (float, optional): probability of applying crossover
                 to each pair. Defaults to 1.0.
         """
-        super().__init__(problem=problem, verbosity=verbosity, publisher=publisher)
+        super().__init__(problem=problem, verbosity=verbosity, publisher=publisher, seed=seed)
 
         if problem.variable_domain is not VariableDomainTypeEnum.continuous:
             raise ValueError("BoundedExponentialCrossover only works on continuous problems.")
@@ -1153,11 +1250,6 @@ class BoundedExponentialCrossover(BaseCrossover):
 
         self.lambda_ = lambda_
         self.xover_probability = xover_probability
-        self.seed = seed
-        self.rng = np.random.default_rng(self.seed)
-
-        self.parent_population: pl.DataFrame | None = None
-        self.offspring_population: pl.DataFrame | None = None
 
     def do(
         self,
@@ -1177,24 +1269,11 @@ class BoundedExponentialCrossover(BaseCrossover):
         Returns:
             pl.DataFrame: the offspring resulting from the crossover.
         """
-        self.parent_population = population
-        pop_size = population.shape[0]
-        num_var = len(self.variable_symbols)
-
-        parent_decision_vars = population[self.variable_symbols].to_numpy()
-        if to_mate is None:
-            shuffled_ids = list(range(pop_size))
-            self.rng.shuffle(shuffled_ids)
-        else:
-            shuffled_ids = copy.copy(to_mate)
-
-        mating_pop_size = len(shuffled_ids)
-        original_pop_size = mating_pop_size
-        if mating_pop_size % 2 == 1:
-            shuffled_ids.append(shuffled_ids[0])
-            mating_pop_size += 1
-
-        mating_pop = parent_decision_vars[shuffled_ids]
+        mating_pop = self.get_parents(population=population, to_mate=to_mate)
+        mating_pop = mating_pop[self.variable_symbols].to_numpy()
+        mating_pop_size = mating_pop.shape[0]
+        num_var = mating_pop.shape[1]
+        original_pop_size = len(to_mate) if to_mate is not None else population.shape[0]
 
         parents1 = mating_pop[0::2, :]
         parents2 = mating_pop[1::2, :]
@@ -1284,3 +1363,69 @@ class BoundedExponentialCrossover(BaseCrossover):
                 ]
             )
         return msgs
+
+
+class CompositeCrossover(BaseCrossover):
+    """Combined crossover operator that combines multiple crossover operators."""
+
+    def __init__(
+        self,
+        *,
+        problem: Problem,
+        verbosity: int,
+        publisher: Publisher,
+        operators: list[BaseCrossover],
+        seed: int,
+    ):
+        """Initialize the composite crossover operator.
+
+        Args:
+            problem (Problem): the problem object.
+            verbosity (int): the verbosity level of the component. The keys in `provided_topics` tell what
+                topics are provided by the operator at each verbosity level. Recommended to be set to 1.
+            publisher (Publisher): the publisher to which the operator will publish messages.
+            operators (list[BaseCrossover]): a list of crossover operators to combine.
+            seed (int): the random seed for reproducibility. Not actually used here.
+        """
+        super().__init__(problem=problem, verbosity=verbosity, publisher=publisher, seed=seed)
+        self.operators = operators
+        self.turn = 0
+
+    def do(
+        self,
+        *,
+        population: pl.DataFrame,
+        to_mate: list[int] | None = None,
+    ) -> pl.DataFrame:
+        """Perform crossover using the next operator in the list.
+
+        Args:
+            population (pl.DataFrame): the population to perform the crossover with.
+            to_mate (list[int] | None): indices of individuals to mate. If None, all individuals are considered.
+
+        Returns:
+            pl.DataFrame: the offspring resulting from the crossover.
+        """
+        operator = self.operators[self.turn]
+        offspring = operator.do(population=population, to_mate=to_mate)
+        self.turn = (self.turn + 1) % len(self.operators)
+        # No need to notify here, as each operator will handle its own notifications.
+        return offspring
+
+    @property
+    def provided_topics(self) -> dict[int, Sequence[CrossoverMessageTopics]]:
+        """This crossover operator does not provide any topics itself."""
+        return {0: [], 1: [], 2: []}
+
+    @property
+    def interested_topics(self):
+        """This crossover operator does not have any interested topics itself."""
+        return []
+
+    def update(self, message: Message):
+        """No need to update the composite operator itself. The publisher will handle the updates for each operator."""
+        return
+
+    def state(self) -> Sequence[Message]:
+        """This crossover operator does not maintain its own state. For now."""
+        return []

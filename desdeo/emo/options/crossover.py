@@ -10,6 +10,7 @@ from desdeo.emo.operators.crossover import (
     BaseCrossover,
     BlendAlphaCrossover,
     BoundedExponentialCrossover,
+    CompositeCrossover,
     LocalCrossover,
     SimulatedBinaryCrossover,
     SingleArithmeticCrossover,
@@ -34,6 +35,13 @@ class SimulatedBinaryCrossoverOptions(BaseModel):
     """The SBX crossover probability."""
     xover_distribution: float = Field(default=30.0, gt=0.0, description="The SBX distribution index.")
     """The SBX distribution index."""
+    bounded: bool = Field(default=False, description="Whether to bound the offspring within the parent range.")
+    """Whether to bound the offspring within the parent range."""
+    uniform_xover_probability: float = Field(
+        default=0.5, ge=0.0, le=1.0, description="The uniform crossover probability."
+    )
+    """The uniform crossover probability. Only operates on variables that have already been selected for crossover
+    by the xover_probability parameter."""
 
 
 class SinglePointBinaryCrossoverOptions(BaseModel):
@@ -66,25 +74,26 @@ class UniformMixedIntegerCrossoverOptions(BaseModel):
 class BlendAlphaCrossoverOptions(BaseModel):
     """Options for Blend Alpha Crossover."""
 
+    model_config = {"use_attribute_docstrings": True}
+
     name: Literal["BlendAlphaCrossover"] = Field(
-        default="BlendAlphaCrossover", frozen=True, description="The name of the crossover operator."
+        default="BlendAlphaCrossover",
+        frozen=True,
     )
     """The name of the crossover operator."""
-    alpha: float = Field(
-        default=0.5,
-        ge=0.0,
-        description=(
-            "Non-negative blending factor 'alpha' that controls the extent to which offspring"
-            " may be sampled outside the interval defined by each pair of parent genes. "
-            "alpha = 0 restricts children strictly within the parents range, larger alpha allows some outliers."
-        ),
-    )
+    alpha: float = Field(default=0.5, ge=0.0)
     """
     Non-negative blending factor 'alpha' that controls the extent to which offspring
     may be sampled outside the interval defined by each pair of parent genes.
-    alpha = 0 restricts children strictly within the parents range, larger alpha allows some outliers.
+    alpha = 0 restricts children strictly within the parents range, larger alpha allows outliers.
     """
-    xover_probability: float = Field(default=1.0, ge=0.0, le=1.0)
+    repeats: int = Field(default=2, ge=1)
+    """Number of offspring to generate per parent pair."""
+    sample_each_component: bool = Field(
+        default=True,
+    )
+    """If True, a new random number is generated for each component of the offspring. If False, a single random number
+    is generated for the entire offspring."""
 
 
 class SingleArithmeticCrossoverOptions(BaseModel):
@@ -105,8 +114,6 @@ class LocalCrossoverOptions(BaseModel):
         default="LocalCrossover", frozen=True, description="The name of the crossover operator."
     )
     """The name of the crossover operator."""
-    xover_probability: float = Field(default=1.0, ge=0.0, le=1.0, description="The crossover probability.")
-    """The crossover probability."""
 
 
 class BoundedExponentialCrossoverOptions(BaseModel):
@@ -122,6 +129,20 @@ class BoundedExponentialCrossoverOptions(BaseModel):
     """Positive scale λ for the exponential distribution."""
 
 
+class CompositeCrossoverOptions(BaseModel):
+    """Options for Composite Crossover."""
+
+    name: Literal["CompositeCrossover"] = Field(
+        default="CompositeCrossover", frozen=True, description="The name of the crossover operator."
+    )
+    """The name of the crossover operator."""
+    crossovers: list[CrossoverOptions] = Field(
+        default_factory=list,
+        description="List of crossover options to be used in the composite crossover.",
+    )
+    """List of crossover options to be used in the composite crossover."""
+
+
 CrossoverOptions = (
     SimulatedBinaryCrossoverOptions
     | SinglePointBinaryCrossoverOptions
@@ -131,6 +152,7 @@ CrossoverOptions = (
     | SingleArithmeticCrossoverOptions
     | LocalCrossoverOptions
     | BoundedExponentialCrossoverOptions
+    | CompositeCrossoverOptions
 )
 
 
@@ -158,7 +180,14 @@ def crossover_constructor(
         "SingleArithmeticCrossover": SingleArithmeticCrossover,
         "LocalCrossover": LocalCrossover,
         "BoundedExponentialCrossover": BoundedExponentialCrossover,
+        "CompositeCrossover": CompositeCrossover,
     }
-    options = options.model_dump()
-    name = options.pop("name")
-    return crossover_types[name](problem=problem, publisher=publisher, seed=seed, verbosity=verbosity, **dict(options))
+    if options.name != "CompositeCrossover":
+        options = options.model_dump()
+        name = options.pop("name")
+        return crossover_types[name](problem=problem, publisher=publisher, seed=seed, verbosity=verbosity, **options)
+
+    sub_crossovers = [crossover_constructor(problem, publisher, seed, verbosity, c) for c in options.crossovers]
+    return CompositeCrossover(
+        problem=problem, publisher=publisher, verbosity=verbosity, operators=sub_crossovers, seed=seed
+    )
