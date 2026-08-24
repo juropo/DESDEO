@@ -77,7 +77,7 @@ from desdeo.problem.graphical import (
     build_rooted_junction_tree,
     compile_diagram,
 )
-from desdeo.problem.graphical.adapters.pyagrum import _fill_cpt, _variable_to_pyagrum, from_pyagrum, to_pyagrum
+from desdeo.problem.graphical.adapters.pyagrum import from_pyagrum, to_pyagrum, to_pyagrum_influence_diagram
 from desdeo.problem.graphical.index_map import mixed_radix_decode
 from desdeo.problem.graphical.network import kahn_topological_order
 from desdeo.problem.graphical.rooted_junction_tree import effective_information_sets
@@ -345,39 +345,9 @@ def _brute_force_cvar(
 
 
 # ── Oracle 2: pyAgrum's own LIMID inference ─────────────────────────────────────────────────────
-
-
-def _to_pyagrum_influence_diagram(network: DiscreteNetwork, annotation: DecisionAnnotation) -> gum.InfluenceDiagram:
-    """Build the same diagram directly in pyAgrum, independent of this package's own compiler."""
-    diagram = gum.InfluenceDiagram()
-
-    for variable in network.variables:
-        diagram.addChanceNode(_variable_to_pyagrum(variable))
-    for node_name, potential in network.potentials.items():
-        for parent in potential.variables[1:]:
-            diagram.addArc(parent, node_name)
-    for node_name, potential in network.potentials.items():
-        _fill_cpt(diagram.cpt(node_name), potential)
-
-    for decision in annotation.decisions:
-        diagram.addDecisionNode(gum.LabelizedVariable(decision.symbol, decision.symbol, decision.states))
-    for decision in annotation.decisions:
-        for parent in decision.information_set:
-            diagram.addArc(parent, decision.symbol)
-
-    for objective in annotation.objectives:
-        util_name = f"util_{objective.symbol}"
-        diagram.addUtilityNode(gum.LabelizedVariable(util_name, util_name, 1))
-        for parent in objective.parents:
-            diagram.addArc(parent, util_name)
-        fake_potential = Potential(
-            variables=[util_name, *objective.parents],
-            shape=[1, *objective.utility.shape],
-            values=np.expand_dims(np.array(objective.utility.values, dtype=float), axis=0).tolist(),
-        )
-        _fill_cpt(diagram.utility(util_name), fake_potential)
-
-    return diagram
+# `_to_pyagrum_influence_diagram` was promoted to a public adapter function,
+# `adapters.pyagrum.to_pyagrum_influence_diagram`, since Phase 7's `/graphical/whatif` needs the
+# exact same diagram-building logic outside this test module. Imported above, not redefined here.
 
 
 def _pyagrum_meu(network: DiscreteNetwork, annotation: DecisionAnnotation, objective_symbol: str) -> float:
@@ -424,7 +394,7 @@ def _pyagrum_meu(network: DiscreteNetwork, annotation: DecisionAnnotation, objec
         probs = np.moveaxis(probs, [order.index(p) for p in objective.parents], range(len(objective.parents)))
         return float(np.sum(probs * utility))
 
-    diagram = _to_pyagrum_influence_diagram(network, annotation)
+    diagram = to_pyagrum_influence_diagram(network, annotation)
     inference = gum.ShaferShenoyLIMIDInference(diagram)
 
     if annotation.no_forgetting:
@@ -438,7 +408,11 @@ def _pyagrum_meu(network: DiscreteNetwork, annotation: DecisionAnnotation, objec
         inference.addNoForgettingAssumption(list(annotation.decision_order))
 
     inference.makeInference()
-    return inference.MEU()["mean"]
+    # `to_pyagrum_influence_diagram` writes the utility table in pyAgrum's own maximize-only sign
+    # convention (negated when `objective.maximize` is False -- see that function's docstring), so
+    # `MEU()["mean"]` must be negated back by the same sign to land in `objective`'s own units.
+    sign = 1.0 if objective.maximize else -1.0
+    return sign * inference.MEU()["mean"]
 
 
 # ── Oracle-checked compiled MILP value ──────────────────────────────────────────────────────────

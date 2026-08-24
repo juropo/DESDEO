@@ -32,7 +32,13 @@
 	// real method UI, ahead of any backend compiler (phases 4-7) -- see the "Findings" for phase B
 	// in .claude/desdeo-graphical-models-plan.md for why this uses demo data rather than a live
 	// compiled diagram for this problem.
-	import { NetworkView } from '$lib/components/custom/network';
+	import {
+		NetworkView,
+		createNetworkHighlightStore,
+		ancestralSet,
+		descendants,
+		buildAdjacency
+	} from '$lib/components/custom/network';
 	import { sampleIrrigationNetwork } from '$lib/components/custom/network/sample-network';
 	import type {
 		DecisionMode,
@@ -196,6 +202,81 @@
 	function toggle_network_flag(id: string) {
 		network_flagged = toggleSet(network_flagged, id);
 	}
+
+	// Phase C (cross-highlighting): a shared highlight store, plus a mock "(demo) Reference
+	// point" panel standing in for what a real reference-point widget would show for each
+	// objective -- proving the shared-store contract against a real method UI, not just
+	// Storybook. See createNetworkHighlightStore's own doc comment for why this is a
+	// page-local instance rather than a module-level singleton.
+	const network_highlight = createNetworkHighlightStore();
+	// Derived off `network_model` (not the static `sampleIrrigationNetwork` fixture) so this
+	// stays correct if the model is ever replaced -- `relayout()` already reassigns it.
+	let network_reference_point_objectives = $derived(
+		network_model.nodes.filter((n) => n.kind === 'objective')
+	);
+	let network_objective_ids = $derived(
+		new Set(network_reference_point_objectives.map((n) => n.id))
+	);
+	// Built once per model change rather than rebuilt from scratch on every hover -- see
+	// `buildAdjacency`'s own doc comment.
+	let network_adjacency = $derived(buildAdjacency(network_model));
+	// Reverse direction: hovering (or selecting) a node on the canvas highlights the objectives
+	// it can influence in the mock reference-point panel.
+	let network_influenced_objectives: Set<string> = $state(new Set());
+
+	// Panel -> canvas: seed's ancestor closure (inclusive of the seed itself).
+	function handle_reference_point_row_hover(id: string | null) {
+		network_highlight.set(id ? ancestralSet(network_model, [id], network_adjacency) : null);
+	}
+
+	// Canvas -> panel (and canvas -> canvas, via the shared store): mirrors `NetworkView`'s own
+	// `hoveredId ?? selectedId` semantics -- a selection outlives hover-out, so unhovering a
+	// still-selected node must not blank the panel while the canvas itself stays lit. Tracked
+	// as two separate ids (rather than reacting to `onNodeHover`/`onNodeSelect` independently)
+	// so hover-out with an active selection falls back to the selection instead of clearing.
+	let network_hovered_id: string | null = $state(null);
+	let network_selected_id: string | null = $state(null);
+	let network_focus_id = $derived(network_hovered_id ?? network_selected_id);
+
+	function handle_network_hover(id: string | null) {
+		network_hovered_id = id;
+	}
+
+	function handle_network_select(id: string | null) {
+		network_selected_id = id;
+	}
+
+	// Drives both `network_influenced_objectives` and the shared store off `network_focus_id`
+	// (not directly off the hover/select events) -- a node's descendant closure, inclusive of
+	// the node itself so self-inclusion agrees with the panel -> canvas direction above (a
+	// node/objective trivially "influences" itself). Pushed into the *same* store
+	// `handle_reference_point_row_hover` writes to, so canvas focus and panel hover both drive
+	// one shared source of truth instead of `NetworkView`'s own internal highlighting and this
+	// panel disagreeing about which objectives are lit vs. dimmed.
+	$effect(() => {
+		const id = network_focus_id;
+		if (id === null) {
+			network_influenced_objectives = new Set();
+			network_highlight.set(null);
+			return;
+		}
+		const forward = new Set([id, ...descendants(network_model, id, network_adjacency)]);
+		network_influenced_objectives = new Set(
+			[...forward].filter((nodeId) => network_objective_ids.has(nodeId))
+		);
+		network_highlight.set(forward);
+	});
+
+	// Escape (or any dialog close that doesn't fire `mouseleave`/blur on the hovered/focused
+	// element) must not leave a stale highlight lit next time the dialog reopens.
+	$effect(() => {
+		if (!show_network_dialog) {
+			network_hovered_id = null;
+			network_selected_id = null;
+			network_highlight.set(null);
+			network_influenced_objectives = new Set();
+		}
+	});
 
 	$effect(() => {
 		if (problem && active_objective_symbols.size === 0) {
@@ -1254,7 +1335,8 @@
 					Preview of the reusable graphical-model network component embedded in CUMULUS, ahead of
 					the backend compiler (plan phases 4-7). This shows a sample irrigation diagram, not this
 					problem's actual structure -- evidence, posteriors and the policy below are fixed demo
-					data, not a live solve.
+					data, not a live solve. The "Reference point" panel on the right is a stand-in for a real
+					reference-point widget, proving the phase C cross-highlight contract.
 				</Dialog.Description>
 			</Dialog.Header>
 			<div class="flex flex-wrap items-center gap-3 text-sm">
@@ -1273,32 +1355,60 @@
 					</span>
 				{/if}
 			</div>
-			<div class="min-h-0 flex-1">
-				<NetworkView
-					bind:model={network_model}
-					bind:evidence={network_evidence}
-					posteriors={NETWORK_DEMO_POSTERIORS}
-					policy={network_decision_mode === 'solver' ? NETWORK_DEMO_POLICY : undefined}
-					decisionMode={network_decision_mode}
-				>
-					{#snippet nodeChrome({ id })}
+			<div class="flex min-h-0 flex-1 gap-3">
+				<div class="min-h-0 flex-1">
+					<NetworkView
+						bind:model={network_model}
+						bind:evidence={network_evidence}
+						posteriors={NETWORK_DEMO_POSTERIORS}
+						policy={network_decision_mode === 'solver' ? NETWORK_DEMO_POLICY : undefined}
+						decisionMode={network_decision_mode}
+						highlight={$network_highlight}
+						onNodeHover={handle_network_hover}
+						onNodeSelect={handle_network_select}
+					>
+						{#snippet nodeChrome({ id })}
+							<button
+								type="button"
+								class="bg-background flex size-4 items-center justify-center rounded-full border shadow-sm"
+								title={network_flagged.has(id) ? 'Unflag' : 'Flag for follow-up'}
+								onclick={(e) => {
+									e.stopPropagation();
+									toggle_network_flag(id);
+								}}
+							>
+								<IconFlag
+									class="size-2.5 {network_flagged.has(id)
+										? 'text-primary'
+										: 'text-muted-foreground'}"
+								/>
+							</button>
+						{/snippet}
+					</NetworkView>
+				</div>
+				<div class="w-48 shrink-0 space-y-2 overflow-auto">
+					<p class="text-muted-foreground text-xs">
+						(demo) Reference point -- stand-in for a real reference-point widget. Hover an
+						objective to highlight its ancestor subgraph on the canvas; hover a canvas node to see
+						which objectives it can influence.
+					</p>
+					{#each network_reference_point_objectives as node (node.id)}
 						<button
 							type="button"
-							class="bg-background flex size-4 items-center justify-center rounded-full border shadow-sm"
-							title={network_flagged.has(id) ? 'Unflag' : 'Flag for follow-up'}
-							onclick={(e) => {
-								e.stopPropagation();
-								toggle_network_flag(id);
-							}}
+							class="block w-full rounded-md border px-2 py-1 text-left text-sm {network_influenced_objectives.has(
+								node.id
+							)
+								? 'border-primary bg-primary/10'
+								: ''}"
+							onmouseenter={() => handle_reference_point_row_hover(node.id)}
+							onmouseleave={() => handle_reference_point_row_hover(null)}
+							onfocus={() => handle_reference_point_row_hover(node.id)}
+							onblur={() => handle_reference_point_row_hover(null)}
 						>
-							<IconFlag
-								class="size-2.5 {network_flagged.has(id)
-									? 'text-primary'
-									: 'text-muted-foreground'}"
-							/>
+							{node.label}
 						</button>
-					{/snippet}
-				</NetworkView>
+					{/each}
+				</div>
 			</div>
 			<Dialog.Footer>
 				<Dialog.Close>

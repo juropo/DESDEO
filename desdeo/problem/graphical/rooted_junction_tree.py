@@ -435,7 +435,9 @@ def build_rooted_junction_tree(
             that validator's message rather than a confusing downstream `KeyError`.
         max_cluster_size: if given, the resulting tree's `max_cluster_size` (a flattened
             state-space size, not a node count -- see `Cluster.state_space_size`) is checked
-            against it.
+            against it -- on every call, including a cache hit (a stricter `on_exceed`/
+            `max_cluster_size` than whatever call first warmed the cache for this structure would
+            otherwise never be checked at all).
         on_exceed: `"warn"` (default, via `ClusterSizeWarning`) or `"raise"` (`ValueError`) when
             `max_cluster_size` is exceeded.
         use_cache: look up/store the result in the module-level cache, keyed on
@@ -457,6 +459,7 @@ def build_rooted_junction_tree(
     if use_cache:
         cached = _cache_get(cache_key)
         if cached is not None:
+            _check_max_cluster_size(cached, max_cluster_size, on_exceed)
             return cached
 
     annotation.validate_against(network)
@@ -525,17 +528,33 @@ def build_rooted_junction_tree(
 
     rjt = RootedJunctionTree(clusters=clusters, root=root)
 
-    if max_cluster_size is not None and rjt.max_cluster_size > max_cluster_size:
-        msg = (
-            f"Rooted junction tree's largest cluster has state space {rjt.max_cluster_size}, "
-            f"exceeding max_cluster_size={max_cluster_size} (owned by "
-            f"'{max(clusters.values(), key=lambda c: c.state_space_size).ownership}')."
-        )
-        if on_exceed == "raise":
-            raise ValueError(msg)
-        warnings.warn(msg, ClusterSizeWarning, stacklevel=2)
+    _check_max_cluster_size(rjt, max_cluster_size, on_exceed)
 
     if use_cache:
         _cache_put(cache_key, rjt)
 
     return rjt
+
+
+def _check_max_cluster_size(
+    rjt: RootedJunctionTree, max_cluster_size: int | None, on_exceed: Literal["warn", "raise"]
+) -> None:
+    """Warn or raise if `rjt.max_cluster_size` exceeds `max_cluster_size`.
+
+    Shared between the freshly-built path and a cache hit -- a review pass caught the original
+    version only ever checking freshly-built trees, so a `use_cache=True` call with a *looser*
+    `on_exceed`/`max_cluster_size` than an earlier call for the same structure could warm the
+    cache, after which a stricter later call (even `on_exceed="raise"`) silently returned the
+    cached tree with no check at all. `RootedJunctionTree.max_cluster_size` is a property of the
+    tree itself, so re-checking it on a cache hit is free -- no re-triangulation needed.
+    """
+    if max_cluster_size is None or rjt.max_cluster_size <= max_cluster_size:
+        return
+    msg = (
+        f"Rooted junction tree's largest cluster has state space {rjt.max_cluster_size}, "
+        f"exceeding max_cluster_size={max_cluster_size} (owned by "
+        f"'{max(rjt.clusters.values(), key=lambda c: c.state_space_size).ownership}')."
+    )
+    if on_exceed == "raise":
+        raise ValueError(msg)
+    warnings.warn(msg, ClusterSizeWarning, stacklevel=3)

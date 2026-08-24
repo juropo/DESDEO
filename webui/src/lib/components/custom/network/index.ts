@@ -42,9 +42,14 @@ export {
 	dSeparated,
 	activeTrailNodes,
 	nodeById,
-	incidentEdges
+	incidentEdges,
+	buildAdjacency
 } from './dag-algorithms';
+export type { Adjacency } from './dag-algorithms';
 
 export { computeDetailLevel } from './lod';
 
 export { isNodeEditable, toggleEvidenceState, mergeHighlightSets } from './interaction';
+
+export { createNetworkHighlightStore } from './highlight-store';
+export type { NetworkHighlightStore } from './highlight-store';

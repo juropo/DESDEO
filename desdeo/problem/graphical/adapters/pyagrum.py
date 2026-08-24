@@ -2,7 +2,10 @@
 
 Also the import/export/learning entry points that go through pyAgrum: `load_network` and
 `save_network` (pyAgrum's own readers/writers -- BIF, XDSL, `.net`, XMLBIF, ...) and
-`learn_network` (a thin wrapper around `pyagrum.BNLearner`).
+`learn_network` (a thin wrapper around `pyagrum.BNLearner`); and `to_pyagrum_influence_diagram`,
+which additionally folds in a `DecisionAnnotation` to build a full `gum.InfluenceDiagram` --
+decision nodes plus one utility node per `ObjectiveNode` -- for Phase 7's `/graphical/whatif`
+inference (and, before that, `tests/test_graphical_compile.py`'s own pyAgrum oracle).
 
 This is the only module in `desdeo/problem/graphical/` allowed to import pyAgrum -- see the
 dependency rule in the plan's cross-cutting section. pyAgrum is an ordinary hard dependency
@@ -23,6 +26,7 @@ from desdeo.problem.graphical.network import (
     DiscreteVariableKind,
     Potential,
 )
+from desdeo.problem.graphical.schema import DecisionAnnotation
 
 
 @dataclass(frozen=True)
@@ -270,3 +274,74 @@ def learn_network(
         learned_bn = learner.learnBN()
 
     return from_pyagrum(learned_bn)
+
+
+def to_pyagrum_influence_diagram(network: DiscreteNetwork, annotation: DecisionAnnotation) -> gum.InfluenceDiagram:
+    """Build a pyAgrum `InfluenceDiagram` from a `(DiscreteNetwork, DecisionAnnotation)` pair.
+
+    Lifted from `tests/test_graphical_compile.py`'s own `_to_pyagrum_influence_diagram` (Phase 4's
+    pyAgrum oracle -- see that module's docstring), now public so Phase 7's `/graphical/whatif`
+    can build the same diagram pyAgrum's own inference engines (`ShaferShenoyLIMIDInference`) need,
+    not just the test suite. Chance nodes and their CPTs come straight from `to_pyagrum`-style
+    conversion (inlined here rather than delegated, since a `gum.BayesNet` can't be upgraded to a
+    `gum.InfluenceDiagram` in place); decision nodes get one arc per `information_set` member
+    (the *declared* one -- `no_forgetting` expansion is an inference-engine concern, applied via
+    `ShaferShenoyLIMIDInference.addNoForgettingAssumption`, not a structural change to the diagram
+    itself); and each `ObjectiveNode` gets its own utility node (`util_<symbol>`), arcs from its
+    `parents`, and its own utility table -- deliberately *not* summed into one utility node, per
+    the Phase 2 finding that pyAgrum's own multi-utility-node convention does that summing itself
+    (`ShaferShenoyLIMIDInference.MEU()`), which is not the semantics `ObjectiveNode` wants. Each
+    utility table is written in *pyAgrum's* maximize-only sign convention, negated from
+    `objective.utility`'s own values whenever `objective.maximize` is `False` -- see the inline
+    comment at the utility-table loop below for why, and for what a caller must do to read a
+    utility-node-derived scalar back out in `objective`'s own units.
+
+    Args:
+        network: the Bayesian network (chance nodes + CPTs).
+        annotation: the decision/objective overlay. Not validated against `network` here --
+            callers needing that should call `annotation.validate_against(network)` themselves.
+
+    Returns:
+        gum.InfluenceDiagram: the equivalent pyAgrum diagram.
+    """
+    diagram = gum.InfluenceDiagram()
+
+    for variable in network.variables:
+        diagram.addChanceNode(_variable_to_pyagrum(variable))
+    for node_name, potential in network.potentials.items():
+        for parent in potential.variables[1:]:
+            diagram.addArc(parent, node_name)
+    for node_name, potential in network.potentials.items():
+        _fill_cpt(diagram.cpt(node_name), potential)
+
+    for decision in annotation.decisions:
+        diagram.addDecisionNode(gum.LabelizedVariable(decision.symbol, decision.symbol, decision.states))
+    for decision in annotation.decisions:
+        for parent in decision.information_set:
+            diagram.addArc(parent, decision.symbol)
+
+    for objective in annotation.objectives:
+        util_name = f"util_{objective.symbol}"
+        diagram.addUtilityNode(gum.LabelizedVariable(util_name, util_name, 1))
+        for parent in objective.parents:
+            diagram.addArc(parent, util_name)
+        # pyAgrum's own ID-solving semantics (`ShaferShenoyLIMIDInference`'s policy optimisation,
+        # MEU()) always *maximize* the utility node(s). `ObjectiveNode.maximize` can be `False`
+        # (a cost -- it's the field's own default), so a minimizing objective's utility values are
+        # negated here before being written into pyAgrum's own utility table -- the same
+        # `sign = 1.0 if objective.maximize else -1.0` convention `compile.py`'s `_build_objective`
+        # already uses for the compiled MILP's `Objective`, applied here so pyAgrum's policy search
+        # optimises in the right direction for a minimizing objective too. A caller reading a
+        # utility-node-derived scalar back out of this diagram (`MEU()["mean"]`,
+        # `posteriorUtility`, ...) must negate again by the same sign to recover the value in
+        # `objective`'s own units -- the diagram's own decision/chance-node posteriors need no such
+        # correction, since a *choice* has no sign.
+        sign = 1.0 if objective.maximize else -1.0
+        fake_potential = Potential(
+            variables=[util_name, *objective.parents],
+            shape=[1, *objective.utility.shape],
+            values=np.expand_dims(sign * np.array(objective.utility.values, dtype=float), axis=0).tolist(),
+        )
+        _fill_cpt(diagram.utility(util_name), fake_potential)
+
+    return diagram
