@@ -9,6 +9,7 @@ the servers on the network and --no-open to not launch a browser window.
 """
 
 import argparse
+import shutil
 import signal
 import subprocess
 import sys
@@ -81,7 +82,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.reload:
         backend_cmd.append("--reload")
 
-    frontend_cmd = ["npm", "run", "dev", "--", "--host", args.host]
+    npm_path = shutil.which("npm")
+    if npm_path is None:
+        print(f"{RED}Could not find 'npm' on PATH. Is Node.js installed?{RESET}")  # noqa: T201
+        return 1
+
+    frontend_cmd = [npm_path, "run", "dev", "--", "--host", args.host]
     if args.frontend_port is not None:
         frontend_cmd += ["--port", str(args.frontend_port)]
     if args.open_browser:
