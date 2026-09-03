@@ -6,6 +6,7 @@
 export { default as NetworkView } from './NetworkView.svelte';
 export { default as NetworkTable } from './NetworkTable.svelte';
 export { default as NetworkPanel } from './NetworkPanel.svelte';
+export { default as TornadoChart } from './TornadoChart.svelte';
 
 export type {
 	NetworkModel,
@@ -16,9 +17,12 @@ export type {
 	NetworkLayoutPosition,
 	DecisionMode,
 	NetworkEvidence,
+	NetworkEvidenceSet,
 	NetworkPosteriors,
 	NetworkPolicy,
+	NetworkPolicySource,
 	NetworkUtilities,
+	NetworkUtilityStdDevs,
 	WhatIfResult
 } from './types';
 
@@ -73,3 +77,23 @@ export {
 export type { Debouncer, WhatIfRunner } from './whatif';
 
 export { explainNoChange } from './null-explanation';
+
+export {
+	mapSensitivityResponse,
+	mapVoiResponse,
+	sortByImpact,
+	tornadoDomain,
+	defaultFetchSensitivity,
+	defaultFetchVoi
+} from './sensitivity';
+export type { SensitivityNodeResult, SensitivityResult, VoiResult } from './sensitivity';
+
+export { defaultFetchPolicy } from './policy';
+
+export {
+	mapEvidenceSetResponse,
+	defaultFetchEvidenceSets,
+	defaultSaveEvidenceSet,
+	defaultDeleteEvidenceSet,
+	defaultFetchEvidenceSetById
+} from './evidence-sets';

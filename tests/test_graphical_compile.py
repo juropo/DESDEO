@@ -76,6 +76,7 @@ from desdeo.problem.graphical import (
     RiskMeasure,
     build_rooted_junction_tree,
     compile_diagram,
+    read_policy_from_solution,
 )
 from desdeo.problem.graphical.adapters.pyagrum import from_pyagrum, to_pyagrum, to_pyagrum_influence_diagram
 from desdeo.problem.graphical.index_map import mixed_radix_decode
@@ -428,21 +429,27 @@ def _compiled_optimum(network: DiscreteNetwork, annotation: DecisionAnnotation, 
 def _read_back_policy(annotation: DecisionAnnotation, index_map: IndexMap, result):
     """Reconstruct `{decision_symbol: (info_order, {info_state: chosen_state})}` from a solved `z`.
 
-    Factored out of what was `_read_back_policy_and_reverify`'s own inline block, so Phase 5's
-    probability/expected_value constraint tests can also read back the actual solved policy (to
-    compute the marginal a `DiagramConstraint` bounds) without duplicating this bookkeeping.
+    Thin adapter over `read_policy_from_solution` (Phase E's promotion of what used to be this
+    function's own inline block into real library code, `compile.py`) -- decodes that function's
+    flat-index-keyed `DecisionPolicy.policy` into the tuple-keyed shape `_expected_utilities`/
+    `_enumerate_policies` (this module's own independent brute-force oracle) already expect, and
+    re-asserts the "a genuinely solved binary z has exactly one 1.0 per block" property directly
+    (a solver-correctness check that belongs to this test module's oracle role, not to the library
+    function itself -- see its own docstring for why it doesn't assert this).
     """
+    policies = read_policy_from_solution(
+        index_map, {sym: result.optimal_variables[sym] for sym in (dm.z_symbol for dm in index_map.decisions.values())}
+    )
     policy_by_decision = {}
     for decision in annotation.decisions:
         decision_map = index_map.decisions[decision.symbol]
+        decision_policy = policies[decision.symbol]
         z_values = result.optimal_variables[decision_map.z_symbol]
         n_states = len(decision_map.states)
-        n_info_states = len(z_values) // n_states
 
         policy: dict[tuple[int, ...], int] = {}
-        for info_flat in range(n_info_states):
+        for info_flat, chosen in decision_policy.policy.items():
             block = z_values[info_flat * n_states : (info_flat + 1) * n_states]
-            chosen = max(range(n_states), key=lambda s: block[s])
             assert block[chosen] == pytest.approx(1.0, abs=1e-6)
             info_state = (
                 mixed_radix_decode(info_flat, decision_map.information_cardinalities)
@@ -595,6 +602,49 @@ def test_decision_observes_chance_node():
         ],
     )
     _assert_all_agree(network, annotation, "fmatch")
+
+
+def test_read_policy_from_solution_returns_full_policy_function():
+    """`read_policy_from_solution` (Phase E) reports a per-information-state function.
+
+    Not one collapsed choice -- the whole point of promoting it out of the test-private helper.
+    Reuses `test_decision_observes_chance_node`'s own fixture: D observes A and is rewarded for
+    matching it, so the optimal policy genuinely differs by information state (`D="s0"` when
+    `A="lo"`, `D="s1"` when `A="hi"`) -- a single collapsed "the" choice would be meaningless here.
+    """
+    network = DiscreteNetwork(
+        variables=[DiscreteVariable(name="A", labels=["lo", "hi"])],
+        arcs=[],
+        potentials={"A": Potential(variables=["A"], shape=[2], values=[0.3, 0.7])},
+    )
+    annotation = DecisionAnnotation(
+        decisions=[DecisionNode(symbol="D", states=["s0", "s1"], information_set=["A"])],
+        objectives=[
+            ObjectiveNode(
+                symbol="fmatch",
+                parents=["A", "D"],
+                utility=Potential(variables=["A", "D"], shape=[2, 2], values=[[10.0, 0.0], [0.0, 10.0]]),
+                maximize=True,
+            )
+        ],
+    )
+    problem, index_map = compile_diagram(network, annotation)
+    result = GurobipySolver(problem).solve("fmatch")
+    assert result.success, result.message
+
+    policies = read_policy_from_solution(index_map, result.optimal_variables)
+    decision_policy = policies["D"]
+
+    assert decision_policy.symbol == "D"
+    assert decision_policy.information_set == ["A"]
+    assert decision_policy.states == ["s0", "s1"]
+    # Two distinct information states (A=lo, A=hi), each its own entry -- not a single value.
+    assert len(decision_policy.policy) == 2
+    assert decision_policy.policy[0] == 0  # A="lo" (flat 0) -> D="s0" (index 0)
+    assert decision_policy.policy[1] == 1  # A="hi" (flat 1) -> D="s1" (index 1)
+    # The two information states genuinely disagree -- confirms this isn't a collapsed single
+    # choice silently repeated for every information state.
+    assert decision_policy.policy[0] != decision_policy.policy[1]
 
 
 def test_two_decisions_with_no_forgetting():

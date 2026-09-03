@@ -94,10 +94,50 @@ export type NetworkPolicy = Record<string, string>;
  *  instead, for a method UI's own objective-value display to consume. */
 export type NetworkUtilities = Record<string, number>;
 
+/** Objective node id -> standard deviation of the utility distribution under the currently
+ *  applied evidence (`WhatIfResponse.utility_std_devs`, phase E: "MEU with its standard
+ *  deviation"). Same keying convention as `NetworkUtilities` — the two are always fetched, and
+ *  remapped from `util_<symbol>`, together (see `defaultFetchWhatIf`). Not rendered on the graph
+ *  itself for the same reason `NetworkUtilities` isn't (phase C: objective nodes stay
+ *  posterior-free) — surfaced only via `NetworkPanel`'s `onWhatIfResult`. */
+export type NetworkUtilityStdDevs = Record<string, number>;
+
 /** Shape of a `POST /graphical/whatif` response (backend phase 7; see `WhatIfResponse` in
  *  `desdeo/api/routers/graphical.py`) — what `<NetworkPanel>`'s `fetchWhatIf` resolves to. */
 export interface WhatIfResult {
 	posteriors: NetworkPosteriors;
 	policy?: NetworkPolicy;
 	utilities?: NetworkUtilities;
+	utilityStdDevs?: NetworkUtilityStdDevs;
+}
+
+/**
+ * Phase E: reads a *solved* `Problem`'s policy back (via `POST /graphical/{id}/policy`), as
+ * distinct from `WhatIfResult.policy` (a live pyAgrum engine's evidence-conditioned posterior —
+ * see `desdeo/api/routers/graphical.py`'s own module docstring for why these are two different,
+ * complementary sources of truth for the same `NetworkPolicy` shape). Exactly one of
+ * `variableValues`/`solutionId` identifies which solved solution to decode.
+ *
+ * `variableValues` is `Record<string, number[] | number>`, not just `Record<string, number[]>` —
+ * matching `PolicyRequest.variable_values`'s own declared `dict[str, list[float] | float]` shape
+ * (`desdeo/api/routers/graphical.py`). A review pass caught this narrower type reintroducing, on
+ * the TypeScript side, the identical mismatch Phase E's own review already fixed on the Python
+ * side: a diagram compiled with a `RiskMeasure` has a scalar `eta` `Variable` in a solved
+ * `Problem`'s `optimal_variables` (a bare number, not a length-1 array) alongside every decision's
+ * own list-valued `z_symbol`.
+ */
+export type NetworkPolicySource =
+	| { variableValues: Record<string, number[] | number> }
+	| { solutionId: number };
+
+/** A named hard-evidence set saved server-side (`GET/POST/DELETE /graphical/.../evidence-sets`,
+ *  phase E) — selectable as a comparison baseline (via `NetworkView`'s existing
+ *  `ghostPosteriors`/`committedEvidence`/`onCommitEvidence` machinery, see `NetworkPanel`'s
+ *  `loadEvidenceSetAsBaseline`) and addressable/shareable by its own `id`. */
+export interface NetworkEvidenceSet {
+	id: number;
+	problemId: number;
+	name: string;
+	evidence: NetworkEvidence;
+	createdAt: string;
 }

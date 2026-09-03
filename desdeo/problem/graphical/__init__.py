@@ -9,7 +9,15 @@ cross-cutting section. Import it explicitly: `from desdeo.problem.graphical.adap
 import to_pyagrum, from_pyagrum`.
 """
 
-from .compile import ClusterIndexMap, DecisionIndexMap, IndexMap, RiskMeasureIndexMap, compile_diagram
+from .compile import (
+    ClusterIndexMap,
+    DecisionIndexMap,
+    DecisionPolicy,
+    IndexMap,
+    RiskMeasureIndexMap,
+    compile_diagram,
+    read_policy_from_solution,
+)
 from .network import DiscreteNetwork, DiscreteVariable, DiscreteVariableKind, Potential
 from .rooted_junction_tree import (
     Cluster,
@@ -38,6 +46,7 @@ __all__ = [
     "DecisionAnnotation",
     "DecisionIndexMap",
     "DecisionNode",
+    "DecisionPolicy",
     "DiagramConstraint",
     "DiagramConstraintKind",
     "DiscreteNetwork",
@@ -54,4 +63,5 @@ __all__ = [
     "clear_rjt_cache",
     "compile_diagram",
     "effective_information_sets",
+    "read_policy_from_solution",
 ]

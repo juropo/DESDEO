@@ -306,6 +306,109 @@ class IndexMap(BaseModel):
     """Keyed by `RiskMeasure.symbol`. Empty when `annotation.risk_measures` is empty."""
 
 
+class DecisionPolicy(BaseModel):
+    """One decision's full solved policy, read back from a solved `z` via `IndexMap`.
+
+    Phase E of `.claude/desdeo-graphical-models-plan.md`: promoted from what was
+    `tests/test_graphical_compile.py`'s own test-private `_read_back_policy` helper (already
+    exercised by Phase 4/5's own oracle-readback tests) into real library code -- the plan's own
+    checklist names this exact mechanism "load-bearing for reading policies back out of
+    solutions". Unlike `routers/graphical.py`'s `/whatif`/`_read_policy` (a *live pyAgrum engine's*
+    evidence-conditioned posterior, collapsed to a single choice only when fully pinned), this
+    reads a *solved MILP*'s `z` directly and returns the whole policy function, not just whatever
+    a particular evidence state happens to collapse to -- the two are complementary read-back
+    paths over the same underlying `IndexMap`/`DecisionIndexMap` bookkeeping, not alternatives for
+    the same question.
+
+    Index-based, not label-based: `IndexMap` carries no node-label information (`DiscreteNetwork`/
+    `DecisionAnnotation` own that) -- translating `information_set`/`states` indices to labels,
+    and collapsing to "the choice given this evidence", is the caller's job. See
+    `routers/graphical.py`'s `_decode_solved_policy` for the API-layer translation actually used.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    symbol: str
+    """`DecisionIndexMap.symbol` -- this decision's own symbol."""
+    information_set: list[str]
+    """`DecisionIndexMap.information_set` -- the *effective* (no_forgetting-expanded) information
+    set, most-significant-first, matching `policy`'s own key encoding (`mixed_radix_encode` over
+    `information_cardinalities`)."""
+    states: list[str]
+    """`DecisionIndexMap.states` -- this decision's own alternatives, in state-index order."""
+    policy: dict[int, int]
+    """Information-state flat index (0-based, `0` -- the only key -- when `information_set` is
+    empty) -> the chosen state's own 0-based index into `states`. The *full* policy function, not
+    a single collapsed choice: a decision with a non-empty information set genuinely answers
+    differently per information state, which is exactly what this preserves."""
+
+
+def read_policy_from_solution(
+    index_map: IndexMap, optimal_variables: dict[str, list[float]]
+) -> dict[str, DecisionPolicy]:
+    """Read every decision's full solved policy out of a solved `Problem`'s `optimal_variables`.
+
+    For each decision, `optimal_variables[decision_map.z_symbol]` (the same flat `z` array
+    `SolverResults.optimal_variables` reports for any `TensorVariable`) is split into
+    `n_info_states` contiguous blocks of `len(states)` entries each (`DecisionIndexMap`'s own
+    information-set-major/states-minor flattening -- see its class docstring), and each block's
+    argmax is read off as that information state's chosen state. A genuinely solved binary `z`
+    has exactly one `1.0` per block (Phase 4/5's own `_zsum_*` constraint enforces this), so
+    argmax recovers the deterministic choice regardless of exact floating-point equality to `1.0`
+    -- no closeness assertion is made here (that belongs to a test oracle checking the *solver*
+    behaved correctly, not to this read-back step, which should read whatever `optimal_variables`
+    actually contains).
+
+    Args:
+        index_map: the `IndexMap` `compile_diagram` returned alongside the `Problem` that was
+            solved (or the equivalent persisted `GraphicalModelMetaData.index_map_json`).
+        optimal_variables: a solved `Problem`'s `SolverResults.optimal_variables` (or an
+            equivalent mapping, e.g. a `UserSavedSolutionDB.variable_values` row) -- must contain
+            an entry for every `index_map.decisions[...].z_symbol`.
+
+    Returns:
+        dict[str, DecisionPolicy]: keyed by decision symbol, matching `index_map.decisions`.
+
+    Raises:
+        KeyError: `optimal_variables` is missing an entry for one of `index_map.decisions`'s
+            `z_symbol`s.
+        ValueError: a `z_symbol` entry's length doesn't match
+            `prod(decision_map.information_cardinalities) * len(decision_map.states)` -- e.g. a
+            stale saved solution's `z` array left over from before a recompile changed a
+            cardinality. Checked explicitly rather than silently inferring `n_info_states` from
+            `len(z_values) // n_states` (a review pass caught the original version doing this,
+            which produces a policy dict missing some info-state keys instead of failing loudly).
+    """
+    policies: dict[str, DecisionPolicy] = {}
+    for symbol, decision_map in index_map.decisions.items():
+        z_values = optimal_variables[decision_map.z_symbol]
+        n_states = len(decision_map.states)
+        n_info_states = prod(decision_map.information_cardinalities)
+        expected_len = n_info_states * n_states
+        if len(z_values) != expected_len:
+            msg = (
+                f"Decision '{symbol}': z_symbol '{decision_map.z_symbol}' has length "
+                f"{len(z_values)}, expected {expected_len} "
+                f"(prod(information_cardinalities)={n_info_states} * len(states)={n_states}). "
+                "This usually means optimal_variables came from a solution solved against a "
+                "different (e.g. since-recompiled) IndexMap."
+            )
+            raise ValueError(msg)
+
+        policy: dict[int, int] = {}
+        for info_flat in range(n_info_states):
+            block = z_values[info_flat * n_states : (info_flat + 1) * n_states]
+            policy[info_flat] = max(range(n_states), key=lambda s: block[s])
+
+        policies[symbol] = DecisionPolicy(
+            symbol=symbol,
+            information_set=decision_map.information_set,
+            states=decision_map.states,
+            policy=policy,
+        )
+    return policies
+
+
 @lru_cache(maxsize=2048)
 def _position_map(order: tuple[str, ...]) -> dict[str, int]:
     """`{node: index in order}`, cached per distinct `order` -- called once per cluster state.
