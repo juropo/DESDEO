@@ -20,7 +20,7 @@ Guides are goal-oriented and are meant to direct users towards specific goals wh
 - **[Utilizing MCDM methods](./how_to_utilize_mcdm_methods.ipynb):** How to utilize 'MCDM' methods
 
 - **[NAUTILUS Navigator](nautilus_navigator.md):** How to use the NAUTILUS Navigator method
-- **[NAUTILI](nautili.md):** How to use the NAUTILI method
+- **[NAUTILI](nautili.ipynb):** How to use the NAUTILI method
 - **[Using EAs in DESDEO](ea.ipynb):** How to use evolutionary algorithms
 - **[Using EAs in DESDEO (Pydantic Interface)](ea_options.ipynb):** How to use evolutionary algorithms with the Pydantic interface
 - **[Implementing new EA components](how_to_implement_ea.md):** How to implement new evolutionary algorithm components
@@ -33,6 +33,7 @@ Guides are goal-oriented and are meant to direct users towards specific goals wh
 ## Web-API and Web-GUI
 
 - **[Running the web-API and web-GUI](api_and_gui.md):** How to run the web-API and web-GUI
+- **[Solving problems with the web-GUI](webui_solving_problems.md):** How to locally set up a database and solve a problem using the web-GUI
 - **[Hosting on Kubernetes (old)](kubernetes.md):** How to host a DESDEO web application on Kubernetes
 - **[Deploying on OpenShift](deploying_on_openshift.md):** How to deploy DESDEO on OpenShift/Kubernetes (Rahti example)
 - **[Implementing method interfaces](implementing_method_interfaces.md):** How to implement new interactive method interfaces in the Web-GUI

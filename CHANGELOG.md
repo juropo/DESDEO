@@ -54,6 +54,529 @@ This project follows **Keep a Changelog** and **Semantic Versioning**:
 
 ---
 
+## [2.8.0] - 13.10.2026
+
+### Highlights
+
+This release fixes two defects that users should be aware of. The infix parser
+grouped chains of mixed operators wrongly, so `a / b * c` was parsed as
+`a / (b * c)`. This affects every function given as a string, so problems
+defined with such expressions may evaluate differently after upgrading. In the
+Web API, a decision maker could use another user's interactive session or
+parent state by passing its id; this is now refused.
+
+### Core logic
+
+#### Added
+
+- Added `DifferentialEvolutionCrossover` (DE/rand/1/bin, Storn and Price 1997)
+  and `ParentCentricCrossover` (PCX, Deb, Anand and Joshi 2002), with
+  `DifferentialEvolutionCrossoverOptions` and `ParentCentricCrossoverOptions`,
+  and the `SCALING_FACTOR`, `SIGMA_ZETA` and `SIGMA_ETA` crossover message
+  topics. Both recombine more than two parents and take their step size from the
+  population.
+- Added `UniformCrossover` and `UniformCrossoverOptions`, a discrete crossover
+  for continuous problems in which every decision variable is inherited whole
+  from one parent or the other, with `pair_xover_probability` and
+  `uniform_xover_probability` parameters.
+- Added `swap_uncrossed_variables` to simulated binary crossover, which
+  exchanges the variables not selected for crossover between the two offspring,
+  to reproduce jMetal (Java). Defaults to `False`.
+- Added `uniform_xover_probability` to the bounded exponential crossover, the
+  same uniform-crossover component simulated binary crossover already has.
+  Defaults to 0.0, which reproduces the previous offspring exactly.
+- Added an `include_perturbed` keyword to `rpm_solve_solutions`. When `False`,
+  only the solution for the given reference point is computed and returned,
+  without the k solutions for the perturbed reference points. Defaults to
+  `True`.
+- Added the D-PHI and PHI+ unary indicators to `desdeo/tools/indicators_unary.py`
+  (`d_phi_indicator`, `d_phi_batch`, `phi_plus_indicator`, `phi_plus_batch`,
+  `desirability_values`, and the `DPhiIndicators` and `PhiPlusIndicator`
+  result models) (#595).
+- Added `desdeo/gdm/grp_subproblem.py` for aggregating the reference points of a
+  group fairly in NAUTILI: `build_grp_subproblem` assembles the Group Reference
+  Point subproblem from a local preference model
+  (`additive_preference_constraints` or
+  `symmetric_cones_preference_constraints`) and a max-min fairness model
+  (`maxmin_fairness_constraints`, `maxmin_fairness_objective`). All are exported
+  from `desdeo.gdm` (#572).
+- Added a `cluster_extremes` field to `SCOREBandsResult`, which reports the
+  minimum and maximum value attained by the solutions of each cluster, as
+  opposed to the limits of the band drawn from the cluster.
+- Added the test problems `re31` (two bar truss), `re32` (welded beam), `re33`
+  (disc brake) and `re42` (conceptual marine design), and exported them, along
+  with `re34`, `re37`, `re41` and `re61`, from `desdeo.problem.testproblems`.
+- Added the General Aviation Aircraft product family design problem, `gaa`
+  (`gaa_problem.py`): ten objectives, 27 continuous variables and a single
+  aggregated constraint, with coefficients checked bit for bit against the MOEA
+  Framework implementation.
+- Added the microalloyed steel design problem of Saini et al. (2023),
+  `metallurgical_application` (`metallurgical_application_problem.py`). Four
+  objectives come from surrogate models that are trained on first use and
+  cached; the datasets are read from the repository or downloaded from GitHub.
+- Added `forest_problem_income_carbon_habitat` (`forest_problem.py`), the
+  discrete forest management problem with income, carbon storage and habitat
+  suitability objectives used in R-XIMO and INFRINGER, with its dataset
+  `datasets/forest_income_carbon_habitat.csv`. `non_dominated_only=True` keeps
+  only the 1247 non-dominated rows of the 1728.
+
+#### Changed
+
+- Subscribers now register themselves with their publisher once they have been
+  constructed, through a metaclass that calls the new `Subscriber.__post_init__`.
+  The EA factories in `EAs.py` and `emo_constructor` no longer subscribe the
+  components by hand. `Publisher.subscribe` and `Publisher.register_topics` are
+  now idempotent, so existing code that still subscribes explicitly does not
+  receive each message twice.
+- `RVEASelector` now uses the provisional ideal point, when one is given, until
+  the population has a feasible solution, and only then builds the ideal point
+  from feasible solutions.
+- `RVEASelector` now adapts its reference vectors periodically under the
+  function evaluation based strategy, instead of only once.
+- `CompositeTerminator` now forwards messages to its children and exposes their
+  topics, so that a limit inside a composite counts. Children the publisher
+  already delivers to are skipped.
+- Renamed `MaxTimeTerminatorOptions.max_time` to `max_time_in_seconds`, to match
+  the `MaxTimeTerminator` constructor.
+- `dmitry_forest_problem_disc` now removes duplicate objective vectors, and its
+  objectives carry full names and units.
+- Documented that `r2_indicator` returns the utility form of R2 (higher is
+  better, always negative), the negation of the distance form reported by
+  PlatEMO and jMetal, and pinned the relationship with tests.
+- The MCWB problem module docstring now names its source, Kenny, Ray and Singh
+  (EMO 2025), and the authors' reference implementation.
+
+#### Fixed
+
+- Fixed the infix parser grouping mixed operator chains to the right: when the
+  operator changed mid-chain, the rest of the chain became the right operand,
+  so `a / b * c` parsed as `a / (b * c)`. Chains are now folded from the left.
+  Chains of a single operator and parenthesized expressions were not affected.
+- Fixed the six MCWB welded beam problems (`mcwb_*_problem`): the parser defect
+  inverted their polar moment, which silenced the shear-stress constraint and
+  made the tapered deflection NaN, and the formulations had drifted from the
+  authors' code (extra and missing constraints, a lost factor of twelve in the
+  tapered inertia, a wrong channel bound, mixed units in the Ragsdell variant).
+  Every objective and constraint now agrees with the reference implementation
+  to machine precision.
+- Fixed `RVEASelector` crashing on a generation with no feasible member, since
+  the ideal point was updated from an empty selection.
+- Fixed the decomposition-based selectors raising `TypeError` on construction
+  when `ReferenceVectorOptions` had `non_preferred_solutions` set: the
+  `norm_order` argument of `interactive_adapt_2` was passed as `ord`.
+- Fixed adaptive IBEA dividing by zero when the population collapses onto one
+  objective vector. `IBEASelector` now falls back to the configured kappa when
+  the adaptive scale is zero; runs that completed before are unchanged.
+- Fixed `terminator_constructor` for composite, external check and maximum time
+  terminators, none of which could previously be built from options.
+- Fixed the verbose state messages of the EMO evaluator, generators and
+  selectors emitting a polars `DeprecationWarning` on every message, by using
+  `DataFrame.hstack` instead of `pl.concat(how="horizontal")`.
+- Fixed `plot_score` using `matplotlib.cm.get_cmap`, which was removed in recent
+  matplotlib versions.
+
+### Web API
+
+#### Added
+
+- Added `include_perturbed` to `RPMSolveRequest`, passed on to
+  `rpm_solve_solutions`, so that the reference point method endpoint can return
+  a single solution. Defaults to `True`.
+
+#### Fixed
+
+- Fixed the reference point method router not persisting its states. It now
+  creates them with `StateDB.create`, links them to their parent state, and
+  stores the preference in `RPMState`.
+
+#### Security
+
+- Fixed `SessionContextGuard` accepting other users' interactive sessions and
+  parent states. `fetch_interactive_session` now checks that the session belongs
+  to the user, and `fetch_parent_state` only accepts a state in one of the
+  user's own sessions or, for a state outside any session, a state of a problem
+  the user may access. Analysts and admins are unaffected. A state the user may
+  not access is reported as not found.
+
+### Documentation
+
+#### Added
+
+- Added a how-to guide on solving problems with the web GUI on a local machine
+  (`docs/howtoguides/webui_solving_problems.md`) (#579).
+- Added a how-to guide on solving the RE problems
+  (`docs/howtoguides/re_problems.ipynb`).
+- Replaced the NAUTILI how-to guide with an executable notebook
+  (`docs/howtoguides/nautili.ipynb`) (#572).
+
+#### Changed
+
+- Updated the guide on using uv with conda (#579).
+- The installation guide now clones the repository over HTTPS instead of SSH.
+- Moved the solver check in the OpenShift deployment guide after the API
+  deployment has rolled out (#576, #577).
+- Listed D-PHI and PHI+ in the features page, and updated the crossover
+  explanation notebook for the new operators.
+- Fixed typos throughout the documentation (#588).
+- Re-executed the cached EA how-to notebooks so that they no longer show the
+  polars deprecation warnings.
+
+### Tooling, CI, and deployment
+
+#### Added
+
+- Added command line options to `run_fullstack.py`: `--host`, `--port`,
+  `--frontend-port`, `--no-open`, `--no-reload` and `--log-level`.
+
+#### Changed
+
+- `run_fullstack.py` now locates `npm` on `PATH`, so it also works on Windows,
+  and reports when it cannot be found (#579).
+- Reformatted `pyproject.toml` to two-space indentation and updated the lock
+  file.
+
+---
+
+## [2.7.0] - 25.8.2026
+
+### Highlights
+
+This release completes the support for scenario-based optimization that was
+started in 2.5.0. A scenario describes what the problem might look like in one
+plausible future, and a `ScenarioModel` collects such scenarios, the tree
+describing how they follow one another, and their probabilities. Scenario
+problems can now be solved interactively: CUMULUS (#550) is a classification
+based method built for them, and it is available through the core logic, the
+Web API and the Web GUI. It comes with soft constraints, worst case regret and
+the stochastic and robust aggregations needed to reduce a scenario problem to
+one a solver can handle.
+
+Scenarios are explained in the documentation at
+https://desdeo.readthedocs.io/en/latest/explanation/scenarios/, which walks
+through building a `ScenarioModel` and solving it. The same material is
+available as a notebook in `notebooks/scenarios.ipynb`.
+
+### Core logic
+
+#### Added
+
+- Added the CUMULUS method (`desdeo/mcdm/cumulus.py`): a classification-based
+  interactive method for scenario-based problems, with
+  `generate_starting_point`, `infer_classifications`, `solve_sub_problems`,
+  `solve_intermediate_solutions`, the `CumulusScalarization` enum and
+  `CumulusError` (#550).
+- Added `add_cumulonimbus_diff` and `add_asf_partial_nondiff` to
+  `desdeo/tools/partial_scalarization.py`, and
+  `add_single_objective_worst_case_regret` to `desdeo/tools/robust.py` (#550).
+- Added `add_soft_constraint` to `desdeo/problem/utils.py`, which turns a
+  constraint into a soft one by introducing a slack variable, and rejects
+  symbols already present in the problem (#550).
+- Added `build_scenario_symbol_maps`, `resolve_elem` and
+  `append_aggregated_elem` to `desdeo/tools/scenarios.py`, which derive the
+  per-symbol pool metadata that the stochastic and robust aggregations need
+  from an already built combined scenario problem (#550).
+- Added `Problem.get_symbol_type_map`, which maps every named symbol to the
+  `Problem` field it belongs to.
+- Added SMS-EMOA: `SMSEMOASelector` (`desdeo/emo/operators/selection.py`),
+  `SMSEMOASelectorOptions`, and the `sms_emoa_options` and
+  `sms_emoa_mixed_integer_options` presets. Hypervolume contributions are
+  computed with moocore (#556).
+- Added `template3` (`desdeo/emo/methods/templates.py`) and `Template3Options`,
+  a steady-state loop that produces one offspring per iteration, which SMS-EMOA
+  follows.
+- Added XLEMOO: the `LearningModeOperator`
+  (`desdeo/emo/operators/learning_mode.py`), the `template_xlemoo` loop that
+  alternates Darwinian and Learning phases, `TemplateXLEMOOOptions`, and the
+  `xlemoo_options` preset. The scalarization used with a reference point is
+  selected through the `XLEMOO_SCALARIZATIONS` dispatch table (ASF, STOM and
+  GUESS, differentiable and non-differentiable).
+- Added the `desdeo/explanations` package with `rules.py`: rule extraction from
+  a trained rule classifier (`extract_skoped_rules`), sampling from rules
+  (`instantiate_from_rules`, `instantiate_from_ruleset`), bound parsing
+  (`parse_rules_to_variable_bounds`, `complete_bounds_from_population`) and
+  reporting (`format_rule_summary`, `format_rule_table`). Sampling accepts an
+  optional NumPy generator for reproducibility.
+- Added `ElitistSelection` (`desdeo/emo/operators/scalar_selection.py`) and
+  `ElitistSelectionOptions`: keeps the top `winner_size` individuals by a single
+  output column.
+- Added Riesz s-energy reference vector generation, `create_s_energy` in
+  `desdeo/tools/reference_vectors.py`. `ReferenceVectorOptions` already accepted
+  `creation_type="s_energy"` but the selector raised `NotImplementedError`. The
+  design is delegated to pymoo, cached on (objectives, vectors, seed), and
+  `_ensure_axis_vectors` guarantees that every axis direction is present. Unlike
+  the simplex lattice, this honours the requested number of vectors exactly, so
+  the population size of a decomposition-based algorithm is no longer rounded
+  down to the nearest binomial count.
+- Added `CompositeCrossover` and `CompositeCrossoverOptions`, which apply a list
+  of crossover operators.
+- Added a bounded (truncated) variant of simulated binary crossover, selected
+  with the `truncated` flag, and a `uniform_xover_probability` parameter that
+  applies uniform crossover to the variables already selected for crossover.
+- Added `pair_xover_probability` to simulated binary crossover: the per-pair
+  probability `p_c` reported in the literature, separate from the per-variable
+  probability of Deb and Agrawal.
+- Added constraint handling to the NSGA-II and IBEA selectors. NSGA-II uses the
+  constrained domination of Deb, Pratap, Agarwal and Meyarivan (2002), IBEA uses
+  feasibility-first, mirroring `NSGA3Selector`. Added the shared
+  `total_constraint_violation` helper.
+- Added a `distance_p` argument to `distance_indicators`, separating the order
+  of the generalized mean used for averaging from the point-to-point metric.
+- Added `project_solution` (`desdeo/tools/project_solution.py`), which projects a
+  solution onto the Pareto front to test for optimality.
+- Added an optional `seed` field to the generator options, for using a generator
+  seed that differs from the template seed.
+- Added the test problems CTP1 to CTP8 (`ctp_problems.py`), car side impact
+  (`car_side_impact_problem.py`), water management
+  (`water_management_problem.py`), vehicle crashworthiness
+  (`vehicle_crashworthiness_problem.py`) and
+  `summer_cabin_battery_robust_ev_problem`, with tests.
+- Added the wrapper functions `re21`, `re34`, `re37`, `re41` and `re61` to
+  `re_problem.py` for test problems already implemented elsewhere.
+- Added `desdeo/emo/options/generate_templates.py`, which regenerates the
+  serialized option templates under `datasets/emoTemplates`, together with the
+  new `emoOptionsSchema.json`, `xlemoo.json` and mixed-integer templates for
+  IBEA, NSGA-III and RVEA.
+
+#### Changed
+
+- Renamed the method-specific exports of `desdeo.mcdm` to carry a method prefix:
+  `generate_starting_point`, `infer_classifications`, `solve_sub_problems` and
+  `solve_intermediate_solutions` are now `nimbus_*`, alongside the new
+  `cumulus_*` counterparts. Importing the unprefixed names from `desdeo.mcdm`
+  no longer works; importing them from `desdeo.mcdm.nimbus` still does (#550).
+- `TournamentSelection` no longer uses its seed as the switch between the
+  deterministic and the stochastic selection rule. `seed` now only seeds and
+  defaults to 0, and the new `stochastic` flag chooses the rule.
+  `RouletteWheelSelectionOptions` sets it. Every options-built algorithm now
+  reproduces from `template.seed` alone; NSGA-II and IBEA previously could not.
+  Callers that passed a seed to obtain roulette-wheel behaviour need
+  `stochastic=True`.
+- The per-variable crossover probability of simulated binary crossover now
+  defaults to 0.5 instead of 1.0, following Deb and Agrawal (1995). The
+  algorithm factories put the per-pair `p_c` in `pair_xover_probability`.
+- `nsga2_options` and `ibea_options` now use `mutation_probability=None`
+  (1/n_variables) rather than a hardcoded 0.01, which was only equivalent for a
+  100-variable problem. `nsga2_options` uses `ClipRepair`, as Deb's reference
+  code clamps offspring onto the variable bounds.
+- `ClipRepair` is now the default repair operator in the algorithm presets that
+  solve continuous problems, and it fills NaN values with the midpoint of the
+  variable bounds. The bounded exponential crossover operator is known to
+  produce NaN values. The repair implementation now operates on NumPy arrays.
+- NSGA-II now publishes `SELECTED_FITNESS` as higher-is-better. Everything
+  downstream reads it that way: the mating tournament takes an argmax, and
+  roulette-wheel selection treats it as a positive weight. The published value
+  is reflected about the worst attainable value, which preserves the ordering
+  and keeps every value strictly positive. On DTLZ2 (m=3, n=12) at 20000
+  evaluations, the median IGD+ over 5 seeds improves from 0.0437 to 0.0393.
+- `max_generations` in the mutation options is now optional and defaults to the
+  budget reported by the terminator, so the decay schedule cannot disagree with
+  the termination criterion.
+- `EMOEvaluator` now builds its backing `SimulatorEvaluator` once in
+  `__init__` instead of constructing a new one on every `evaluate` call. For a
+  problem with surrogate objectives, that construction reloads every surrogate
+  from disk. Measured on a 2000-evaluation NSGA-III run against three 124 MB
+  surrogates: 9.47 s before, 2.99 s after.
+- `LHSGenerator` now seeds `scipy.stats.qmc.LatinHypercube` through a NumPy
+  generator.
+- `BaseTerminator` no longer subscribes to the generator's evaluation counts,
+  which were counted twice for the initial population.
+- The default scale of the bounded exponential crossover changed from 1.0 to
+  0.1. Blend-alpha crossover gained `repeats` and `sample_each_component`
+  parameters, and the crossover probability was removed from local crossover.
+- `distance_indicators` now documents and computes `igd_p` and `gd_p` as the
+  generalized (power) mean of order p, matching moocore and Schuetze et al.
+  These coincide with `igd` and `gd` when p equals 1.
+- `fast_non_dominated_sort_indices` returns `list[list[int]]` instead of
+  `list[np.ndarray]`.
+- The gurobipy result parser now inspects the model status before reading any
+  values, and returns an unsuccessful `SolverResults` with NaN entries when the
+  model is infeasible, unbounded or otherwise not solved to optimality.
+- `set_initial_guess` (SciPy interface) now handles variables with only one
+  bound defined, or neither, instead of failing on the missing bound.
+- The unbounded `_alpha` variable in the differentiable group scalarizations is
+  now declared with `lowerbound=None` and `upperbound=None` instead of infinite
+  bounds.
+- Renamed `mixed_variable_dimenrions_problem.py` to
+  `mixed_variable_dimensions_problem.py`.
+- Cleaned up the selection module: added missing docstrings, removed leftover
+  prints, renamed uppercase variables and named magic values.
+- The docstring return types of `Problem.get_ideal_point` and
+  `Problem.get_nadir_point` no longer claim the result can be `None`.
+
+#### Removed
+
+- Removed `ASFSelector` and `ASFSelectorOptions`, superseded by the more general
+  `ElitistSelection`, which ranks by any single output column rather than an
+  achievement scalarizing function specifically.
+
+#### Fixed
+
+- Fixed RVEA selecting the last individual of the population for every reference
+  vector with no associated solution. `_rvea_selection` left the running best
+  index at -1 and wrote `selection[-1] = True`. Empty reference vectors become
+  more common as the number of objectives grows. The constrained selector had
+  the same defect in its fallback branch, which tracks the least infeasible
+  solution, and constrained runs meet it constantly.
+- Fixed the NSGA-II crowding distance raising `ZeroDivisionError` on a constant
+  objective column. Numba does not return infinity for that division the way
+  NumPy does, so the run died. Constant columns are now skipped, which also
+  stops two arbitrary solutions from being awarded an infinite crowding
+  distance.
+- Fixed `NSGA3Selector` selecting an empty population when the number of
+  reference vectors exceeds the population size, for example with multiple
+  preferred solutions, which crashed the next generation. All available
+  solutions are now kept when the combined population is smaller than the
+  number of survivors.
+- Fixed tensor constants not being updated correctly across scenarios (#573).
+- Fixed bounded polynomial mutation producing NaN for variables whose bounds
+  coincide, and fixed the population being transposed when it has as many
+  individuals as decision variables, by stating `orient="row"` on every
+  `pl.from_numpy` in the mutation module.
+- Fixed a type check in `GurobipyEvaluator` that tested `gp.GenExpr` against
+  `int` instead of testing the expression against `gp.GenExpr`, so
+  general expressions were never rejected.
+- Fixed the crossover operators to work with SMS-EMOA.
+- Fixed the blend-alpha crossover operator.
+
+### Web API
+
+#### Added
+
+- Added the CUMULUS router (`desdeo/api/routers/cumulus.py`, prefix
+  `/method/cumulus`) with the endpoints `/solve`, `/initialize`,
+  `/get-or-initialize`, `/save`, `/delete_save`, `/intermediate`,
+  `/objective-constraint`, `/modify-problem`, `/modify-problem/status/{state_id}`
+  and `/finalize` (#550).
+- Added the CUMULUS request, response and state models
+  (`desdeo/api/models/cumulus.py`) and the state kinds `cumulus.solve_candidates`,
+  `cumulus.save_solutions`, `cumulus.initialize`, `cumulus.final`,
+  `cumulus.modify` and `cumulus.objective_constraint` (#550).
+- Added `ProblemModification`, `SoftConstraintSpec` and `UncertaintyMeasureSpec`
+  models, and `apply_problem_modifications` in `routers/utils.py`, which applies
+  soft constraints and uncertainty measures to a problem (#550).
+- Added the solution description router
+  (`desdeo/api/routers/solution_description.py`) with `/get` and
+  `/update_metadata`, backed by the new `SolutionDescriptionMetaData` problem
+  metadata model and its `DescriptionPart` entries. A part is either literal
+  text, a symbol looked up from the solver results, or a MathJSON expression
+  evaluated against them (#550).
+- Added `validate_description_parts` in `routers/solution_description.py`, which
+  checks a description template on its own, so callers other than
+  `/update_metadata` can validate one (#578).
+- Added `get_solver_results_at` and `copy_problem_metadata` to
+  `routers/utils.py`.
+- Added `desdeo/api/db_init_gdm.py` and `desdeo/api/db_init_summer_cabin.py`,
+  which initialize a database for group decision making and for the summer cabin
+  EV problem with its solution description metadata.
+- Added `desdeo/api/tests/test_routes.py` and
+  `desdeo/api/tests/test_scenario_tensor_constants.py`, and extended the problem
+  metadata tests.
+
+#### Changed
+
+- `GET /problem/all` and `GET /problem/all_info` now also return the problems
+  reachable through the groups a decision maker owns or belongs to, instead of
+  only the problems the user owns. Analysts and admins are unaffected.
+- Moved `filter_duplicates`, `collect_saved_solutions` and
+  `collect_all_solutions` from `routers/nimbus.py` to `routers/utils.py`. The
+  NIMBUS and XNIMBUS routers now import them from there.
+- The group decision making websocket endpoint keeps its database session open
+  while the group manager is resolved and the connection is registered, and
+  closes it afterwards. It was closed before the manager needed it.
+- Raised the debug access and refresh token lifetimes in `config.toml` from 15
+  and 30 minutes to 480 minutes, for development and testing.
+- Solution descriptions expose tensor solver results element by element, as
+  `x_1`, `x_2` and `x_1_2` for nested tensors, instead of collapsing a tensor to
+  its first element, so a description part can aggregate over one, for example
+  the maximum over a schedule (#578).
+- The problem's constants are available to solution descriptions, so a part can
+  refer to `p_1` rather than having that value written into the expression. The
+  solution's own values take precedence over the constants (#578).
+- Solution description expressions substitute the known values into the MathJSON
+  tree before it is parsed, instead of parsing symbolically and then
+  substituting. Rendering a part that aggregates over a few hundred symbols went
+  from about 52 s to about 10 ms (#578).
+- `/update_metadata` rejects description parts referring to symbols the problem
+  does not have. Such a part previously failed only when a description was
+  requested (#578).
+
+### Web GUI
+
+#### Added
+
+- Added the CUMULUS method view (`routes/interactive_methods/CUMULUS/`) with its
+  page, layout, handlers and types, and an entry in the method selection list.
+  It supports classification, saving and removing solutions, intermediate
+  solutions, objective constraints, scenario-based initialization and problem
+  modification (#550).
+- Added a solution description panel to NIMBUS, shown for problems that carry
+  solution description metadata.
+- Added a cluster band table for SCORE bands
+  (`components/custom/score-bands-table/solution-table.svelte`) showing the
+  per-objective range and median of each band.
+- Added a `footerExtra` snippet to the preferences sidebar, and made
+  `numSolutions` optional.
+- Added a Playwright authentication setup step and a multi-user GDM SCORE bands
+  specification, together with the `dev:gdm-score` script.
+
+#### Changed
+
+- Reworked the GDM SCORE bands page: learning, consensus reaching and decision
+  phases, vote synchronization and iteration polling, per-cluster vote counts
+  and percentages, per-axis agreement labels, sub-bands and notes, a separate
+  layout for the group owner, and an instruction box.
+- The SCORE bands visualization now sizes itself from its container and redraws
+  through a `ResizeObserver`, instead of a fixed 800 by 600 canvas.
+- Regenerated the orval clients for the new and changed endpoints.
+- The orval configuration reads the API base URL and the OpenAPI URL from the
+  environment, with localhost defaults.
+- Replaced the deprecated vitest `workspace` option with `projects`, and split
+  the Playwright configuration into `setup`, `gdm-score` and `e2e` projects.
+
+### Documentation
+
+#### Added
+
+- Added a crossover operators explanation notebook
+  (`docs/explanation/crossover_operators.ipynb`) covering every crossover
+  operator in the framework.
+- Added a how-to guide on solving constrained problems with evolutionary
+  algorithms (`docs/howtoguides/ea_constraints.ipynb`).
+- Added a how-to guide on the XLEMOO method (`docs/howtoguides/xlemoo.ipynb`),
+  which executes deterministically.
+
+#### Changed
+
+- Shortened the JOSS paper to at or under 1800 words, as requested by the
+  handling editor during pre-review.
+- Updated the crossover row of the features table to list every available
+  operator, and linked the crossover explanation.
+- Added the Zenodo DOI badge to `README.md` and the DOI to `CITATION.cff`, and
+  corrected the Read the Docs badge version.
+- Added the INDENSYS project (373063) to the funding list in `README.md`.
+
+### Tooling, CI, and deployment
+
+#### Added
+
+- Added `imodels` as a dependency, used by the XLEMOO learning mode for rule
+  extraction.
+- Added the `cumulus` pytest marker.
+- Added ruff per-file ignores for notebooks (`print` statements, module and
+  function docstrings, magic values in comparisons).
+
+#### Changed
+
+- Replaced `psycopg2` with `psycopg2-binary` in the `server` group, and
+  restricted `griffe` to a mkdocs-compatible version (`<2`).
+- Disabled codecov comments on pull requests.
+- Bumped the web GUI dependencies: `vite` to 8.0.16, `@sveltejs/kit` to 2.65.2,
+  `@sveltejs/vite-plugin-svelte` to 7.1.2, `vitest` and its packages to 4.1.9,
+  the Storybook packages to 10.4.6, `@tailwindcss/vite` to 4.3.1, `orval` to
+  8.18.0 and `js-yaml` to 4.2.0.
+
+---
+
 ## [2.6.0] - 18.6.2026
 
 ### Core logic

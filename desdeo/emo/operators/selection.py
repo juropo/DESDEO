@@ -34,8 +34,27 @@ from desdeo.tools.message import (
 )
 from desdeo.tools.non_dominated_sorting import fast_non_dominated_sort, fast_non_dominated_sort_indices
 from desdeo.tools.patterns import Publisher, Subscriber
+from desdeo.tools.reference_vectors import create_s_energy
 
 SolutionType = TypeVar("SolutionType", list, pl.DataFrame)
+
+
+def total_constraint_violation(outputs: pl.DataFrame, constraint_symbols: Sequence[str] | None) -> np.ndarray | None:
+    """Sum each solution's constraint violations, following DESDEO's positive-means-violated convention.
+
+    Args:
+        outputs (pl.DataFrame): The objective values, targets, and constraint values of a population.
+        constraint_symbols (Sequence[str] | None): The constraint columns to read, or None for an
+            unconstrained problem.
+
+    Returns:
+        np.ndarray | None: A 1-D array of total violations, one per row, zero where feasible. None if
+            the problem has no constraints, which lets callers keep the unconstrained code path.
+    """
+    if not constraint_symbols:
+        return None
+    values = outputs[list(constraint_symbols)].to_numpy()
+    return np.maximum(values, 0.0).sum(axis=1)
 
 
 class BaseSelector(Subscriber):
@@ -100,14 +119,12 @@ class ReferenceVectorOptions(BaseModel):
     Only used if no preference is provided."""
     creation_type: Literal["simplex", "s_energy"] = Field(default="simplex")
     """The method for creating reference vectors. Defaults to "simplex".
-    Currently only "simplex" is implemented. Future versions will include "s_energy".
 
     If set to "simplex", the reference vectors are created using the simplex lattice design method.
     This method is generates distributions with specific numbers of reference vectors.
     Check: https://www.itl.nist.gov/div898/handbook/pri/section5/pri542.htm for more information.
     If set to "s_energy", the reference vectors are created using the Riesz s-energy criterion. This method is used to
     distribute an arbitrary number of reference vectors in the objective space while minimizing the s-energy.
-    Currently not implemented.
     """
     vector_type: Literal["spherical", "planar"] = Field(default="spherical")
     """The method for normalizing the reference vectors. Defaults to "spherical"."""
@@ -163,9 +180,9 @@ class BaseDecompositionSelector(BaseSelector):
         self.reference_vectors_initial: np.ndarray
 
         if self.reference_vector_options.creation_type == "s_energy":
-            raise NotImplementedError("Riesz s-energy criterion is not yet implemented.")
-
-        self._create_simplex()
+            self._create_s_energy()
+        else:
+            self._create_simplex()
 
         if self.reference_vector_options.reference_point:
             corrected_rp = np.array(
@@ -199,7 +216,7 @@ class BaseDecompositionSelector(BaseSelector):
             self.interactive_adapt_2(
                 corrected_sols,
                 predefined_distance=self.reference_vector_options.adaptation_distance,
-                ord=2 if self.reference_vector_options.vector_type == "spherical" else 1,
+                norm_order=2 if self.reference_vector_options.vector_type == "spherical" else 1,
             )
         elif self.reference_vector_options.preferred_ranges:
             corrected_ranges = np.array(
@@ -211,6 +228,23 @@ class BaseDecompositionSelector(BaseSelector):
             self.interactive_adapt_4(
                 corrected_ranges,
             )
+
+    def _create_s_energy(self):
+        """Create the reference vectors by minimizing the Riesz s-energy.
+
+        Unlike the simplex lattice, this honours `number_of_vectors` exactly, so the population size
+        of a decomposition-based algorithm can be chosen freely rather than being rounded down to the
+        nearest binomial count. `lattice_resolution` is not meaningful here and is left untouched.
+        """
+        vectors = create_s_energy(
+            number_of_objectives=self.num_dims,
+            number_of_vectors=self.reference_vector_options.number_of_vectors,
+            seed=self.seed,
+        )
+        # `invert_reference_vectors` mirrors the simplex branch, where it exists for NSGA-III.
+        self.reference_vectors = vectors if not self.invert_reference_vectors else 1 - vectors
+        self.reference_vectors_initial = np.copy(self.reference_vectors)
+        self._normalize_rvs()
 
     def _create_simplex(self):
         """Create the reference vectors using simplex lattice design."""
@@ -466,7 +500,12 @@ def _rvea_selection(
             if apd < min_apd:
                 min_apd = apd
                 select = i
-        selection[select] = True
+        # A reference vector with no associated solution leaves select at -1. Guarding here is
+        # essential: selection[-1] = True would silently promote the *last* individual in the array,
+        # once per empty vector. Empty vectors are common, and become commoner as the number of
+        # objectives grows, so the unguarded write biases selection exactly where RVEA is used most.
+        if select != -1:
+            selection[select] = True
 
     return selection, apd_fitness
 
@@ -535,7 +574,10 @@ def _rvea_selection_constrained(
                 select_violation = i
         if select != -1:
             selection[select] = True
-        else:
+        elif select_violation != -1:
+            # Guarding this branch matters as much as the one above: a reference vector with no
+            # associated solution at all leaves both indices at -1, and selection[-1] = True would
+            # silently promote the last individual in the array, once per empty vector.
             selection[select_violation] = True
 
     return selection, apd_fitness
@@ -598,7 +640,7 @@ class RVEASelector(BaseDecompositionSelector):
                 "Adaptation frequency was set to 0. Setting it to 100 for RVEA selector. "
                 "Set it to 0 only if you provide preference information.",
                 UserWarning,
-                stacklevel=2,
+                stacklevel=3,
             )
             reference_vector_options.adaptation_frequency = 100
 
@@ -613,6 +655,13 @@ class RVEASelector(BaseDecompositionSelector):
         self.reference_vectors_gamma: np.ndarray
         self.numerator: float | None = None
         self.denominator: float | None = None
+        # Which adaptation epoch was last acted on under an evaluation budget.
+        self._adaptation_epoch = 0
+        # Whether the ideal so far was taken over infeasible members only, for
+        # want of any feasible one. Such an ideal can be better than any
+        # feasible design can reach, so it is replaced, not minimised into,
+        # the moment a feasible member appears.
+        self._ideal_is_provisional = False
         self.alpha = alpha
         self.selected_individuals: list | pl.DataFrame
         self.selected_targets: pl.DataFrame
@@ -672,12 +721,25 @@ class RVEASelector(BaseDecompositionSelector):
                 parents[1][self.constraints_symbols].vstack(offsprings[1][self.constraints_symbols]).to_numpy()
             )
             feasible = (constraints <= 0).all(axis=1)
-            # Note that
-            if self.ideal is None:
-                # TODO: This breaks if there are no feasible solutions in the initial population
-                self.ideal = np.min(targets[feasible], axis=0)
-            else:
-                self.ideal = np.min(np.vstack((self.ideal, np.min(targets[feasible], axis=0))), axis=0)
+            # The ideal is tracked over feasible members only. A generation may have
+            # none, at the start on a tightly constrained problem or later once the
+            # population has contracted, and a minimum over nothing raises. Keep the
+            # previous ideal in that case, as the nadir below already does. With no
+            # ideal yet, take a provisional one over every member. The ideal of
+            # infeasible members can be far better than any feasible design, and
+            # minimising into it would carry that error through every later
+            # generation, so the provisional ideal is replaced outright by the
+            # first feasible one, and only then minimised into as usual.
+            if feasible.any():
+                feasible_ideal = np.min(targets[feasible], axis=0)
+                if self.ideal is None or self._ideal_is_provisional:
+                    self.ideal = feasible_ideal
+                    self._ideal_is_provisional = False
+                else:
+                    self.ideal = np.min(np.vstack((self.ideal, feasible_ideal)), axis=0)
+            elif self.ideal is None or self._ideal_is_provisional:
+                self.ideal = np.min(targets, axis=0)
+                self._ideal_is_provisional = True
             try:
                 nadir = np.max(targets[feasible], axis=0)
                 self.nadir = nadir
@@ -740,6 +802,18 @@ class RVEASelector(BaseDecompositionSelector):
         elif self.parameter_adaptation_strategy == ParameterAdaptationStrategy.FUNCTION_EVALUATION_BASED:
             if message.topic == TerminatorMessageTopics.EVALUATION:
                 self.numerator = message.value
+                # The adaptation frequency is stated in generations. Under an
+                # evaluation budget one generation is about one population of
+                # evaluations, so adapt each time the count crosses that many
+                # evaluations times the frequency, as the generation-based
+                # branch adapts every frequency generations.
+                frequency = self.reference_vector_options.adaptation_frequency
+                if frequency > 0:
+                    every = frequency * max(int(self.reference_vector_options.number_of_vectors or 1), 1)
+                    epoch = self.numerator // every
+                    if epoch > self._adaptation_epoch:
+                        self._adaptation_epoch = epoch
+                        self._adapt()
             if message.topic == TerminatorMessageTopics.MAX_EVALUATIONS:
                 self.denominator = message.value
         return
@@ -768,7 +842,7 @@ class RVEASelector(BaseDecompositionSelector):
         if isinstance(self.selected_individuals, pl.DataFrame):
             message = PolarsDataFrameMessage(
                 topic=SelectorMessageTopics.SELECTED_VERBOSE_OUTPUTS,
-                value=pl.concat([self.selected_individuals, self.selected_targets], how="horizontal"),
+                value=self.selected_individuals.hstack(self.selected_targets),
                 source=self.__class__.__name__,
             )
         else:
@@ -1221,7 +1295,7 @@ class NSGA3Selector(BaseDecompositionSelector):
         if isinstance(self.selected_individuals, pl.DataFrame):
             message = PolarsDataFrameMessage(
                 topic=SelectorMessageTopics.SELECTED_VERBOSE_OUTPUTS,
-                value=pl.concat([self.selected_individuals, self.selected_targets], how="horizontal"),
+                value=self.selected_individuals.hstack(self.selected_targets),
                 source=self.__class__.__name__,
             )
         else:
@@ -1349,6 +1423,12 @@ def _ibea_select_all(fitness_components: np.ndarray, population_size: int, kappa
 class IBEASelector(BaseSelector):
     """The adaptive IBEA selection operator.
 
+    Constraints are handled feasibility-first, as in `NSGA3Selector`: while feasible solutions alone
+    can fill the population the infeasible ones are discarded and the indicator selection runs
+    unchanged, and while they cannot, every feasible solution survives and the remaining places go to
+    the least infeasible. The binary indicator itself is left untouched, since it compares objective
+    vectors and has no reading of an infeasible one.
+
     Reference: Zitzler, E., Künzli, S. (2004). Indicator-Based Selection in Multiobjective Search. In: Yao, X., et al.
     Parallel Problem Solving from Nature - PPSN VIII. PPSN 2004. Lecture Notes in Computer Science, vol 3242.
     Springer, Berlin, Heidelberg. https://doi.org/10.1007/978-3-540-30217-9_84
@@ -1402,8 +1482,48 @@ class IBEASelector(BaseSelector):
         self.binary_indicator = binary_indicator
         self.kappa = kappa
         self.population_size = population_size
-        if self.constraints_symbols is not None:
-            raise NotImplementedError("IBEA selector does not support constraints. Please use a different selector.")
+
+    def _indicator_components(self, targets: np.ndarray) -> np.ndarray:
+        """Scale the targets to the unit box and return the pairwise binary indicator matrix."""
+        target_min = np.min(targets, axis=0)
+        target_max = np.max(targets, axis=0)
+        span = target_max - target_min
+        # A target that is constant across the population carries no information; dividing by its
+        # zero span would turn the whole indicator matrix into NaN.
+        span[span == 0] = 1.0
+        return self.binary_indicator((targets - target_min) / span)
+
+    def _adaptive_kappa(self, components: np.ndarray) -> float:
+        """Adaptive IBEA's kappa: the configured kappa scaled by the largest indicator magnitude.
+
+        The scaling makes kappa independent of the objectives' range. When the set has collapsed onto a
+        single objective vector every indicator value is zero, and so is the scale: dividing by it
+        raised ZeroDivisionError in the fitness kernels and would turn the vectorised survivor
+        selection into NaN. A set with no spread has nothing to scale, so the configured kappa is used
+        unscaled. Every exp(-0 / kappa) is then 1 and each member's fitness is -(n - 1), a tie, which is
+        the honest reading of a set the indicator cannot separate. Wherever the scale is positive the
+        value is exactly what it was before.
+        """
+        scale = float(np.abs(components).max())
+        return self.kappa * scale if scale > 0 else self.kappa
+
+    def _infeasible_fitness(self, targets: np.ndarray, violations: np.ndarray) -> np.ndarray:
+        """Fitness for a set that is partly or wholly infeasible, feasible solutions first.
+
+        The binary indicator only orders solutions sensibly when they are all feasible, so the
+        indicator fitness is kept for the feasible members and every infeasible member is placed
+        strictly below all of them, ordered among themselves by total violation. Fitness stays
+        higher-is-better, which is what the mating tournament expects.
+        """
+        components = self._indicator_components(targets)
+        fitness = _ibea_fitness(components, kappa=self._adaptive_kappa(components))
+
+        infeasible = violations > 0
+        if not np.any(infeasible):
+            return fitness
+        feasible_worst = fitness[~infeasible].min() if np.any(~infeasible) else 0.0
+        fitness[infeasible] = feasible_worst - violations[infeasible] / violations[infeasible].max()
+        return fitness
 
     def do(
         self, parents: tuple[SolutionType, pl.DataFrame], offsprings: tuple[SolutionType, pl.DataFrame]
@@ -1420,8 +1540,6 @@ class IBEASelector(BaseSelector):
             tuple[SolutionType, pl.DataFrame]: The selected decision variables and their objective values,
                 targets, and constraint violations.
         """
-        if self.constraints_symbols is not None:
-            raise NotImplementedError("IBEA selector does not support constraints. Please use a different selector.")
         if isinstance(parents[0], pl.DataFrame) and isinstance(offsprings[0], pl.DataFrame):
             solutions = parents[0].vstack(offsprings[0])
         elif isinstance(parents[0], list) and isinstance(offsprings[0], list):
@@ -1432,24 +1550,38 @@ class IBEASelector(BaseSelector):
             return parents[0], parents[1]
         alltargets = parents[1].vstack(offsprings[1])
 
+        violations = total_constraint_violation(alltargets, self.constraints_symbols)
+        if violations is not None:
+            feasible = np.flatnonzero(violations <= 0)
+            if len(feasible) <= self.population_size:
+                # Too few feasible solutions to fill the population, so the indicator has nothing to
+                # choose between: keep every feasible solution and top up with the least infeasible.
+                self.selection = np.argsort(violations, kind="stable")[: self.population_size].tolist()
+                self.selected_individuals = solutions[self.selection]
+                self.selected_targets = alltargets[self.selection]
+                self.fitness = self._infeasible_fitness(
+                    self.selected_targets[self.target_symbols].to_numpy(), violations[self.selection]
+                )
+
+                self.notify()
+                return self.selected_individuals, self.selected_targets
+            # Enough feasible solutions to fill the population, so the infeasible ones are simply
+            # dropped and the indicator selection proceeds unchanged on the feasible ones.
+            solutions = solutions[feasible]
+            alltargets = alltargets[feasible]
+
         # Adaptation
-        target_vals = alltargets[self.target_symbols].to_numpy()
-        target_min = np.min(target_vals, axis=0)
-        target_max = np.max(target_vals, axis=0)
-        # Scale the targets to the range [0, 1]
-        target_vals = (target_vals - target_min) / (target_max - target_min)
-        fitness_components = self.binary_indicator(target_vals)
-        kappa_mult = np.max(np.abs(fitness_components))
+        fitness_components = self._indicator_components(alltargets[self.target_symbols].to_numpy())
 
         chosen = _ibea_select_all(
-            fitness_components, population_size=self.population_size, kappa=kappa_mult * self.kappa
+            fitness_components, population_size=self.population_size, kappa=self._adaptive_kappa(fitness_components)
         )
         self.selected_individuals = solutions.filter(chosen)
         self.selected_targets = alltargets.filter(chosen)
         self.selection = chosen
 
         fitness_components = fitness_components[chosen][:, chosen]
-        self.fitness = _ibea_fitness(fitness_components, kappa=self.kappa * np.abs(fitness_components).max())
+        self.fitness = _ibea_fitness(fitness_components, kappa=self._adaptive_kappa(fitness_components))
 
         self.notify()
         return self.selected_individuals, self.selected_targets
@@ -1473,7 +1605,7 @@ class IBEASelector(BaseSelector):
         if isinstance(self.selected_individuals, pl.DataFrame):
             message = PolarsDataFrameMessage(
                 topic=SelectorMessageTopics.SELECTED_VERBOSE_OUTPUTS,
-                value=pl.concat([self.selected_individuals, self.selected_targets], how="horizontal"),
+                value=self.selected_individuals.hstack(self.selected_targets),
                 source=self.__class__.__name__,
             )
         else:
@@ -1545,6 +1677,12 @@ def _nsga2_crowding_distance_assignment(
     crowding_distances = np.zeros(num_vectors)  # I[i]_distance
 
     for m in range(num_objectives):
+        # An objective that is constant across the whole population separates nothing. Sorting by it
+        # gives an arbitrary order, so marking its two ends as boundary points would hand an infinite
+        # distance to two arbitrary solutions, and the normalisation below would divide by zero.
+        if f_maxs[m] == f_mins[m]:
+            continue
+
         # sort by column (objective)
         m_order = vectors[:, m].argsort()
         # inlcude boundary points
@@ -1563,6 +1701,11 @@ class NSGA2Selector(BaseSelector):
 
     Implements the selection operator defined for NSGA2, which included the crowding
     distance calculation.
+
+    On a constrained problem the ranking switches to the constrained domination of the same paper:
+    a feasible solution beats an infeasible one, two infeasible solutions are compared by total
+    constraint violation, and two feasible solutions are compared by ordinary Pareto dominance.
+    Nothing else changes, since that is where NSGA-II confines its constraint handling.
 
     Reference: Deb, K., Pratap, A., Agarwal, S., & Meyarivan, T. A. M. T.
         (2002). A fast and elitist multiobjective genetic algorithm: NSGA-II. IEEE
@@ -1601,18 +1744,43 @@ class NSGA2Selector(BaseSelector):
             seed (int, optional): The random seed to use. Defaults to 0.
         """
         super().__init__(problem=problem, verbosity=verbosity, publisher=publisher, seed=seed)
-        if self.constraints_symbols is not None:
-            warnings.warn(
-                "NSGA2 selector does not currently support constraints. "
-                "Results may vary if used to solve constrained problems.",
-                UserWarning,
-                stacklevel=2,
-            )
         self.population_size = population_size
         self.seed = seed
         self.selection: list[int] | None = None
         self.selected_individuals: SolutionType | None = None
         self.selected_targets: pl.DataFrame | None = None
+
+    def _sort(self, targets: np.ndarray, violations: np.ndarray | None) -> np.ndarray:
+        """Rank a population into fronts, applying constrained domination when the problem has constraints.
+
+        Constrained domination never compares a feasible solution with an infeasible one on
+        objectives, so the two groups can be ranked separately and concatenated instead of a
+        dominance relation being redefined. The feasible group gets the ordinary non-dominated
+        sort; the infeasible group is stratified by total violation, one front per distinct value,
+        which is what "the one with the smaller violation wins" means as a ranking.
+
+        Everything downstream -- crowding distance, the partial-front trim, the fitness -- is left
+        alone, exactly as in NSGA-II, where constraint handling enters only through the ranking.
+        """
+        if violations is None:
+            return fast_non_dominated_sort(targets)
+
+        feasible = np.flatnonzero(violations <= 0)
+        infeasible = np.flatnonzero(violations > 0)
+        fronts = []
+
+        if feasible.size > 0:
+            for front in fast_non_dominated_sort(targets[feasible]):
+                row = np.zeros(len(targets), dtype=np.bool_)
+                row[feasible[front]] = True
+                fronts.append(row)
+
+        for violation in np.unique(violations[infeasible]):
+            row = np.zeros(len(targets), dtype=np.bool_)
+            row[infeasible[violations[infeasible] == violation]] = True
+            fronts.append(row)
+
+        return np.array(fronts)
 
     def do(
         self, parents: tuple[SolutionType, pl.DataFrame], offsprings: tuple[SolutionType, pl.DataFrame]
@@ -1626,12 +1794,12 @@ class NSGA2Selector(BaseSelector):
         if offsprings[0].is_empty() and offsprings[1].is_empty():
             # just compute non-dominated ranks of population and be done
             parents_a = parents[1][self.target_symbols].to_numpy()
-            fronts = fast_non_dominated_sort(parents_a)
+            fronts = self._sort(parents_a, total_constraint_violation(parents[1], self.constraints_symbols))
 
-            # assign fitness according to non-dom rank (lower better)
+            # assign fitness according to non-dom rank, flipped to higher-is-better and kept
+            # strictly positive for the consumers of SELECTED_FITNESS; see the main branch below
             scores = np.arange(len(fronts))
-            fitness_values = scores @ fronts
-            self.fitness = fitness_values
+            self.fitness = len(fronts) - scores @ fronts
 
             # all selected in first iteration
             self.selection = list(range(len(parents[1])))
@@ -1653,7 +1821,7 @@ class NSGA2Selector(BaseSelector):
         f_mins, f_maxs = np.min(r_targets_arr, axis=0), np.max(r_targets_arr, axis=0)
 
         # Do fast non-dominated sorting on R_t -> F
-        fronts = fast_non_dominated_sort(r_targets_arr)
+        fronts = self._sort(r_targets_arr, total_constraint_violation(r_population, self.constraints_symbols))
         crowding_distances = np.ones(self.population_size) * np.nan
         rankings = np.ones(self.population_size) * np.nan
         fitness_values = np.ones(self.population_size) * np.nan
@@ -1761,7 +1929,15 @@ class NSGA2Selector(BaseSelector):
         solutions = pl.DataFrame(new_parents_solutions, schema=parents[0].schema)
         outputs = pl.DataFrame(new_parents, schema=parents[1].schema)
 
-        self.fitness = fitness_values
+        # Everything downstream of SELECTED_FITNESS reads it as higher-is-better: the mating
+        # tournament takes an argmax, and roulette-wheel selection treats it as a weight, which also
+        # requires it to be positive. The NSGA-II quantity built above is the opposite -- front rank
+        # plus a reversed crowding distance, lower is better -- so publishing it directly made the
+        # binary tournament pick the loser of every pair. Reflecting it about the worst attainable
+        # value flips the direction, keeps every value strictly positive (a front's fitness lies in
+        # `(n_fronts - rank - 1, n_fronts - rank]`, since the reversed distance never reaches 1) and
+        # preserves the ordering exactly.
+        self.fitness = (np.nanmax(rankings) + 1.0) - fitness_values
 
         whole_fronts = fronts[: last_whole_front_idx + 1]
         whole_indices = [np.where(row)[0].tolist() for row in whole_fronts]
@@ -1799,7 +1975,7 @@ class NSGA2Selector(BaseSelector):
         if isinstance(self.selected_individuals, pl.DataFrame):
             message = PolarsDataFrameMessage(
                 topic=SelectorMessageTopics.SELECTED_VERBOSE_OUTPUTS,
-                value=pl.concat([self.selected_individuals, self.selected_targets], how="horizontal"),
+                value=self.selected_individuals.hstack(self.selected_targets),
                 source=self.__class__.__name__,
             )
         else:
@@ -1999,7 +2175,7 @@ class SMSEMOASelector(BaseSelector):
         if isinstance(self.selected_individuals, pl.DataFrame):
             message = PolarsDataFrameMessage(
                 topic=SelectorMessageTopics.SELECTED_VERBOSE_OUTPUTS,
-                value=pl.concat([self.selected_individuals, self.selected_targets], how="horizontal"),
+                value=self.selected_individuals.hstack(self.selected_targets),
                 source=self.__class__.__name__,
             )
         else:
