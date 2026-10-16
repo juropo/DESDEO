@@ -2,6 +2,7 @@
 	// Layout and core components
 	import { BaseLayout } from '$lib/components/custom/method_layout/index.js';
 	import { methodSelection } from '../../../stores/methodSelection';
+	import { auth } from '../../../stores/auth';
 	import { errorMessage, isLoading } from '../../../stores/uiState';
 	import { onMount } from 'svelte';
 	import LoadingSpinner from '$lib/components/custom/notifications/loading-spinner.svelte';
@@ -27,6 +28,28 @@
 	import UtopiaMap from '$lib/components/custom/nimbus/utopia-map.svelte';
 	import SolutionDescriptionPanel from '$lib/components/custom/nimbus/solution-description-panel.svelte';
 	import { PREFERENCE_TYPES } from '$lib/constants';
+
+	// Graphical-models plan, frontend phase F: the network-structure demo dialog now compiles and
+	// solves a real backend diagram (`desdeo/problem/graphical/demo.py`, via
+	// `POST /graphical/demo/irrigation` and `POST /graphical/{id}/solve`) and drives `<NetworkPanel>`
+	// against it -- `/graphical/whatif`/`/structure`/`/policy`/evidence-sets are all real, live
+	// requests now, not `sample-network.ts`'s mock. See .claude/desdeo-graphical-models-plan.md,
+	// "Phase F -- Real backend integration for the CUMULUS demo", for the full writeup.
+	import {
+		NetworkPanel,
+		createNetworkHighlightStore,
+		ancestralSet,
+		descendants,
+		buildAdjacency
+	} from '$lib/components/custom/network';
+	import type {
+		DecisionMode,
+		NetworkModel,
+		NetworkPolicySource
+	} from '$lib/components/custom/network';
+	import IconFlag from '@lucide/svelte/icons/flag';
+	import { toggleSet } from '$lib/helpers';
+	import { dev } from '$app/environment';
 
 	// Utility functions (reused from NIMBUS — logic is identical)
 	import {
@@ -187,6 +210,236 @@
 	let selected_measures: MeasureType[] = $state(['expected_value']);
 	let cvar_alpha = $state(0.95);
 	let combined_problem_name = $state('');
+
+	// Network structure demo dialog (frontend phase F) -- `<NetworkPanel>` now owns fetching/
+	// evidence/posteriors/policy/committed-baseline/debounce-cancel-stale state itself (built up
+	// across phases B/D/E); this page only owns what's genuinely CUMULUS-specific: getting a real
+	// `problem_id` to hand it (compile + solve the canned demo diagram, lazily, once), the
+	// decision-mode toggle, the flag-button `nodeChrome`, and the phase C cross-highlight demo.
+	// Plain `string`, not `DecisionMode`, for the SegmentedControl binding -- see NetworkView's own
+	// `viewMode` for why.
+	let show_network_dialog = $state(false);
+	let network_decision_mode_str = $state<string>('manual');
+	let network_decision_mode = $derived(network_decision_mode_str as DecisionMode);
+	let network_flagged: Set<string> = $state(new Set());
+
+	function toggle_network_flag(id: string) {
+		network_flagged = toggleSet(network_flagged, id);
+	}
+
+	// Lazy compile + solve (phase F item 2): the dialog needs a `problem_id` to hand `<NetworkPanel>`
+	// and a solved policy to drive `decisionMode: 'solver'` -- built once, the first time the dialog
+	// opens, and cached in `sessionStorage` so repeat opens (within the same browser tab) don't
+	// recompile/resolve. `<NetworkPanel>` itself is only mounted once `network_problem_id` is known
+	// (see the markup below) -- there is nothing for it to fetch structure/what-if for otherwise.
+	//
+	// Cache key includes the logged-in user's own id (a review pass caught the un-scoped version:
+	// user A opens the dialog (caching problem 42), logs out, user B logs in in the *same* browser
+	// tab, opens the dialog -- it used to adopt A's cached id, 404ing against `<NetworkPanel>`'s own
+	// `/structure` fetch). This alone only narrows the window (still shared across a `sessionStorage`
+	// lifetime for one user), not closes it -- see `handle_network_structure_error` below for the
+	// part that actually recovers from a stale/foreign cached id, regardless of cause (cross-user
+	// collision, or a since-reset local dev DB).
+	const NETWORK_DEMO_PROBLEM_ID_KEY = 'cumulus-network-demo-problem-id';
+	function network_demo_cache_key(): string {
+		return `${NETWORK_DEMO_PROBLEM_ID_KEY}:${$auth.user?.id ?? 'anon'}`;
+	}
+	// Maximizes profit -- `demo.py`'s only `ObjectiveNode` (a second one would make every
+	// `/graphical/whatif` call 501 -- see that module's own docstring).
+	const NETWORK_DEMO_OBJECTIVE_SYMBOL = 'profit';
+
+	let network_problem_id: number | null = $state(null);
+	let network_compiling = $state(false);
+	let network_compile_error: string | null = $state(null);
+	let network_policy_source: NetworkPolicySource | null = $state(null);
+	let network_solving = $state(false);
+	let network_solve_error: string | null = $state(null);
+
+	/** `force`: bypass both the `sessionStorage` cache and the backend's own idempotency lookup
+	 *  (`POST /graphical/demo/irrigation`'s `force` field) -- for the "Recompile demo" toolbar
+	 *  button, which should mean "build a genuinely new one", not "get the one I already have". */
+	async function ensure_network_demo_compiled(force = false) {
+		if (!force && (network_problem_id !== null || network_compiling)) return;
+		if (!force) {
+			const cached = sessionStorage.getItem(network_demo_cache_key());
+			if (cached) {
+				network_problem_id = Number(cached);
+				return;
+			}
+		}
+		network_compiling = true;
+		network_compile_error = null;
+		try {
+			const res = await fetch('/api/graphical/demo/irrigation', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ force })
+			});
+			if (!res.ok) throw new Error(`Failed to compile network demo (status ${res.status})`);
+			const data: { problem_id: number } = await res.json();
+			network_problem_id = data.problem_id;
+			sessionStorage.setItem(network_demo_cache_key(), String(data.problem_id));
+		} catch (e) {
+			network_compile_error = e instanceof Error ? e.message : 'Failed to compile network demo';
+		} finally {
+			network_compiling = false;
+		}
+	}
+
+	// A genuinely solved MILP (`POST /graphical/{id}/solve`), fed to `<NetworkPanel>` as
+	// `policySource` so `decisionMode: 'solver'` decodes a real policy via `POST /graphical/{id}/
+	// policy` -- see that prop's own doc comment for why this is a different (complementary) source
+	// of truth than `/whatif`'s own live-engine `policy` field. Non-fatal if it fails: `<NetworkPanel>`
+	// still works fine without `policySource`, falling back to `/whatif`'s own policy.
+	async function ensure_network_demo_solved() {
+		if (network_problem_id === null || network_policy_source || network_solving) return;
+		network_solving = true;
+		network_solve_error = null;
+		try {
+			const res = await fetch(`/api/graphical/${network_problem_id}/solve`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ objective_symbol: NETWORK_DEMO_OBJECTIVE_SYMBOL })
+			});
+			if (!res.ok) throw new Error(`Failed to solve network demo (status ${res.status})`);
+			// `Record<string, number[] | number>` -- matches `SolveResponse.variable_values`'s own
+			// `dict[str, list[float] | float]` shape (`graphical.py`), and `NetworkPolicySource.
+			// variableValues`'s identically-widened type (see that type's own doc comment).
+			const data: { variable_values: Record<string, number[] | number> } = await res.json();
+			network_policy_source = { variableValues: data.variable_values };
+		} catch (e) {
+			network_solve_error = e instanceof Error ? e.message : 'Failed to solve network demo';
+		} finally {
+			network_solving = false;
+		}
+	}
+
+	// Forget the cached `problem_id` (e.g. after a local backend DB reset makes it stale,
+	// surfacing as `<NetworkPanel>`'s own structure-fetch error, or a cross-user cache collision --
+	// see `network_demo_cache_key`'s own doc comment) and recompile/resolve. `force`: pass straight
+	// through to `ensure_network_demo_compiled` -- the "Recompile demo" toolbar button wants an
+	// unconditional fresh compile (`force: true`); the "Retry" button and the automatic
+	// structure-error recovery below just want *a* valid one, reusing the backend's own idempotent
+	// lookup if it can (`force: false`, the default).
+	function reset_network_demo(force = false) {
+		sessionStorage.removeItem(network_demo_cache_key());
+		network_problem_id = null;
+		network_policy_source = null;
+		network_compile_error = null;
+		network_solve_error = null;
+		// A failed/stale model must not leave the "(demo) Reference point" panel showing the
+		// *previous* model's objectives next to a fatal error pane (a review pass caught this --
+		// this used to be left untouched by a reset).
+		network_model = null;
+		void ensure_network_demo_compiled(force);
+	}
+
+	// Auto-recovery for a stale/foreign cached `problem_id` (frontend phase F review finding 4):
+	// `<NetworkPanel>`'s own structure fetch failing -- as opposed to a `/whatif` failure, which it
+	// already treats as non-fatal -- means the cached id doesn't actually resolve to a graphical
+	// model this user can see right now, whether from a cross-user cache collision or a since-reset
+	// local dev DB. Drop the cache and recompile automatically, once, rather than leaving the DM
+	// staring at a fatal error pane until they notice the unrelated "Recompile demo" button. Guarded
+	// to fire only once per dialog open (reset alongside the rest of this dialog's own hover/select/
+	// highlight bookkeeping below) -- a persistently failing backend must not retry forever.
+	let network_structure_retry_attempted = false;
+	function handle_network_structure_error() {
+		if (network_structure_retry_attempted) return;
+		network_structure_retry_attempted = true;
+		reset_network_demo();
+	}
+
+	$effect(() => {
+		if (show_network_dialog) void ensure_network_demo_compiled();
+	});
+	$effect(() => {
+		if (network_problem_id !== null) void ensure_network_demo_solved();
+	});
+
+	// Phase C (cross-highlighting), still real and still worth demonstrating live: a shared
+	// highlight store, plus a "(demo) Reference point" panel standing in for what a real
+	// reference-point widget would show for each objective. `<NetworkPanel>` owns `model` itself
+	// (not exposed as a prop), so `onStructureLoad` is how this page gets its own read of it --
+	// needed for the objective list and the ancestor/descendant adjacency below.
+	const network_highlight = createNetworkHighlightStore();
+	let network_model = $state<NetworkModel | null>(null);
+	function handle_network_structure_load(model: NetworkModel) {
+		network_model = model;
+	}
+	let network_reference_point_objectives = $derived(
+		network_model?.nodes.filter((n) => n.kind === 'objective') ?? []
+	);
+	let network_objective_ids = $derived(
+		new Set(network_reference_point_objectives.map((n) => n.id))
+	);
+	// Built once per model load rather than rebuilt from scratch on every hover -- see
+	// `buildAdjacency`'s own doc comment.
+	let network_adjacency = $derived(network_model ? buildAdjacency(network_model) : null);
+	// Reverse direction: hovering (or selecting) a node on the canvas highlights the objectives
+	// it can influence in the reference-point panel.
+	let network_influenced_objectives: Set<string> = $state(new Set());
+
+	// Panel -> canvas: seed's ancestor closure (inclusive of the seed itself).
+	function handle_reference_point_row_hover(id: string | null) {
+		if (!network_model || !network_adjacency) return;
+		network_highlight.set(id ? ancestralSet(network_model, [id], network_adjacency) : null);
+	}
+
+	// Canvas -> panel (and canvas -> canvas, via the shared store): mirrors `NetworkView`'s own
+	// `hoveredId ?? selectedId` semantics -- a selection outlives hover-out, so unhovering a
+	// still-selected node must not blank the panel while the canvas itself stays lit. Tracked
+	// as two separate ids (rather than reacting to `onNodeHover`/`onNodeSelect` independently)
+	// so hover-out with an active selection falls back to the selection instead of clearing.
+	let network_hovered_id: string | null = $state(null);
+	let network_selected_id: string | null = $state(null);
+	let network_focus_id = $derived(network_hovered_id ?? network_selected_id);
+
+	function handle_network_hover(id: string | null) {
+		network_hovered_id = id;
+	}
+
+	function handle_network_select(id: string | null) {
+		network_selected_id = id;
+	}
+
+	// Drives both `network_influenced_objectives` and the shared store off `network_focus_id`
+	// (not directly off the hover/select events) -- a node's descendant closure, inclusive of
+	// the node itself so self-inclusion agrees with the panel -> canvas direction above (a
+	// node/objective trivially "influences" itself). Pushed into the *same* store
+	// `handle_reference_point_row_hover` writes to, so canvas focus and panel hover both drive
+	// one shared source of truth instead of `NetworkView`'s own internal highlighting and this
+	// panel disagreeing about which objectives are lit vs. dimmed.
+	$effect(() => {
+		const id = network_focus_id;
+		if (id === null || !network_model || !network_adjacency) {
+			network_influenced_objectives = new Set();
+			network_highlight.set(null);
+			return;
+		}
+		const forward = new Set([id, ...descendants(network_model, id, network_adjacency)]);
+		network_influenced_objectives = new Set(
+			[...forward].filter((nodeId) => network_objective_ids.has(nodeId))
+		);
+		network_highlight.set(forward);
+	});
+
+	// Escape (or any dialog close that doesn't fire `mouseleave`/blur on the hovered/focused
+	// element) must not leave a stale highlight lit next time the dialog reopens. `<NetworkPanel>`
+	// itself is only mounted while `show_network_dialog` is true (see the markup below), so its own
+	// evidence/posteriors/policy/commit state resets for free on every reopen -- nothing here needs
+	// to reach into it the way the old mock-backed version did.
+	$effect(() => {
+		if (!show_network_dialog) {
+			network_hovered_id = null;
+			network_selected_id = null;
+			network_highlight.set(null);
+			network_influenced_objectives = new Set();
+			network_model = null;
+			// A fresh dialog open deserves its own chance at auto-recovery, not one already spent by
+			// a previous open's structure error.
+			network_structure_retry_attempted = false;
+		}
+	});
 
 	// Whether the current problem (or the base problem it was combined from) has scenarios at
 	// all — gates whether "Add uncertainty measures" is enabled in the hamburger menu.
@@ -928,6 +1181,16 @@
 						Add uncertainty measures
 					</DropdownMenu.Item>
 					<DropdownMenu.Item>Modify problem</DropdownMenu.Item>
+					{#if dev}
+						<!-- Dev-only: exercises the network-view embedding contract (frontend phase B)
+						     against real fixture data, ahead of the backend compiler (phases 4-7) --
+						     see the import comment above. Gated out of production builds so a real
+						     CUMULUS user never sees a fabricated diagram styled like the real actions
+						     above it. -->
+						<DropdownMenu.Item onclick={() => (show_network_dialog = true)}>
+							View network structure (demo)
+						</DropdownMenu.Item>
+					{/if}
 				</DropdownMenu.Content>
 			</DropdownMenu.Root>
 		{/snippet}
@@ -1282,6 +1545,131 @@
 			<Dialog.Footer>
 				<Dialog.Close>
 					<Button variant="default">Done</Button>
+				</Dialog.Close>
+			</Dialog.Footer>
+		</Dialog.Content>
+	</Dialog.Portal>
+</Dialog.Root>
+
+<!-- Network structure dialog (demo) -- frontend phase B embedding contract, see the import
+     comment above -->
+<Dialog.Root bind:open={show_network_dialog}>
+	<Dialog.Portal>
+		<Dialog.Overlay />
+		<Dialog.Content class="flex h-[85vh] w-[90vw] max-w-4xl flex-col gap-3">
+			<Dialog.Header>
+				<Dialog.Title>Network structure (demo)</Dialog.Title>
+				<Dialog.Description>
+					Preview of the reusable graphical-model network component embedded in CUMULUS. This is a
+					real, live diagram now -- compiled server-side (`POST /graphical/demo/irrigation`, the
+					same compiler `/graphical/compile` itself uses) from a small irrigation influence diagram
+					(`desdeo/problem/graphical/demo.py`) and driven entirely by the actual `/graphical/*`
+					endpoints: structure, evidence-driven what-if inference,
+					saved evidence sets, and (in Solver mode) a policy decoded from a genuinely solved MILP
+					(`POST /graphical/{network_problem_id}/solve` + `/policy`). What's still illustrative:
+					this diagram is a fixed, unrelated sample -- not derived from the currently selected
+					optimization problem or its objectives, and it isn't the same diagram
+					`sample-network.ts`'s Storybook story shows (that fixture has an irrigation-decision ->
+					crop-yield arc this backend can't compile directly; see `demo.py`'s own docstring for
+					the reformulation). Try pinning "weather" to see "soil_moisture" respond to a real
+					inference call.
+				</Dialog.Description>
+			</Dialog.Header>
+			<div class="flex flex-wrap items-center gap-3 text-sm">
+				<span class="text-muted-foreground">Decision mode:</span>
+				<SegmentedControl
+					size="sm"
+					bind:value={network_decision_mode_str}
+					options={[
+						{ value: 'manual', label: 'Manual' },
+						{ value: 'solver', label: 'Solver' }
+					]}
+				/>
+				{#if network_flagged.size > 0}
+					<span class="text-muted-foreground">
+						Flagged for follow-up: {[...network_flagged].join(', ')}
+					</span>
+				{/if}
+				{#if network_solve_error}
+					<span class="text-destructive">
+						{network_solve_error} (Solver mode falls back to /whatif's own live policy.)
+					</span>
+				{/if}
+				<Button variant="ghost" size="sm" class="ml-auto" onclick={() => reset_network_demo(true)}>
+					Recompile demo
+				</Button>
+			</div>
+			<div class="flex min-h-0 flex-1 gap-3">
+				<div class="min-h-0 flex-1">
+					{#if network_problem_id !== null}
+						<NetworkPanel
+							modelId={network_problem_id}
+							policySource={network_decision_mode === 'solver' ? network_policy_source : null}
+							decisionMode={network_decision_mode}
+							highlight={$network_highlight}
+							onNodeHover={handle_network_hover}
+							onNodeSelect={handle_network_select}
+							onStructureLoad={handle_network_structure_load}
+							onStructureError={handle_network_structure_error}
+						>
+							{#snippet nodeChrome({ id })}
+								<button
+									type="button"
+									class="bg-background flex size-4 items-center justify-center rounded-full border shadow-sm"
+									title={network_flagged.has(id) ? 'Unflag' : 'Flag for follow-up'}
+									onclick={(e) => {
+										e.stopPropagation();
+										toggle_network_flag(id);
+									}}
+								>
+									<IconFlag
+										class="size-2.5 {network_flagged.has(id)
+											? 'text-primary'
+											: 'text-muted-foreground'}"
+									/>
+								</button>
+							{/snippet}
+						</NetworkPanel>
+					{:else if network_compile_error}
+						<div class="text-destructive flex h-full items-center justify-center text-sm">
+							{network_compile_error}
+							<Button variant="outline" size="sm" class="ml-2" onclick={() => reset_network_demo()}>
+								Retry
+							</Button>
+						</div>
+					{:else}
+						<div class="text-muted-foreground flex h-full items-center justify-center text-sm">
+							Compiling demo diagram…
+						</div>
+					{/if}
+				</div>
+				<div class="w-48 shrink-0 space-y-2 overflow-auto">
+					<p class="text-muted-foreground text-xs">
+						(demo) Reference point -- stand-in for a real reference-point widget. Hover an
+						objective to highlight its ancestor subgraph on the canvas; hover a canvas node to see
+						which objectives it can influence.
+					</p>
+					{#each network_reference_point_objectives as node (node.id)}
+						<button
+							type="button"
+							class="block w-full rounded-md border px-2 py-1 text-left text-sm {network_influenced_objectives.has(
+								node.id
+							)
+								? 'border-primary bg-primary/10'
+								: ''}"
+							onmouseenter={() => handle_reference_point_row_hover(node.id)}
+							onmouseleave={() => handle_reference_point_row_hover(null)}
+							onfocus={() => handle_reference_point_row_hover(node.id)}
+							onblur={() => handle_reference_point_row_hover(null)}
+						>
+							{node.label}
+						</button>
+					{/each}
+				</div>
+			</div>
+			<Dialog.Footer>
+				<Dialog.Close>
+					<Button variant="outline">Close</Button>
 				</Dialog.Close>
 			</Dialog.Footer>
 		</Dialog.Content>

@@ -344,6 +344,43 @@ class SiteSelectionMetaData(SQLModel, table=True):
     metadata_instance: "ProblemMetaDataDB" = Relationship(back_populates="site_selection_metadata")
 
 
+class GraphicalModelMetaData(SQLModel, table=True):
+    """Metadata for a graphical model (Bayesian network / influence diagram) compiled `Problem`.
+
+    Mirrors `SiteSelectionMetaData`'s JSON-blob-column pattern rather than `ScenarioModelDB`'s
+    relational one: see `.claude/desdeo-graphical-models-plan.md`'s Phase 3 checklist item and
+    design decisions table ("Compiled-model metadata ... persists via the API's
+    `ProblemMetaDataDB` side-table pattern, not a field on core `Problem`"). Nothing in the
+    current API queries *into* a stored problem's substructure at the SQL level (unlike
+    `ScenarioModelDB`, whose relational mapping exists specifically for its polymorphic pools
+    and per-leaf scenario dispatch) -- a JSON blob per document is sufficient here, same as
+    `SiteSelectionMetaData`'s `sites_json`/`nodes_json`/`travel_time_matrix_json`.
+
+    Each JSON column round-trips one `problem/graphical` pydantic model via `.model_dump_json()`/
+    `.model_validate_json()`: `network_json` <-> `DiscreteNetwork`, `annotation_json` <->
+    `DecisionAnnotation`, `rjt_json` <-> `RootedJunctionTree` (Phase 3). `index_map_json` is
+    Phase 4's `IndexMap`, returned alongside the compiled `Problem` by `compile_diagram` -- it
+    stays `None` until a Phase 4/7 compile step populates it, since nothing before that point has
+    an `IndexMap` to store.
+    """
+
+    id: int | None = Field(primary_key=True, default=None)
+    metadata_id: int | None = Field(foreign_key="problemmetadatadb.id", default=None)
+
+    metadata_type: str = "graphical_model_metadata"
+
+    network_json: str = Field(description="JSON-serialised `desdeo.problem.graphical.DiscreteNetwork`")
+    annotation_json: str = Field(description="JSON-serialised `desdeo.problem.graphical.DecisionAnnotation`")
+    rjt_json: str | None = Field(
+        default=None, description="JSON-serialised `desdeo.problem.graphical.RootedJunctionTree`, once built"
+    )
+    index_map_json: str | None = Field(
+        default=None, description="JSON-serialised `IndexMap` (Phase 4), once the diagram has been compiled"
+    )
+
+    metadata_instance: "ProblemMetaDataDB" = Relationship(back_populates="graphical_model_metadata")
+
+
 class DescriptionPart(BaseModel):
     """A single part of a solution description template.
 
@@ -399,6 +436,9 @@ class ProblemMetaDataDB(SQLModel, table=True):
     solution_description_metadata: list[SolutionDescriptionMetaData] = Relationship(
         back_populates="metadata_instance", cascade_delete=True
     )
+    graphical_model_metadata: list[GraphicalModelMetaData] = Relationship(
+        back_populates="metadata_instance", cascade_delete=True
+    )
     problem: ProblemDB = Relationship(back_populates="problem_metadata")
 
     @property
@@ -410,6 +450,7 @@ class ProblemMetaDataDB(SQLModel, table=True):
         | SolverSelectionMetadata
         | SiteSelectionMetaData
         | SolutionDescriptionMetaData
+        | GraphicalModelMetaData
     ]:
         """Return all metadata in one list."""
         return (
@@ -418,6 +459,7 @@ class ProblemMetaDataDB(SQLModel, table=True):
             + (self.solver_selection_metadata or [])
             + (self.site_selection_metadata or [])
             + (self.solution_description_metadata or [])
+            + (self.graphical_model_metadata or [])
         )
 
 
@@ -430,6 +472,7 @@ class ProblemMetaDataPublic(SQLModel):
     representative_nd_metadata: list[RepresentativeNonDominatedSolutions] | None
     site_selection_metadata: list[SiteSelectionMetaData] | None
     solution_description_metadata: list[SolutionDescriptionMetaData] | None
+    graphical_model_metadata: list[GraphicalModelMetaData] | None
 
 
 class ProblemMetaDataGetRequest(SQLModel):

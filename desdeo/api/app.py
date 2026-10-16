@@ -8,6 +8,7 @@ from desdeo.api.routers import (
     cumulus,
     enautilus,
     generic,
+    graphical,
     nautilus_navigator,
     nimbus,
     problem,
@@ -44,6 +45,7 @@ app.include_router(gdm_aggregate.router)
 app.include_router(gnimbus_routers.router)
 app.include_router(enautilus.router)
 app.include_router(site_selection.router)
+app.include_router(graphical.router)
 app.include_router(gdm_score_bands_routers.router)
 app.include_router(nautilus_navigator.router)
 app.include_router(solution_description.router)

@@ -35,6 +35,8 @@ __all__ = [  # noqa: RUF022
     "NautilusNavigatorStep",
     "ForestProblemMetaData",
     "GenericIntermediateSolutionResponse",
+    "GraphicalEvidenceSetDB",
+    "GraphicalModelMetaData",
     "GNIMBUSOptimizationState",
     "GNIMBUSVotingState",
     "GNIMBUSEndState",
@@ -277,6 +279,7 @@ from .generic_states import (
     StateDB,
     UserSavedSolutionDB,
 )
+from .graphical import GraphicalEvidenceSetDB
 from .nautilus_navigator import (
     NautilusNavigatorInitializationState,
     NautilusNavigatorInitRequest,
@@ -319,6 +322,7 @@ from .problem import (
     DiscreteRepresentationDB,
     ExtraFunctionDB,
     ForestProblemMetaData,
+    GraphicalModelMetaData,
     ObjectiveDB,
     ProblemAddFromJSONRequest,
     ProblemDB,

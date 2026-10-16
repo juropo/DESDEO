@@ -33,6 +33,7 @@ from desdeo.api.models.cumulus import ProblemModification
 from desdeo.api.models.generic_states import StateKind
 from desdeo.api.models.problem import (
     ForestProblemMetaData,
+    GraphicalModelMetaData,
     ProblemMetaDataDB,
     RepresentativeNonDominatedSolutions,
     SiteSelectionMetaData,
@@ -142,6 +143,21 @@ def copy_problem_metadata(source_problem_db: ProblemDB, target_problem_db: Probl
                 metadata_id=new_meta.id,
                 parts=raw_parts,
                 separator=item.separator,
+            )
+        )
+    for item in source_meta.graphical_model_metadata or []:
+        # Missing until a Phase 7 review pass caught it: without this loop, any flow going through
+        # `copy_problem_metadata` (e.g. Cumulus's problem-modification path) silently dropped a
+        # compiled diagram's `GraphicalModelMetaData` row on the copy, leaving
+        # `/graphical/{id}/structure`/`/whatif` both 404ing on the copy forever with no way to
+        # notice why.
+        db_session.add(
+            GraphicalModelMetaData(
+                metadata_id=new_meta.id,
+                network_json=item.network_json,
+                annotation_json=item.annotation_json,
+                rjt_json=item.rjt_json,
+                index_map_json=item.index_map_json,
             )
         )
 
