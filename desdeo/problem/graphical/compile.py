@@ -477,7 +477,24 @@ def _extract_expr(symbol: str, flat_indices_0based: list[int]) -> list:
     Emits a single `At` for a lone index, a `Tuple` range when the (already-ascending) indices
     happen to be contiguous, and an explicit index list otherwise -- the "accept strided access"
     fallback from the module docstring. Never a dense matrix (Phase 0's finding).
+
+    Raises:
+        ValueError: `flat_indices_0based` is empty. A defensive check, not expected to trigger in
+            practice now that `ObjectiveNode.parents` rejects duplicate entries at construction
+            time (`schema.py`) -- a duplicate parent used to be the one way a projection target
+            with a repeated dimension could produce a genuinely empty group here (e.g. the
+            off-diagonal states of a `["A", "A"]` target are unreachable), surfacing as a bare
+            `IndexError` on `flat_indices_0based[0]` below instead of a clear message naming the
+            cause.
     """
+    if not flat_indices_0based:
+        msg = (
+            f"'{symbol}': no cluster state maps to this group -- an empty projection group. This "
+            "usually means a duplicate dimension in the projection target (e.g. an ObjectiveNode's "
+            "parents containing the same node twice)."
+        )
+        raise ValueError(msg)
+
     if len(flat_indices_0based) == 1:
         return ["At", symbol, flat_indices_0based[0] + 1]
 
@@ -783,6 +800,30 @@ def _risk_measure_internal_symbols(risk_measures: list[RiskMeasure]) -> set[str]
             _rho_symbol(risk_measure.symbol),
             _rho_bar_symbol(risk_measure.symbol),
         }
+    return symbols
+
+
+def _cluster_internal_symbols(
+    cluster_maps: dict[str, ClusterIndexMap], decision_maps: dict[str, DecisionIndexMap]
+) -> set[str]:
+    """Every mu_*/sep_*/z_* symbol this module's own compilation emits for `cluster_maps`/`decision_maps`.
+
+    The same treatment `_risk_measure_internal_symbols` gets for the eta/lambda/rho namespace,
+    extended to this module's *other* reserved prefixes (see the module docstring's reserved
+    symbol namespace note): `cluster_maps`/`decision_maps` already exist by the time
+    `_build_diagram_constraint` is called, so these can be collected directly rather than
+    re-derived from naming conventions alone. A `DiagramConstraint.func` written directly over
+    one of these (bypassing the `At`-substitution path entirely, e.g. `["Multiply",
+    "mu_SomeCluster_entry0", ...]`) would otherwise fall through `known_symbols` unchecked and
+    get hardcoded `is_linear=True` regardless of what it actually computes -- a gap the code
+    review pass flagged alongside `_risk_measure_internal_symbols`'s own.
+    """
+    symbols: set[str] = set()
+    for cluster_map in cluster_maps.values():
+        symbols.add(cluster_map.mu_symbol)
+        symbols.update(cluster_map.separator_symbols)
+    for decision_map in decision_maps.values():
+        symbols.add(decision_map.z_symbol)
     return symbols
 
 
@@ -1110,25 +1151,53 @@ def _substitute_at_nodes(
     """
     if isinstance(func, list) and len(func) == _AT_NODE_EXPR_LENGTH and func[0] == "At" and isinstance(func[1], str):
         node = func[1]
-        if node in known_symbols:
-            if node not in nodes:
-                msg = (
-                    f"DiagramConstraint '{constraint_symbol}': func references node '{node}' via "
-                    f'["At", "{node}", ...], but "{node}" is not declared in this constraint\'s '
-                    f"nodes {sorted(nodes)}. Add it to nodes, or remove the reference."
-                )
-                raise ValueError(msg)
-            k = func[2]
-            if not isinstance(k, int) or isinstance(k, bool):
-                msg = (
-                    f"DiagramConstraint '{constraint_symbol}': the state index in "
-                    f'["At", "{node}", {k!r}] must be a literal 1-based integer, not {type(k).__name__}.'
-                )
-                raise ValueError(msg)
-            return make_expr(node, k), True
+        if node not in known_symbols:
+            msg = (
+                f"DiagramConstraint '{constraint_symbol}': func references unknown symbol '{node}' "
+                f'via ["At", "{node}", ...] -- "{node}" is not a chance/decision node, objective, or '
+                "risk measure known to this compiled model. Check for a typo."
+            )
+            raise ValueError(msg)
+        if node not in nodes:
+            msg = (
+                f"DiagramConstraint '{constraint_symbol}': func references node '{node}' via "
+                f'["At", "{node}", ...], but "{node}" is not declared in this constraint\'s '
+                f"nodes {sorted(nodes)}. Add it to nodes, or remove the reference."
+            )
+            raise ValueError(msg)
+        k = func[2]
+        if not isinstance(k, int) or isinstance(k, bool):
+            msg = (
+                f"DiagramConstraint '{constraint_symbol}': the state index in "
+                f'["At", "{node}", {k!r}] must be a literal 1-based integer, not {type(k).__name__}.'
+            )
+            raise ValueError(msg)
+        return make_expr(node, k), True
 
     if isinstance(func, list):
+        if len(func) == 0:
+            # `DiagramConstraint._check_func_not_empty` (schema.py) rejects an empty top-level
+            # `func` at construction time, but `func` nests arbitrarily and that validator doesn't
+            # recurse -- an empty *sub*-list (e.g. `["Subtract", [], 0.5]`) reaches here on recursion
+            # and would otherwise hit a bare `IndexError` on `func[0]` just below.
+            msg = f"DiagramConstraint '{constraint_symbol}': func contains an empty sub-expression."
+            raise ValueError(msg)
         operator = func[0]
+        if isinstance(operator, str) and operator in known_symbols:
+            if operator in nodes:
+                msg = (
+                    f"DiagramConstraint '{constraint_symbol}': func references node '{operator}' in "
+                    "operator position, an unsupported form. Only [\"At\", \"<node>\", k] (a single "
+                    "1-based own-state index) is supported for referencing a node's state -- combine "
+                    "several such At terms with Add/Multiply/Subtract for anything more complex."
+                )
+            else:
+                msg = (
+                    f"DiagramConstraint '{constraint_symbol}': func references '{operator}' in "
+                    f"operator position, which is not declared in this constraint's nodes "
+                    f"{sorted(nodes)}. Add it to nodes, or remove the reference."
+                )
+            raise ValueError(msg)
         substituted: list = [operator]
         derived_flags: list[bool] = []
         for item in func[1:]:
@@ -1170,6 +1239,7 @@ def _build_diagram_constraint(
     cardinality: dict[str, int],
     objective_like_symbols: set[str],
     reserved_risk_measure_symbols: set[str] = frozenset(),
+    reserved_internal_symbols: set[str] = frozenset(),
 ) -> Constraint:
     """One `Constraint`, compiled per the Phase 5 taxonomy table (see the module docstring).
 
@@ -1194,11 +1264,14 @@ def _build_diagram_constraint(
     so both must be rejected identically by the check just below, and both feed `known_symbols`
     (below) so a bare/`At` reference to either outside `nodes` is rejected too, not silently passed
     through. `reserved_risk_measure_symbols` (every risk measure's own internal eta/lambda/
-    lambda_bar/rho/rho_bar variable symbols -- see `_risk_measure_internal_symbols`) is folded into
-    `known_symbols` only, not this rejection: these aren't objective-like at all (a `DiagramConstraint`
-    was never meant to reference them under any kind, "tail" included), so they get the generic
-    "not declared in this constraint's nodes" rejection via `_substitute_at_nodes` rather than this
-    objective-specific one. Defaults to `frozenset()` for callers with no risk measures at all.
+    lambda_bar/rho/rho_bar variable symbols -- see `_risk_measure_internal_symbols`) and
+    `reserved_internal_symbols` (every mu/sep/z symbol this module's own compilation emits for the
+    cluster/decision maps being compiled against -- see `_cluster_internal_symbols`) are both
+    folded into `known_symbols` only, not this rejection: neither is objective-like at all (a
+    `DiagramConstraint` was never meant to reference either under any kind, "tail" included), so
+    they get the generic "not declared in this constraint's nodes" rejection via
+    `_substitute_at_nodes` rather than this objective-specific one. Both default to `frozenset()`
+    for callers with no risk measures/no cluster context at all.
     """
     symbol = diagram_constraint.symbol
     nodes = set(diagram_constraint.nodes)
@@ -1283,7 +1356,9 @@ def _build_diagram_constraint(
             )
             return _extract_expr(cluster_map.mu_symbol, groups[k - 1])
 
-    known_symbols = set(cardinality) | objective_like_symbols | reserved_risk_measure_symbols
+    known_symbols = (
+        set(cardinality) | objective_like_symbols | reserved_risk_measure_symbols | reserved_internal_symbols
+    )
     func, _ = _substitute_at_nodes(diagram_constraint.func, nodes, make_expr, symbol, known_symbols)
 
     return Constraint(
@@ -1384,15 +1459,17 @@ def compile_diagram(
     Raises:
         ValueError: `annotation` doesn't validate against `network`; a chance node's CPT isn't
             normalised; `rjt` was given but doesn't match `(network, annotation)`'s expected node
-            set or family containment; (defensively -- should not happen for a
-            `RootedJunctionTree` built by `build_rooted_junction_tree`) an `ObjectiveNode`'s
+            set, family containment, or has a root cluster with a non-empty separator (see the
+            module docstring's "Root normalisation" paragraph); (defensively -- should not happen
+            for a `RootedJunctionTree` built by `build_rooted_junction_tree`) an `ObjectiveNode`'s
             parents aren't contained in any cluster; or a `DiagramConstraint` is out of Phase 5's
-            scope (`kind == "tail"`, references an objective symbol, references a decision with a
-            non-empty effective information set under `kind == "decision"`, references a `nodes`
-            member in an unsupported MathJSON form, references a node/objective symbol that isn't
-            declared in this constraint's own `nodes`, combines node-derived subtrees under a
-            non-linear operator, or an `At` state index is out of range -- see
-            `_build_diagram_constraint`/`_substitute_at_nodes`).
+            scope (`kind == "tail"`, references an objective/risk-measure/compiler-internal
+            symbol, references a decision with a non-empty effective information set under
+            `kind == "decision"`, references a `nodes` member in an unsupported MathJSON form
+            (including in operator position), references a node/objective symbol that isn't
+            declared in this constraint's own `nodes` or isn't known to the compiled model at
+            all, combines node-derived subtrees under a non-linear operator, or an `At` state
+            index is out of range -- see `_build_diagram_constraint`/`_substitute_at_nodes`).
     """
     annotation.validate_against(network)
     _check_cpts_normalized(network)
@@ -1407,6 +1484,22 @@ def compile_diagram(
         msg = (
             f"The given rjt's node set {sorted(rjt.clusters)} doesn't match the expected chance/"
             f"decision node set {sorted(expected_nodes)} for this (network, annotation) pair."
+        )
+        raise ValueError(msg)
+
+    if rjt.clusters[rjt.root].separator != []:
+        # The root-mass constraint below pins `Sum(mu_root) == 1` directly, which is correct
+        # regardless of the root cluster's own shape -- but the invariant
+        # `cluster.parent is None ⟹ cluster.separator == []` must still hold for `rjt.root` to be
+        # a genuine root (a non-empty separator would mean this cluster is still tied to some
+        # other cluster the tree doesn't know about). `build_rooted_junction_tree` always
+        # produces a root with an empty separator; only a caller-supplied `rjt` could violate
+        # this, so raise a clear error here rather than compiling something silently wrong.
+        msg = (
+            f"The given rjt's root cluster '{rjt.root}' has a non-empty separator "
+            f"{rjt.clusters[rjt.root].separator} -- a root cluster's separator must be empty "
+            "(Cluster.parent is None implies Cluster.separator == []). This usually means a "
+            "caller-supplied rjt wasn't actually built with this cluster as its root."
         )
         raise ValueError(msg)
 
@@ -1481,7 +1574,11 @@ def compile_diagram(
             name=f"Total probability mass at root {rjt.root}",
             symbol=f"mass_{rjt.root}",
             cons_type=ConstraintTypeEnum.EQ,
-            func=["Subtract", root_map.separator_symbols[0], 1],
+            # `Sum(mu_root) == 1` directly, rather than `root_map.separator_symbols[0] == 1` --
+            # the two only agree because `build_rooted_junction_tree` always produces a singleton
+            # root cluster (a single separator state, trivially equal to the cluster's own total
+            # mass); this form is correct regardless of the root cluster's own shape.
+            func=["Subtract", ["Sum", root_map.mu_symbol], 1],
             is_linear=True,
             is_convex=True,
             is_twice_differentiable=True,
@@ -1513,6 +1610,11 @@ def compile_diagram(
     # closes; see the plan's Findings.
     objective_like_symbols = objective_symbols | risk_measure_symbols
     reserved_risk_measure_symbols = _risk_measure_internal_symbols(annotation.risk_measures)
+    # This module's own mu/sep/z symbols (see `_cluster_internal_symbols`) -- a `DiagramConstraint.
+    # func` written directly over one of these bypasses the `At`-substitution path entirely and
+    # must be rejected the same way an unknown `known_symbols` member outside `nodes` already is;
+    # see `_build_diagram_constraint`'s docstring.
+    reserved_internal_symbols = _cluster_internal_symbols(cluster_maps, decision_maps)
     constraints.extend(
         _build_diagram_constraint(
             diagram_constraint,
@@ -1523,6 +1625,7 @@ def compile_diagram(
             cardinality,
             objective_like_symbols,
             reserved_risk_measure_symbols,
+            reserved_internal_symbols,
         )
         for diagram_constraint in annotation.constraints
     )

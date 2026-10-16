@@ -64,6 +64,7 @@ import pyagrum as gum
 import pytest
 
 from desdeo.problem.graphical import (
+    Cluster,
     DecisionAnnotation,
     DecisionNode,
     DiagramConstraint,
@@ -74,6 +75,7 @@ from desdeo.problem.graphical import (
     ObjectiveNode,
     Potential,
     RiskMeasure,
+    RootedJunctionTree,
     build_rooted_junction_tree,
     compile_diagram,
     read_policy_from_solution,
@@ -809,6 +811,45 @@ def test_random_small_diagrams_all_oracles_agree(seed, n, domain_size, ratio_arc
     _assert_all_agree(network, annotation, "obj")
 
 
+# ── Phase G hardening: compile_diagram robustness against a caller-supplied rjt ─────────────────
+
+
+def test_malformed_root_cluster_separator_raises():
+    """A caller-supplied `rjt` whose root cluster has a non-empty separator is rejected.
+
+    Regression test for the audit's root-mass finding: the total-probability-mass constraint
+    used to pin `root_map.separator_symbols[0] == 1`, which only equals the root's own total mass
+    because `build_rooted_junction_tree` always produces a singleton root cluster (empty
+    separator). A hand-built `rjt` violating that invariant -- `rjt.clusters[rjt.root].separator
+    != []` -- used to compile without error and solve to a silently wrong optimum. Now rejected
+    outright at compile time, naming the offending cluster.
+    """
+    network = DiscreteNetwork(
+        variables=[DiscreteVariable(name="A", labels=["lo", "hi"]), DiscreteVariable(name="B", labels=["lo", "hi"])],
+        arcs=[("A", "B")],
+        potentials={
+            "A": Potential(variables=["A"], shape=[2], values=[0.4, 0.6]),
+            "B": Potential(variables=["B", "A"], shape=[2, 2], values=[[0.9, 0.2], [0.1, 0.8]]),
+        },
+    )
+    annotation = DecisionAnnotation(
+        objectives=[
+            ObjectiveNode(
+                symbol="fA", parents=["A"], utility=Potential(variables=["A"], shape=[2], values=[1.0, 2.0])
+            )
+        ]
+    )
+    bad_rjt = RootedJunctionTree(
+        clusters={
+            "A": Cluster(ownership="A", nodes=["A", "B"], parent=None, separator=["B"], order=0, state_space_size=4),
+            "B": Cluster(ownership="B", nodes=["A", "B"], parent="A", separator=["A"], order=1, state_space_size=4),
+        },
+        root="A",
+    )
+    with pytest.raises(ValueError, match="non-empty separator"):
+        compile_diagram(network, annotation, rjt=bad_rjt)
+
+
 # ── Phase 5: DiagramConstraint compilation ──────────────────────────────────────────────────────
 
 
@@ -1330,6 +1371,114 @@ def test_constraint_referencing_risk_measure_internal_symbol_raises():
         ],
     )
     with pytest.raises(ValueError, match="not declared in this constraint's nodes"):
+        compile_diagram(network, annotation)
+
+
+def test_constraint_referencing_compiler_internal_mu_symbol_raises():
+    """A bare `func` reference to this module's own internal `mu_<node>` symbol is rejected.
+
+    Regression test: `known_symbols` (feeding `_substitute_at_nodes`'s undeclared-reference
+    guard) used to cover chance/decision nodes, objectives, and risk-measure internals, but not
+    the compiler's own `mu_*`/`z_*`/`sep_*` namespace. A `DiagramConstraint.func` written directly
+    over `mu_A` (bypassing the `At`-substitution path entirely) used to fall straight through
+    `_substitute_at_nodes` unsubstituted and still compile with hardcoded `is_linear=True`, even
+    though `["Multiply", "mu_A", "mu_A"]` is a genuinely bilinear expression -- poisoning
+    `Problem.is_linear` for the whole model.
+    """
+    network = DiscreteNetwork(
+        variables=[DiscreteVariable(name="A", labels=["lo", "hi"])],
+        arcs=[],
+        potentials={"A": Potential(variables=["A"], shape=[2], values=[0.4, 0.6])},
+    )
+    annotation = DecisionAnnotation(
+        objectives=[
+            ObjectiveNode(
+                symbol="f1", parents=["A"], utility=Potential(variables=["A"], shape=[2], values=[10.0, 20.0])
+            )
+        ],
+        constraints=[
+            DiagramConstraint(
+                symbol="leaky_mu_ref",
+                kind=DiagramConstraintKind.probability,
+                nodes=["A"],
+                func=["Subtract", ["Multiply", "mu_A", "mu_A"], 0.1],
+                cons_type=ConstraintTypeEnum.LTE,
+            )
+        ],
+    )
+    with pytest.raises(ValueError, match="not declared in this constraint's nodes"):
+        compile_diagram(network, annotation)
+
+
+def test_constraint_at_unknown_symbol_raises():
+    """`["At", sym, k]` where `sym` isn't even a known node/objective/risk-measure symbol is rejected.
+
+    Regression test: `_substitute_at_nodes`'s `if node in known_symbols:` guard meant nothing
+    happened for an entirely unknown `sym` -- execution fell through to the generic list-walk
+    below, which recursed into `"At"` as an ordinary operator and the unknown symbol as an
+    unmatched leaf, silently returning `["At", "Z", 1]` unchanged (`is_node_derived=False`)
+    instead of raising at compile time. The module's own docstring claims this case raises;
+    before the fix it didn't, surfacing only as an opaque error once the solver backend tried to
+    evaluate a reference to a symbol that was never compiled.
+    """
+    network = DiscreteNetwork(
+        variables=[DiscreteVariable(name="A", labels=["lo", "hi"])],
+        arcs=[],
+        potentials={"A": Potential(variables=["A"], shape=[2], values=[0.4, 0.6])},
+    )
+    annotation = DecisionAnnotation(
+        objectives=[
+            ObjectiveNode(
+                symbol="f1", parents=["A"], utility=Potential(variables=["A"], shape=[2], values=[10.0, 20.0])
+            )
+        ],
+        constraints=[
+            DiagramConstraint(
+                symbol="unknown_at_ref",
+                kind=DiagramConstraintKind.probability,
+                nodes=["A"],
+                func=["Subtract", ["At", "Z", 1], 0.5],
+                cons_type=ConstraintTypeEnum.LTE,
+            )
+        ],
+    )
+    with pytest.raises(ValueError, match="unknown symbol"):
+        compile_diagram(network, annotation)
+
+
+def test_constraint_node_in_operator_position_raises():
+    """A node symbol appearing in operator position (`func[0]`) is rejected.
+
+    Regression test: the generic list-walk branch of `_substitute_at_nodes` only ever recursed
+    into `func[1:]` (the operands), never checking `func[0]` (the operator) against
+    `known_symbols` at all -- contradicting the module's own docstring, which already claims a
+    node reference "in operator position" raises `ValueError`. Before the fix, `["A", 1]` (node
+    `"A"` used nonsensically as an operator) passed straight through unsubstituted and
+    unflagged, surfacing only as an opaque error once a solver backend's own MathJSON parser
+    tried to interpret `"A"` as an operator it doesn't recognise.
+    """
+    network = DiscreteNetwork(
+        variables=[DiscreteVariable(name="A", labels=["lo", "hi"])],
+        arcs=[],
+        potentials={"A": Potential(variables=["A"], shape=[2], values=[0.4, 0.6])},
+    )
+    annotation = DecisionAnnotation(
+        objectives=[
+            ObjectiveNode(
+                symbol="f1", parents=["A"], utility=Potential(variables=["A"], shape=[2], values=[10.0, 20.0])
+            )
+        ],
+        constraints=[
+            DiagramConstraint(
+                symbol="node_as_operator",
+                kind=DiagramConstraintKind.probability,
+                nodes=["A"],
+                func=["Subtract", ["A", 1], 0.5],
+                cons_type=ConstraintTypeEnum.LTE,
+            )
+        ],
+    )
+    with pytest.raises(ValueError, match="operator position"):
         compile_diagram(network, annotation)
 
 

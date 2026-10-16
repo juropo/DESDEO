@@ -84,7 +84,7 @@ from desdeo.api.models import (
 )
 from desdeo.api.routers.user_authentication import get_current_user
 from desdeo.api.routers.utils import fetch_interactive_session_with_role_check, fetch_problem_with_role_check
-from desdeo.problem import Problem
+from desdeo.problem import Problem, VariableDomainTypeEnum
 from desdeo.problem.graphical import (
     DecisionAnnotation,
     DiscreteNetwork,
@@ -97,6 +97,8 @@ from desdeo.problem.graphical.adapters.pyagrum import to_pyagrum, to_pyagrum_inf
 from desdeo.problem.graphical.demo import build_irrigation_demo
 from desdeo.problem.graphical.index_map import mixed_radix_encode
 from desdeo.tools import find_compatible_solvers, guess_best_solver
+from desdeo.tools.gurobipy_solver_interfaces import GurobipySolver
+from desdeo.tools.pyomo_solver_interfaces import PyomoBonminSolver, PyomoCBCSolver, PyomoGurobiSolver
 
 router = APIRouter(prefix="/graphical", tags=["Graphical models"])
 
@@ -205,6 +207,16 @@ reasonably-sized diagram, tight enough to bound one request's worst case. A requ
 *stricter* cap than this (respected as given, at the caller's own `on_exceed`), but never a looser
 one -- see `_effective_cluster_cap`."""
 
+_SERVER_MAX_TOTAL_CLUSTER_SIZE = 2_000_000
+"""Hard ceiling on the *sum* of every cluster's own `state_space_size`, unconditional (no
+caller-supplied override, unlike `_SERVER_MAX_CLUSTER_SIZE`). `_SERVER_MAX_CLUSTER_SIZE` only
+bounds the single largest cluster -- a network built from many small, disjoint cliques (each well
+under that cap individually) can still produce an arbitrarily large *total* compiled `Problem`,
+since `compile_diagram`'s overall cost scales with the sum across clusters, not just its max. Set
+an order of magnitude above `_SERVER_MAX_CLUSTER_SIZE` (10x): generous enough that a legitimate
+diagram with several independent, moderately-sized clusters still compiles, tight enough to still
+bound one request's worst-case total work."""
+
 
 def _effective_cluster_cap(request: CompileRequest) -> tuple[int, Literal["warn", "raise"]]:
     """Clamp `request.max_cluster_size`/`on_exceed` to never exceed `_SERVER_MAX_CLUSTER_SIZE`.
@@ -240,7 +252,9 @@ def compile_graphical_model(
         HTTPException: 401 for a guest user; 400 for a `ValueError` from `validate_against`/
             `build_rooted_junction_tree`/`compile_diagram` (bad/inconsistent annotation,
             `max_cluster_size` exceeded with `on_exceed="raise"`, an out-of-scope
-            `DiagramConstraint`, ...) -- translated rather than left as an opaque 500.
+            `DiagramConstraint`, ...) -- translated rather than left as an opaque 500; 400 if the
+            sum of every cluster's own state space exceeds `_SERVER_MAX_TOTAL_CLUSTER_SIZE` (a
+            many-small-disjoint-clusters diagram that never trips the single-largest-cluster cap).
     """
     if user.role == UserRole.guest:
         raise HTTPException(
@@ -253,6 +267,16 @@ def compile_graphical_model(
         rjt = build_rooted_junction_tree(
             request.network, request.annotation, max_cluster_size=max_cluster_size, on_exceed=on_exceed
         )
+        total_cluster_size = sum(cluster.state_space_size for cluster in rjt.clusters.values())
+        if total_cluster_size > _SERVER_MAX_TOTAL_CLUSTER_SIZE:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"Combined cluster state space ({total_cluster_size}) exceeds the server "
+                    f"limit of {_SERVER_MAX_TOTAL_CLUSTER_SIZE}, even though every individual "
+                    f"cluster is under max_cluster_size={max_cluster_size}."
+                ),
+            )
         problem, index_map = compile_diagram(request.network, request.annotation, rjt=rjt)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
@@ -481,18 +505,25 @@ def _build_engine(network: DiscreteNetwork, annotation: DecisionAnnotation):
     decision nodes (Phase 4 finding, `compile.py`'s module docstring). Every `ObjectiveNode`'s
     joint target is registered once, here, before any `makeInference` call -- see the module
     docstring's "pyAgrum API facts" for why that's what lets the cached engine answer many later
-    `/whatif` calls under different evidence without re-declaring targets each time.
-
-    With-decision case: `to_pyagrum_influence_diagram` + `ShaferShenoyLIMIDInference`, applying
-    `addNoForgettingAssumption` only when `annotation.no_forgetting` is set -- `decision_order`
-    alone is *not* sufficient (Phase 4 finding), and the assumption wants decision *names*
-    (`list[str]`), not the ids its own docstring claims.
+    `/whatif` calls under different evidence without re-declaring targets each time. Every chance
+    node is *also* registered as its own single-node target here -- confirmed empirically that
+    `LazyPropagation.addJointTarget(...)` silently narrows its default "every node is a target"
+    behaviour to *only* the explicitly declared (joint) targets plus any hard-evidenced node, so
+    without this, `posterior(node)` for any chance node that's neither a declared joint target's
+    own member nor evidenced raises `gum.UndefinedElement` ("does not belong to this optimized
+    inference") -- a review pass caught this breaking `/sensitivity`'s own near-zero-marginal
+    check (`sensitivity`'s `base_marginals`) for a chance node unrelated to every objective's own
+    parents. `ShaferShenoyLIMIDInference` (the with-decision branch below) has no such
+    restriction -- confirmed empirically it answers `posterior` for any chance/decision node
+    regardless of target declarations -- so this only applies here.
     """
     if not annotation.decisions:
         engine = gum.LazyPropagation(to_pyagrum(network))
         for objective in annotation.objectives:
             if objective.parents:
                 engine.addJointTarget(set(objective.parents))
+        for variable in network.variables:
+            engine.addTarget(variable.name)
         return engine
 
     diagram = to_pyagrum_influence_diagram(network, annotation)
@@ -867,11 +898,17 @@ def _decode_solved_policy(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"variable_values is missing a required entry: {e}.",
         ) from e
-    except ValueError as e:
+    except (ValueError, TypeError) as e:
         # `read_policy_from_solution` raises `ValueError` when a `z_symbol` entry's length
         # doesn't match this IndexMap's own expected shape (e.g. a stale saved solution from
         # before a recompile changed a cardinality) -- a client-correctable 400, not an
-        # uncaught 500 (a review pass caught this path falling through uncaught).
+        # uncaught 500 (a review pass caught this path falling through uncaught). `TypeError` is
+        # caught alongside it for the same reason: `variable_values` is typed to accept a bare
+        # scalar per entry (the Phase 6 `RiskMeasure` `eta` case -- see `PolicyRequest.
+        # variable_values`'s own docstring), but nothing stops a caller putting a bare scalar on a
+        # decision's own `z_symbol` key instead, and `len(z_values)` on a bare `float` raises
+        # `TypeError` rather than `ValueError` (a review pass caught this escaping as an uncaught
+        # 500 instead of the same clean 400 a wrong-length list already gets).
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
 
     decoding_order = annotation.decision_order or [decision.symbol for decision in annotation.decisions]
@@ -918,9 +955,12 @@ def get_policy(
         HTTPException: 404 if the problem doesn't exist, isn't visible to `user`, has no
             `GraphicalModelMetaData`, has no `index_map_json` yet (compiled via a path that never
             ran `compile_diagram`), or `solution_id` doesn't reference a saved solution belonging
-            to `problem_id`; 400 if neither/both of `variable_values`/`solution_id` are given, if
-            `evidence` references a node that isn't a chance node, if `variable_values` is missing
-            a required `z_symbol` entry, or if an evidence value isn't one of its own node's states.
+            to `problem_id`; 403 if `solution_id` references a solution saved by a different user
+            and `user` is neither its owner nor an admin/analyst (visibility into `problem_id`
+            alone is not ownership of one specific saved solution); 400 if neither/both of
+            `variable_values`/`solution_id` are given, if `evidence` references a node that isn't
+            a chance node, if `variable_values` is missing a required `z_symbol` entry or has one
+            in the wrong shape, or if an evidence value isn't one of its own node's states.
     """
     problem_db = fetch_problem_with_role_check(user, problem_id, db_session)
     if problem_db is None:
@@ -951,6 +991,16 @@ def get_policy(
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"No saved solution with id={request.solution_id} for problem {problem_id}.",
+            )
+        # Group-visibility into `problem_id` (checked above, via `fetch_problem_with_role_check`)
+        # is not ownership of this *specific* saved solution -- mirrors `delete_evidence_set`'s own
+        # role-aware ownership check (`row.user_id != user.id and user.role not in (...)`), the
+        # precedent `test_evidence_set_delete_visible_non_owner_is_403` already establishes for
+        # exactly this kind of check elsewhere in this router.
+        if solution.user_id != user.id and user.role not in (UserRole.analyst, UserRole.admin):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only the saving user (or an admin/analyst) may read back this solution's policy.",
             )
         variable_values = solution.variable_values
 
@@ -1182,6 +1232,7 @@ def _sweep_node(
     sweep_node_name: str,
     target: str,
     target_state: str | None,
+    states: list[str] | None = None,
 ) -> dict[str, float]:
     """`{state_label: target_value}` for every state of `sweep_node_name`.
 
@@ -1197,9 +1248,14 @@ def _sweep_node(
     `entry.lock` for the whole sweep and are responsible for restoring `engine`'s evidence back to
     `base_evidence` afterward, since a cached engine is shared across later calls on the same
     cache key.
+
+    `states`: sweep exactly these states instead of `sweep_node_name`'s full label list -- lets a
+    caller (`/sensitivity`) exclude a state it already knows is ~impossible under `base_evidence`
+    *before* spending a `setEvidence`/`makeInference` call on it, rather than discarding the result
+    afterward. `None` (default, and always for `/voi`'s own call): sweep every state, unchanged.
     """
     label_lists: dict[str, list[str]] = {variable.name: variable.labels for variable in network.variables}
-    labels = label_lists[sweep_node_name]
+    labels = states if states is not None else label_lists[sweep_node_name]
 
     values: dict[str, float] = {}
     for state in labels:
@@ -1207,6 +1263,21 @@ def _sweep_node(
         engine.makeInference()
         values[state] = _resolve_target_value(engine, network, annotation, target, target_state)
     return values
+
+
+_SENSITIVITY_NEGLIGIBLE_MARGINAL = 1e-6
+"""A swept state with its own marginal probability below this, under the base evidence alone, is
+excluded from `/sensitivity`'s results entirely -- pyAgrum doesn't raise on near-impossible
+evidence, so hard-pinning such a state would otherwise produce a numerically meaningless value
+that still ends up in the tornado chart."""
+
+_MAX_SENSITIVITY_SWEEP_NODES = 50
+"""Hard cap on how many chance nodes one `/sensitivity` request may sweep (after `nodes`
+filtering, if given). Each swept node costs `Sigma|states|` `setEvidence`/`makeInference` calls on
+a synchronous endpoint -- unconditionally sweeping every chance node in a large network (no `nodes`
+filter given at all) could otherwise run an unbounded number of inference calls per request, the
+same worker-blocking concern `_SERVER_MAX_CLUSTER_SIZE` already guards against for `/compile`.
+Picked generously for a tornado chart, which is normally read a handful of bars at a time anyway."""
 
 
 class SensitivityRequest(BaseModel):
@@ -1220,6 +1291,10 @@ class SensitivityRequest(BaseModel):
     target_state: str | None = None
     """Required when `target` is a chance/decision node rather than an objective symbol -- see
     `_resolve_target_value`."""
+    nodes: list[str] | None = None
+    """Restrict the sweep to these chance nodes only (still excluding `target`/already-evidenced
+    ones). `None` (default): sweep every chance node in the network, as before -- subject to
+    `_MAX_SENSITIVITY_SWEEP_NODES`."""
 
 
 class SensitivityNodeResult(BaseModel):
@@ -1227,7 +1302,10 @@ class SensitivityNodeResult(BaseModel):
 
     node: str
     values: dict[str, float]
-    """State label -> `target`'s value with `node` hard-pinned to that state."""
+    """State label -> `target`'s value with `node` hard-pinned to that state. Omits any state
+    whose own marginal probability under the base `evidence` is ~0 (below `1e-6`) -- pyAgrum
+    doesn't raise on such near-impossible evidence, so hard-pinning it would otherwise produce a
+    numerically meaningless value in the tornado chart."""
     low: float
     high: float
     swing: float
@@ -1241,8 +1319,11 @@ class SensitivityResponse(BaseModel):
     """`target`'s own value under `evidence` exactly as given, no sweep -- the tornado's reference
     line."""
     results: list[SensitivityNodeResult]
-    """One entry per chance node other than `target`/already in `evidence`, sorted descending by
-    `swing` -- the standard tornado-diagram ordering, biggest bar first."""
+    """One entry per swept chance node -- every chance node other than `target`/already in
+    `evidence`, or, when `SensitivityRequest.nodes` is given, only those (still excluding
+    `target`/already-evidenced ones) -- sorted descending by `swing` -- the standard
+    tornado-diagram ordering, biggest bar first. A candidate node all of whose own states are
+    ~impossible under the base evidence is omitted entirely (see `SensitivityNodeResult.values`)."""
 
 
 @router.post("/sensitivity")
@@ -1262,13 +1343,22 @@ def sensitivity(
     nodes for the same reason `/whatif`'s own evidence is (see `_validate_chance_evidence`).
 
     Raises:
-        HTTPException: 404 if the problem doesn't exist, isn't visible to `user`, or has no
-            `GraphicalModelMetaData`; 400 if `evidence` references a non-chance node, if `target`
-            isn't a chance/decision/objective node of this diagram, or if `target` is a chance/
-            decision node and `target_state` is missing/invalid; 501 if `target` is an objective
-            and the diagram has more than one objective and at least one decision (see
-            `_compute_utilities`).
+        HTTPException: 401 for a guest user (this endpoint can trigger `Sigma|states|` expensive
+            inference calls much like `/compile`'s own concern); 404 if the problem doesn't exist,
+            isn't visible to `user`, or has no `GraphicalModelMetaData`; 400 if `evidence`
+            references a non-chance node, if `target` isn't a chance/decision/objective node of
+            this diagram, if `target` is a chance/decision node and `target_state` is
+            missing/invalid, if `nodes` references a node that isn't a chance node, or if the
+            number of nodes to sweep (after `nodes` filtering, if given) exceeds
+            `_MAX_SENSITIVITY_SWEEP_NODES`; 501 if `target` is an objective and the diagram has
+            more than one objective and at least one decision (see `_compute_utilities`).
     """
+    if user.role == UserRole.guest:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Guest users are not allowed to run sensitivity analysis on graphical models.",
+        )
+
     problem_db = fetch_problem_with_role_check(user, request.problem_id, db_session)
     if problem_db is None:
         raise HTTPException(
@@ -1280,6 +1370,34 @@ def sensitivity(
     annotation = DecisionAnnotation.model_validate_json(meta.annotation_json)
 
     _validate_chance_evidence(network, request.evidence)
+
+    # (a) `nodes` filter: restrict the sweep to these chance nodes only, still excluding `target`/
+    # already-evidenced ones. (b) cap: bound how many nodes one request may sweep, applied after
+    # the filter -- see `_MAX_SENSITIVITY_SWEEP_NODES`'s own docstring.
+    chance_node_names = {variable.name for variable in network.variables}
+    candidate_names = [
+        variable.name
+        for variable in network.variables
+        if variable.name != request.target and variable.name not in request.evidence
+    ]
+    if request.nodes is not None:
+        unknown_nodes = sorted(set(request.nodes) - chance_node_names)
+        if unknown_nodes:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"'nodes' references node(s) that aren't DiscreteNetwork chance nodes: {unknown_nodes}.",
+            )
+        requested = set(request.nodes)
+        candidate_names = [name for name in candidate_names if name in requested]
+    if len(candidate_names) > _MAX_SENSITIVITY_SWEEP_NODES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Sweeping {len(candidate_names)} node(s) exceeds the server limit of "
+                f"{_MAX_SENSITIVITY_SWEEP_NODES} per /sensitivity request -- narrow 'nodes'."
+            ),
+        )
+
     cache_key = _resolve_cache_key(user, request.session_id, request.problem_id, db_session)
     entry = _get_or_build_entry(cache_key, meta.network_json, meta.annotation_json, network, annotation)
 
@@ -1290,23 +1408,43 @@ def sensitivity(
             entry.engine.makeInference()
             base_value = _resolve_target_value(entry.engine, network, annotation, request.target, request.target_state)
 
+            # Each candidate's own marginal under `request.evidence` alone (before any sweeping
+            # mutates the engine's evidence) -- used below to drop a swept state whose own
+            # probability is ~0 given the rest of the evidence: pyAgrum doesn't raise on
+            # near-impossible evidence, so hard-pinning such a state produces a numerically
+            # meaningless value that would otherwise still end up in the tornado chart.
+            label_lists = {variable.name: variable.labels for variable in network.variables}
+            base_marginals = {
+                name: dict(
+                    zip(label_lists[name], np.asarray(entry.engine.posterior(name).toarray()).tolist(), strict=True)
+                )
+                for name in candidate_names
+            }
+
             results: list[SensitivityNodeResult] = []
-            for variable in network.variables:
-                if variable.name == request.target or variable.name in request.evidence:
+            for name in candidate_names:
+                surviving_states = [
+                    state
+                    for state in label_lists[name]
+                    if base_marginals[name][state] >= _SENSITIVITY_NEGLIGIBLE_MARGINAL
+                ]
+                if not surviving_states:
+                    # Every one of this node's own states is ~impossible under the base evidence
+                    # (shouldn't happen for a normalised CPT, but defensively skip rather than
+                    # crash on an empty min/max below).
                     continue
                 values = _sweep_node(
                     entry.engine,
                     network,
                     annotation,
                     request.evidence,
-                    variable.name,
+                    name,
                     request.target,
                     request.target_state,
+                    states=surviving_states,
                 )
                 low, high = min(values.values()), max(values.values())
-                results.append(
-                    SensitivityNodeResult(node=variable.name, values=values, low=low, high=high, swing=high - low)
-                )
+                results.append(SensitivityNodeResult(node=name, values=values, low=low, high=high, swing=high - low))
         except gum.GumException as e:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
         finally:
@@ -1502,6 +1640,29 @@ class DemoIrrigationRequest(BaseModel):
     an explicit opt-in rather than being the only behaviour."""
 
 
+def _demo_irrigation_metadata_matches(problem_id: int, db_session: Session) -> bool:
+    """Whether `problem_id` actually carries a `GraphicalModelMetaData` row matching the demo.
+
+    Backs `compile_demo_irrigation_model`'s idempotency lookup: matching on `ProblemDB.name` +
+    `user_id` alone would also silently adopt a same-named problem created through the ordinary
+    `/problem/add` path (which carries no `GraphicalModelMetaData` at all), or a genuinely
+    different diagram someone happened to save under this exact name -- neither is actually "the"
+    irrigation demo. Compared against `build_irrigation_demo()`'s own serialized network, the same
+    "most precise, fully compiled" signal `/structure` and friends already trust, rather than
+    anything looser (e.g. just "has some `GraphicalModelMetaData`").
+    """
+    row = db_session.exec(
+        select(GraphicalModelMetaData)
+        .join(ProblemMetaDataDB, GraphicalModelMetaData.metadata_id == ProblemMetaDataDB.id)
+        .where(ProblemMetaDataDB.problem_id == problem_id)
+        .order_by(GraphicalModelMetaData.id.desc())
+    ).first()
+    if row is None:
+        return False
+    demo_network, _demo_annotation = build_irrigation_demo()
+    return row.network_json == demo_network.model_dump_json()
+
+
 @router.post("/demo/irrigation")
 def compile_demo_irrigation_model(
     request: DemoIrrigationRequest,
@@ -1524,13 +1685,18 @@ def compile_demo_irrigation_model(
     meaning every browser tab, every reload without a live `sessionStorage` cache, and every
     "Recompile demo" click accumulated a fresh, never-cleaned-up
     `"CUMULUS network demo (irrigation)"` entry. Unless `request.force` is set, this now looks for
-    a `ProblemDB` already owned by `user` with that exact name (matching on the demo's fixed,
-    unique-enough-for-this-purpose name rather than diffing serialized network JSON, which would
-    be more precise but is unneeded precision for a canned, never-parameterised demo model) and
-    returns its `problem_id` instead of recompiling -- the most recently compiled one, if somehow
-    more than one exists (e.g. from before this fix, or from an explicit `force=True` call).
-    `force=True` bypasses this lookup entirely and always compiles fresh, for the webui's own
-    "Recompile demo" button.
+    a `ProblemDB` already owned by `user` with that exact name, *and* carrying a
+    `GraphicalModelMetaData` row whose own network actually matches `build_irrigation_demo()`'s
+    (see `_demo_irrigation_metadata_matches`) -- name alone isn't enough: a review pass caught a
+    same-named problem created through the ordinary `/problem/add` path (or a different diagram
+    saved under this exact name) getting silently adopted as if it were the demo. A name match
+    that doesn't also qualify falls through to a fresh compile rather than being adopted. The
+    lookup itself only inspects the single most-recently-created row with this name, not the
+    most-recent *qualifying* one -- so a higher-id, same-named-but-unrelated row (e.g. from
+    `/problem/add`) shadows an older genuine demo copy and forces a redundant fresh compile. This
+    self-heals after that one extra compile, though: the fresh copy is itself the new
+    highest-id row with this name, so it qualifies on every call after. `force=True` bypasses
+    this lookup entirely and always compiles fresh, for the webui's own "Recompile demo" button.
 
     Raises:
         HTTPException: whatever `compile_graphical_model` itself raises (401 for a guest user; a
@@ -1543,7 +1709,7 @@ def compile_demo_irrigation_model(
             .where(ProblemDB.user_id == user.id, ProblemDB.name == _DEMO_IRRIGATION_PROBLEM_NAME)
             .order_by(ProblemDB.id.desc())
         ).first()
-        if existing is not None:
+        if existing is not None and _demo_irrigation_metadata_matches(existing.id, db_session):
             return CompileResponse(problem_id=existing.id)
 
     network, annotation = build_irrigation_demo()
@@ -1620,12 +1786,36 @@ def solve_graphical_model(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=f"No compatible solver found for problem {problem_id}."
         )
+
+    # A compiled graphical diagram's `z` variables are always binary, so `variable_domain` is
+    # `integer` or `mixed` for essentially every real diagram. `find_compatible_solvers`'s own
+    # vetted list can still include `CVXPYSolver` in that case purely on convexity grounds
+    # (`check_cvxpy_suitability` doesn't check for a MIP-capable backend at all) -- a review pass
+    # caught the earlier "fall back to a vetted solver" fix (below) not actually preventing its own
+    # target scenario, since `CVXPYSolver` being vetted-but-not-MIP-capable means plain `in solvers`
+    # membership isn't enough on a license-less machine with no MIP-capable CVXPY backend
+    # installed. Narrow to solvers known to actually handle MILPs before applying that fallback.
+    if problem.variable_domain in (VariableDomainTypeEnum.integer, VariableDomainTypeEnum.mixed):
+        # `PyomoBonminSolver` (BONMIN) is a real MINLP/branch-and-bound solver that handles binary
+        # `z` vars fine -- it's the one `find_compatible_solvers` itself appends specifically
+        # *because* `variable_domain` is `integer`/`mixed` (see its own "mixed integer" branch), so
+        # leaving it out of this allowlist would reject the one MIP-capable solver actually present
+        # on a machine with `bonmin` installed but no Gurobi/cbc.
+        mip_capable_solvers = {GurobipySolver, PyomoGurobiSolver, PyomoCBCSolver, PyomoBonminSolver}
+        solvers = [solver for solver in solvers if solver in mip_capable_solvers]
+        if not solvers:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"No compatible MIP-capable solver found for problem {problem_id}.",
+            )
+
     # `guess_best_solver` never returns nothing -- it falls through to `NevergradGenericSolver` --
     # and its own branch order differs from `find_compatible_solvers`'s (a review pass caught this
     # landing on `CVXPYSolver` instead of `GurobipySolver` for a mixed-integer diagram on a machine
     # without a Gurobi license, raising an unhandled `cvxpy` exception when the local CVXPY install
     # lacks a MIP-capable backend). Trust the guess only when it's actually one of the solvers
-    # `find_compatible_solvers` itself already vetted; fall back to its own first choice otherwise.
+    # `find_compatible_solvers` itself already vetted (and, above, actually MIP-capable when
+    # needed); fall back to its own first choice otherwise.
     solver_class = guess_best_solver(problem)
     if solver_class not in solvers:
         solver_class = solvers[0]

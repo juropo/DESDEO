@@ -27,6 +27,6 @@ export async function defaultFetchPolicy(
 		signal
 	});
 	if (!res.ok) throw new Error(`Failed to fetch solved policy (status ${res.status})`);
-	const result: { policy: NetworkPolicy } = await res.json();
+	const result = (await res.json()) as { policy: NetworkPolicy };
 	return result.policy;
 }

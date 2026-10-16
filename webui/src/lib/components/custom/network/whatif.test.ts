@@ -92,7 +92,7 @@ describe('createWhatIfRunner', () => {
 
 	it('a slower earlier request resolving after a faster later one is discarded, not clobbering', async () => {
 		const { runner, onResult } = makeRunner();
-		let resolveSlow: (value: string) => void = () => {};
+		let resolveSlow: (value: string) => void = () => undefined;
 		const slow = new Promise<string>((resolve) => {
 			resolveSlow = resolve;
 		});

@@ -57,7 +57,7 @@
 	async function defaultFetchStructure(modelId: string | number): Promise<NetworkModel> {
 		const res = await fetch(`/api/graphical/${modelId}/structure`);
 		if (!res.ok) throw new Error(`Failed to fetch network structure (status ${res.status})`);
-		return res.json();
+		return res.json() as Promise<NetworkModel>;
 	}
 
 	/**
@@ -95,12 +95,12 @@
 			signal
 		});
 		if (!res.ok) throw new Error(`Failed to fetch what-if result (status ${res.status})`);
-		const result: {
+		const result = (await res.json()) as {
 			posteriors: NetworkPosteriors;
 			policy?: NetworkPolicy;
 			utilities?: NetworkUtilities;
 			utility_std_devs?: NetworkUtilityStdDevs;
-		} = await res.json();
+		};
 		const withUtilPrefix = <T extends Record<string, number>>(map: T | undefined): T | undefined =>
 			map
 				? (Object.fromEntries(
@@ -218,8 +218,6 @@
 	let evidence = $state<NetworkEvidence>({});
 	let posteriors = $state<NetworkPosteriors | undefined>(undefined);
 	let policy = $state<NetworkPolicy | undefined>(undefined);
-	let utilities = $state<NetworkUtilities | undefined>(undefined);
-	let utilityStdDevs = $state<NetworkUtilityStdDevs | undefined>(undefined);
 	let loading = $state(true);
 	// Fatal -- replaces the whole pane below, the same as this component's single `error` used to.
 	let structureError = $state<string | null>(null);
@@ -282,8 +280,6 @@
 			// `undefined` -- a what-if response that legitimately carries no policy for the current
 			// evidence must clear a previously-solved one, not leave a stale checkmark showing.
 			policy = result.policy;
-			utilities = result.utilities;
-			utilityStdDevs = result.utilityStdDevs;
 			whatIfError = null;
 			onWhatIfResult?.(result);
 		},
@@ -330,8 +326,6 @@
 		evidence = {};
 		posteriors = undefined;
 		policy = undefined;
-		utilities = undefined;
-		utilityStdDevs = undefined;
 		priorPosteriors = undefined;
 		committedEvidence = {};
 		committedPosteriors = undefined;

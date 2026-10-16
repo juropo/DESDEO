@@ -142,6 +142,9 @@ class ObjectiveNode(BaseModel):
         if self.symbol in self.parents:
             msg = f"Objective '{self.symbol}' cannot depend on itself."
             raise ValueError(msg)
+        if len(set(self.parents)) != len(self.parents):
+            msg = f"Objective '{self.symbol}' has duplicate entries in parents: {self.parents}."
+            raise ValueError(msg)
         return self
 
 
@@ -183,6 +186,13 @@ class DiagramConstraint(BaseModel):
     """MathJSON expression over `nodes`, in the same standard form `Constraint.func` uses --
     left-hand side only, compared against zero by `cons_type`."""
     cons_type: ConstraintTypeEnum = ConstraintTypeEnum.LTE
+
+    @model_validator(mode="after")
+    def _check_func_not_empty(self) -> Self:
+        if len(self.func) == 0:
+            msg = f"DiagramConstraint '{self.symbol}' must have a non-empty func."
+            raise ValueError(msg)
+        return self
 
 
 class RiskMeasureKind(StrEnum):

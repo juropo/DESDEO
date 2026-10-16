@@ -143,7 +143,7 @@ export function computeDelta(
 	baseline: number[] | undefined,
 	current: number[] | undefined
 ): number[] | null {
-	if (!baseline || !current || baseline.length !== current.length) return null;
+	if (!baseline || baseline.length !== current?.length) return null;
 	return current.map((value, index) => value - baseline[index]);
 }
 

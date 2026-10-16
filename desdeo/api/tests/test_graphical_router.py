@@ -10,10 +10,13 @@ entries from an earlier test in the same pytest process could otherwise make a l
 "was the engine actually rebuilt/reused" assertions non-deterministic (see `_clear_engine_cache`).
 """
 
+import numpy as np
 import pyagrum as gum
 import pytest
 from fastapi.testclient import TestClient
 from sqlmodel import Session, select
+
+import desdeo.tools.utils as tools_utils
 
 from desdeo.api.models import (
     GraphicalModelMetaData,
@@ -232,6 +235,57 @@ def test_compile_bad_annotation_returns_400(client: TestClient, session_and_user
     payload = {"network": network.model_dump(mode="json"), "annotation": bad_annotation.model_dump(mode="json")}
     response = post_json(client, "/graphical/compile", payload, access_token)
     assert response.status_code == 400
+
+
+def test_compile_many_small_disjoint_clusters_exceeding_total_cap_is_400(
+    client: TestClient, session_and_user: dict, monkeypatch: pytest.MonkeyPatch
+):
+    """Many small, disjoint-clique clusters whose *sum* exceeds the total cap are a clean 400.
+
+    Regression test for a review-pass finding: `_SERVER_MAX_CLUSTER_SIZE` only bounds the single
+    largest cluster -- a network built from many small, independent cliques (here, chained through
+    one tiny shared `Root` node, since `build_rooted_junction_tree` requires a single connected
+    component) can produce an arbitrarily large *total* compiled `Problem` without ever tripping
+    that per-cluster cap. `_SERVER_MAX_TOTAL_CLUSTER_SIZE` is monkeypatched down to a small value
+    so this is exercisable with a network small enough to fit comfortably in a test payload -- the
+    fixture below (5 independent `A_i -> B_i` pairs, cardinality 20) has a largest single cluster
+    of 400 (`B_i`'s own clique), far under even the *real* `_SERVER_MAX_CLUSTER_SIZE` (200_000),
+    and would never have tripped any cap that only looks at the largest cluster.
+    """
+    monkeypatch.setattr(graphical_router, "_SERVER_MAX_TOTAL_CLUSTER_SIZE", 1000)
+
+    access_token = login(client)
+
+    n_pairs, card = 5, 20
+    variables = [DiscreteVariable(name="Root", labels=["r0", "r1"])]
+    arcs: list[tuple[str, str]] = []
+    potentials = {"Root": Potential(variables=["Root"], shape=[2], values=[0.5, 0.5])}
+    for i in range(n_pairs):
+        a_name, b_name = f"A{i}", f"B{i}"
+        variables.append(DiscreteVariable(name=a_name, labels=[f"a{i}_{j}" for j in range(card)]))
+        variables.append(DiscreteVariable(name=b_name, labels=[f"b{i}_{j}" for j in range(card)]))
+        arcs.append(("Root", a_name))
+        arcs.append((a_name, b_name))
+        potentials[a_name] = Potential(
+            variables=[a_name, "Root"], shape=[card, 2], values=(np.ones((card, 2)) / card).tolist()
+        )
+        potentials[b_name] = Potential(
+            variables=[b_name, a_name], shape=[card, card], values=(np.ones((card, card)) / card).tolist()
+        )
+
+    network = DiscreteNetwork(variables=variables, arcs=arcs, potentials=potentials)
+    annotation = DecisionAnnotation(
+        objectives=[
+            ObjectiveNode(
+                symbol="f1", parents=["Root"], utility=Potential(variables=["Root"], shape=[2], values=[0.0, 1.0])
+            )
+        ]
+    )
+
+    payload = {"network": network.model_dump(mode="json"), "annotation": annotation.model_dump(mode="json")}
+    response = post_json(client, "/graphical/compile", payload, access_token)
+    assert response.status_code == 400, response.text
+    assert "combined" in response.json()["detail"].lower()
 
 
 def test_compile_guest_rejected(client: TestClient, session_and_user: dict):
@@ -868,6 +922,54 @@ def test_policy_via_solution_id(client: TestClient, session_and_user: dict):
     assert response.json()["policy"] == {"D": "s0"}
 
 
+@pytest.mark.gurobipy
+def test_policy_solution_id_visible_non_owner_is_403(client: TestClient, session_and_user: dict):
+    """A user who can see the problem (via a shared `Group`) but didn't save the solution gets 403.
+
+    Regression test for a review-pass finding: the `solution_id` path only checked
+    `solution.problem_id`, never `solution.user_id` -- a user with group-visibility into the
+    problem but no ownership of this specific saved solution could read back its decoded policy.
+    Mirrors `test_evidence_set_delete_visible_non_owner_is_403`'s own role-aware ownership check
+    (`row.user_id != user.id and user.role not in (...)`), the precedent this fix follows.
+    """
+    session: Session = session_and_user["session"]
+    owner = session_and_user["user"]
+    access_token = login(client)
+
+    problem = session.exec(select(ProblemDB)).first()
+    network = _decision_network()
+    annotation = _decision_annotation()
+    _persist_graphical_metadata_with_index_map(session, problem.id, network, annotation)
+
+    _, optimal_variables = _solved_decision_problem(network, annotation, "fmatch")
+
+    saved = UserSavedSolutionDB(
+        name="owner's solution",
+        objective_values={"fmatch": 10.0},
+        variable_values=optimal_variables,
+        solution_index=0,
+        user_id=owner.id,
+        problem_id=problem.id,
+    )
+    session.add(saved)
+    session.commit()
+    session.refresh(saved)
+
+    dm_user = User(username="dm_user_policy", password_hash=get_password_hash("dm_pw"), role=UserRole.dm, group="test")
+    session.add(dm_user)
+    session.commit()
+    session.refresh(dm_user)
+    dm_token = login(client, username="dm_user_policy", password="dm_pw")  # noqa: S106
+
+    group = Group(name="shared-policy", owner_id=owner.id, user_ids=[dm_user.id], problem_id=problem.id)
+    session.add(group)
+    session.commit()
+
+    payload = {"solution_id": saved.id, "evidence": {"A": "lo"}}
+    response = post_json(client, f"/graphical/{problem.id}/policy", payload, dm_token)
+    assert response.status_code == 403, response.text
+
+
 def test_policy_requires_exactly_one_of_variable_values_or_solution_id(client: TestClient, session_and_user: dict):
     """400 when neither, or both, of `variable_values`/`solution_id` are given."""
     session: Session = session_and_user["session"]
@@ -946,6 +1048,30 @@ def test_policy_wrong_length_z_symbol_is_400_not_500(client: TestClient, session
     _persist_graphical_metadata_with_index_map(session, problem.id, network, annotation)
 
     payload = {"variable_values": {"z_D": [1.0, 0.0, 1.0]}, "evidence": {}}
+    response = post_json(client, f"/graphical/{problem.id}/policy", payload, access_token)
+    assert response.status_code == 400, response.text
+
+
+def test_policy_scalar_z_symbol_entry_is_400_not_500(client: TestClient, session_and_user: dict):
+    """A bare scalar on a decision's own `z_symbol` entry is a clean 400, not an uncaught `TypeError`/500.
+
+    Regression test for a review-pass finding: `PolicyRequest.variable_values` was deliberately
+    widened to `dict[str, list[float] | float]` for the Phase 6 `RiskMeasure` `eta` case (a bare
+    scalar, not a length-1 list), but nothing stops a caller putting a bare scalar on a decision's
+    own `z_symbol` key instead -- `read_policy_from_solution` does `len(z_values)` on each
+    decision's `z_symbol` entry, and `len()` on a bare `float` raises `TypeError`, which used to
+    escape `_decode_solved_policy`'s `except (KeyError, ValueError)` uncaught (-> 500) instead of
+    the same clean 400 a wrong-length list already gets.
+    """
+    session: Session = session_and_user["session"]
+    access_token = login(client)
+
+    problem = session.exec(select(ProblemDB)).first()
+    network = _decision_network()
+    annotation = _decision_annotation()
+    _persist_graphical_metadata_with_index_map(session, problem.id, network, annotation)
+
+    payload = {"variable_values": {"z_D": 1.0}, "evidence": {}}
     response = post_json(client, f"/graphical/{problem.id}/policy", payload, access_token)
     assert response.status_code == 400, response.text
 
@@ -1347,6 +1473,108 @@ def test_sensitivity_bad_evidence_state_label_is_400_not_500(client: TestClient,
     assert response.status_code == 400, response.text
 
 
+def test_sensitivity_nodes_filter_restricts_sweep(client: TestClient, session_and_user: dict):
+    """`nodes` restricts the sweep to only the given node(s), not every chance node.
+
+    Regression test for a review-pass finding: `/sensitivity` used to unconditionally sweep every
+    chance node in the network with no way to narrow the request at all.
+    """
+    session: Session = session_and_user["session"]
+    access_token = login(client)
+
+    problem = session.exec(select(ProblemDB)).first()
+    network = _sensitivity_fixture_network()
+    annotation = _sensitivity_fixture_annotation()
+    _persist_graphical_metadata(session, problem.id, network, annotation)
+
+    payload = {"problem_id": problem.id, "evidence": {}, "target": "f1", "nodes": ["B"]}
+    response = post_json(client, "/graphical/sensitivity", payload, access_token)
+    assert response.status_code == 200, response.text
+    swept_nodes = {r["node"] for r in response.json()["results"]}
+    assert swept_nodes == {"B"}  # not {"A", "B", "C"} -- C is excluded by the filter
+
+
+def test_sensitivity_sweep_cap_exceeded_is_400(client: TestClient, session_and_user: dict, monkeypatch: pytest.MonkeyPatch):
+    """Exceeding `_MAX_SENSITIVITY_SWEEP_NODES` (after any `nodes` filtering) is a clean 400.
+
+    Regression test for a review-pass finding: `/sensitivity` had no cap at all on how many
+    chance nodes one request could sweep, each costing `Sigma|states|` inference calls on a
+    synchronous endpoint. Monkeypatches the cap down to `1` so this is exercisable with the small
+    fixture network (`B`/`C` are both swept by default, i.e. 2 candidates > 1).
+    """
+    monkeypatch.setattr(graphical_router, "_MAX_SENSITIVITY_SWEEP_NODES", 1)
+
+    session: Session = session_and_user["session"]
+    access_token = login(client)
+
+    problem = session.exec(select(ProblemDB)).first()
+    network = _sensitivity_fixture_network()
+    annotation = _sensitivity_fixture_annotation()
+    _persist_graphical_metadata(session, problem.id, network, annotation)
+
+    payload = {"problem_id": problem.id, "evidence": {}, "target": "f1"}
+    response = post_json(client, "/graphical/sensitivity", payload, access_token)
+    assert response.status_code == 400, response.text
+
+
+def test_sensitivity_guest_rejected(client: TestClient, session_and_user: dict):
+    """Guest users may not run `/sensitivity`, matching `/compile`'s own guest check.
+
+    Regression test for a review-pass finding: unlike `/compile` and `/demo/irrigation`,
+    `/sensitivity` had no guest-role check at all, despite triggering the same kind of
+    `Sigma|states|` expensive inference calls.
+    """
+    session: Session = session_and_user["session"]
+    guest = User(
+        username="guest_sensitivity", password_hash=get_password_hash("guest_pw"), role=UserRole.guest, group="test"
+    )
+    session.add(guest)
+    session.commit()
+
+    access_token = login(client, username="guest_sensitivity", password="guest_pw")  # noqa: S106
+    payload = {"problem_id": 1, "evidence": {}, "target": "f1"}
+    response = post_json(client, "/graphical/sensitivity", payload, access_token)
+    assert response.status_code == 401
+
+
+def test_sensitivity_excludes_near_impossible_state_from_values(client: TestClient, session_and_user: dict):
+    """A swept state whose own marginal under the base evidence is ~0 is excluded from `values`.
+
+    Regression test for a review-pass finding: pyAgrum doesn't raise on evidence with ~zero
+    probability, so hard-pinning a swept node to an already-near-impossible state (here, `B`'s own
+    `"lo"`, given prior probability `1e-9`) used to produce a numerically meaningless entry that
+    still ended up in the tornado chart.
+    """
+    session: Session = session_and_user["session"]
+    access_token = login(client)
+
+    problem = session.exec(select(ProblemDB)).first()
+    network = DiscreteNetwork(
+        variables=[
+            DiscreteVariable(name="A", labels=["lo", "hi"]),
+            DiscreteVariable(name="B", labels=["lo", "hi"]),
+        ],
+        arcs=[],
+        potentials={
+            "A": Potential(variables=["A"], shape=[2], values=[0.5, 0.5]),
+            "B": Potential(variables=["B"], shape=[2], values=[1e-9, 1 - 1e-9]),
+        },
+    )
+    annotation = DecisionAnnotation(
+        objectives=[
+            ObjectiveNode(symbol="f1", parents=["A"], utility=Potential(variables=["A"], shape=[2], values=[0.0, 100.0]))
+        ]
+    )
+    _persist_graphical_metadata(session, problem.id, network, annotation)
+
+    payload = {"problem_id": problem.id, "evidence": {}, "target": "f1"}
+    response = post_json(client, "/graphical/sensitivity", payload, access_token)
+    assert response.status_code == 200, response.text
+
+    results_by_node = {r["node"]: r for r in response.json()["results"]}
+    assert set(results_by_node["B"]["values"]) == {"hi"}  # "lo" (prob 1e-9) is excluded
+
+
 # --- POST /graphical/voi (Phase E) -----------------------------------------------------------------
 
 
@@ -1605,6 +1833,36 @@ def test_solve_visible_non_owner_succeeds(client: TestClient, session_and_user: 
     assert response.status_code == 200, response.text
 
 
+def test_solve_without_gurobi_license_never_crashes_on_cvxpy_mip(
+    client: TestClient, session_and_user: dict, monkeypatch: pytest.MonkeyPatch
+):
+    """License-less Gurobi: `/solve` picks a genuinely MIP-capable fallback, or a clean 400 --
+    never an unhandled CVXPY MIP-backend-missing crash.
+
+    Regression test for a review-pass finding: the "fall back to a vetted solver" fix didn't
+    actually prevent its own target scenario, since `CVXPYSolver` is itself in
+    `find_compatible_solvers`'s vetted list purely on convexity grounds (`check_cvxpy_suitability`
+    never checks for a MIP-capable backend) -- a license-less machine could still land on it for
+    this inherently mixed-integer-linear compiled diagram. Monkeypatches `check_gurobi_license` in
+    `desdeo.tools.utils` -- where `find_compatible_solvers`/`guess_best_solver` actually call it --
+    to simulate a license-less machine, rather than relying on this test environment's own Gurobi
+    license happening to be absent.
+    """
+    monkeypatch.setattr(tools_utils, "check_gurobi_license", lambda: False)
+
+    access_token = login(client)
+
+    compile_response = post_json(client, "/graphical/demo/irrigation", {}, access_token)
+    assert compile_response.status_code == 200, compile_response.text
+    problem_id = compile_response.json()["problem_id"]
+
+    response = post_json(client, f"/graphical/{problem_id}/solve", {"objective_symbol": "profit"}, access_token)
+    # Never a raw crash from an unhandled CVXPY MIP-backend-missing exception -- either a genuine
+    # solve (a real MIP-capable fallback, e.g. PyomoCBCSolver, actually worked) or a clean,
+    # documented 400 when no MIP-capable solver is available at all.
+    assert response.status_code in (200, 400), response.text
+
+
 def test_solve_non_graphical_problem_is_404(client: TestClient, session_and_user: dict):
     """`/solve` rejects an ordinary (non-graphical) `ProblemDB` -- same 404 every sibling endpoint gives.
 
@@ -1656,3 +1914,39 @@ def test_demo_irrigation_force_recompiles(client: TestClient, session_and_user: 
     third = post_json(client, "/graphical/demo/irrigation", {}, access_token)
     assert third.status_code == 200, third.text
     assert third.json()["problem_id"] == forced.json()["problem_id"]
+
+
+def test_demo_irrigation_rejects_impostor_same_name_different_diagram(client: TestClient, session_and_user: dict):
+    """A same-named `ProblemDB` whose `GraphicalModelMetaData` doesn't match the demo isn't adopted.
+
+    Regression test for a review-pass finding: the idempotency lookup matched on `ProblemDB.name`
+    + `user_id` alone -- a same-named problem created through the ordinary `/problem/add` path (or,
+    as exercised here, a genuinely different diagram compiled under this exact name) used to be
+    silently adopted as if it were the demo. Compiles an unrelated chain-network diagram under the
+    demo's own fixed name first, then confirms `/demo/irrigation` falls through to a fresh compile
+    of the real demo instead of returning the impostor's `problem_id`.
+    """
+    access_token = login(client)
+
+    impostor_network = _chain_network()
+    impostor_annotation = _no_decision_annotation()
+    impostor_payload = {
+        "network": impostor_network.model_dump(mode="json"),
+        "annotation": impostor_annotation.model_dump(mode="json"),
+        "name": graphical_router._DEMO_IRRIGATION_PROBLEM_NAME,
+    }
+    impostor_response = post_json(client, "/graphical/compile", impostor_payload, access_token)
+    assert impostor_response.status_code == 200, impostor_response.text
+    impostor_problem_id = impostor_response.json()["problem_id"]
+
+    demo_response = post_json(client, "/graphical/demo/irrigation", {}, access_token)
+    assert demo_response.status_code == 200, demo_response.text
+    demo_problem_id = demo_response.json()["problem_id"]
+
+    # The impostor (most recently created, same name) wasn't adopted -- a genuinely fresh demo
+    # problem was compiled instead.
+    assert demo_problem_id != impostor_problem_id
+
+    structure = get_json(client, f"/graphical/{demo_problem_id}/structure", access_token)
+    assert structure.status_code == 200
+    assert "irrigate" in {n["id"] for n in structure.json()["nodes"]}

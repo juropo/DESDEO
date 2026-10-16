@@ -111,6 +111,23 @@ def test_objective_node_self_dependency_raises():
         )
 
 
+def test_objective_node_duplicate_parents_raises():
+    """Duplicate entries in `parents` are rejected.
+
+    Regression test: a duplicate parent (e.g. `["A", "A"]`) used to pass construction cleanly and
+    only surface deep inside the compiler as a bare `IndexError` out of `_extract_expr` (an empty
+    projection group, since the off-diagonal states of a repeated-dimension target are
+    unreachable -- see `compile.py`'s `_group_flat_indices_by_projection`), instead of a clear
+    error naming the objective at the point the mistake was actually made.
+    """
+    with pytest.raises(ValidationError, match="duplicate entries in parents"):
+        ObjectiveNode(
+            symbol="F",
+            parents=["A", "A"],
+            utility=Potential(variables=["A", "A"], shape=[2, 2], values=[[0.0, 1.0], [2.0, 3.0]]),
+        )
+
+
 # ── RiskMeasure ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -215,6 +232,18 @@ def test_diagram_constraint_duplicate_symbol_with_objective_raises():
     constraint = DiagramConstraint(symbol="F", kind=DiagramConstraintKind.decision, nodes=["D"], func=["D"])
     with pytest.raises(ValidationError, match="must be unique across"):
         _annotation(constraints=[constraint])
+
+
+def test_diagram_constraint_empty_func_raises():
+    """An empty `func` is rejected at construction, not left to crash `operator = func[0]` later.
+
+    Regression test: `func == []` used to construct cleanly and only raise a bare `IndexError`
+    once the compiler (or any other code reading `func[0]`, e.g. `_substitute_at_nodes`) actually
+    tried to use it -- inconsistent with how other malformed-input cases in this module (duplicate
+    states, self-reference) are already schema-level rejections rather than compile-time crashes.
+    """
+    with pytest.raises(ValidationError, match="non-empty func"):
+        DiagramConstraint(symbol="C1", kind=DiagramConstraintKind.decision, nodes=["D"], func=[])
 
 
 # ── validate_against ─────────────────────────────────────────────────────────────────────────
