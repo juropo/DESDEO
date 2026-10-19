@@ -883,9 +883,13 @@ def summer_cabin_battery_robust_ev_problem(initial_soc: float = 0.0, n_panels_ma
     """Build a robust multi-objective problem from the split summer cabin battery scenario model.
 
     Wraps `summer_cabin_battery_problem_split_scenario` (4-leaf outage scenario tree) and adds
-    both worst-case robust and expected-value scalarization objectives for f_1 (electricity cost),
-    f_2 (investment cost), and f_3 (unmet demand).  Ideal and nadir bounds are computed via the
-    payoff table method so that scalarization functions can be properly scaled.
+    both worst-case robust and expected-value scalarization objectives for f_1 (electricity cost)
+    and f_3 (unmet demand). f_2 (investment cost) is excluded from both aggregations: it's an
+    investment decision made once up front, identical across every scenario leaf, so its
+    worst-case and expected value would just equal f_2 itself -- `build_combined_scenario_problem`
+    already keeps it as a single shared, unprefixed objective for exactly that reason. Ideal and
+    nadir bounds are computed via the payoff table method so that scalarization functions can be
+    properly scaled.
 
     Args:
         initial_soc: initial state of charge in kWh.
@@ -899,13 +903,13 @@ def summer_cabin_battery_robust_ev_problem(initial_soc: float = 0.0, n_panels_ma
     combined_problem, symbol_maps = build_combined_scenario_problem(scenario_model)
     combined_problem, _ = add_worst_case_robust(
         scenario_model=scenario_model,
-        symbols=["f_1", "f_2", "f_3"],
+        symbols=["f_1", "f_3"],
         combined=combined_problem,
         symbol_maps=symbol_maps,
     )
     combined_problem, _ = add_expected_value(
         scenario_model=scenario_model,
-        symbols=["f_1", "f_2", "f_3"],
+        symbols=["f_1", "f_3"],
         combined=combined_problem,
         symbol_maps=symbol_maps,
     )

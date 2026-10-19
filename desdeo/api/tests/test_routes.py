@@ -2,7 +2,9 @@
 
 import json
 import time
+from unittest import mock
 
+import pytest
 from fastapi import status
 from fastapi.testclient import TestClient
 from sqlmodel import select
@@ -32,6 +34,7 @@ from desdeo.api.models import (
     GDMScoreBandsInitializationRequest,
     GDMScoreBandsVoteRequest,
     GenericIntermediateSolutionResponse,
+    Group,
     GroupCreateRequest,
     GroupInfoRequest,
     GroupModifyRequest,
@@ -61,6 +64,7 @@ from desdeo.api.models import (
     StateDB,
     User,
     UserPublic,
+    UserRole,
 )
 from desdeo.api.models.nimbus import (
     NIMBUSInitializationResponse,
@@ -68,10 +72,12 @@ from desdeo.api.models.nimbus import (
     NIMBUSMultiplierResponse,
 )
 from desdeo.api.models.problem import ConstraintDB, ProblemMetaDataDB
-from desdeo.api.routers.user_authentication import create_access_token
+from desdeo.api.routers import cumulus as cumulus_router
+from desdeo.api.routers.user_authentication import create_access_token, get_password_hash
 from desdeo.emo.options.algorithms import rvea_options
 from desdeo.emo.options.templates import ReferencePointOptions
 from desdeo.gdm.score_bands import SCOREBandsGDMConfig
+from desdeo.mcdm.cumulus import CumulusError
 from desdeo.problem import Problem
 from desdeo.problem.testproblems import dtlz2, simple_knapsack_vectors
 from desdeo.problem.testproblems.simple_problem import simple_scenario_model
@@ -1463,6 +1469,199 @@ def test_cumulus_initialize(client: TestClient):
     assert len(result.all_solutions) == 1
 
 
+def test_cumulus_initialize_estimates_missing_ideal_nadir_for_owner(client: TestClient, session_and_user: dict):
+    """`/initialize` estimates ideal/nadir via a payoff table when they're missing, and persists.
+
+    E.g. a problem compiled from a graphical model has no ideal/nadir, which
+    `generate_starting_point` requires.
+    """
+    session = session_and_user["session"]
+    user = session_and_user["user"]
+    access_token = login(client)
+
+    # dtlz2 defines ideal/nadir, so clear them.
+    problem_db = ProblemDB.from_problem(dtlz2(5, 3), user=user)
+    session.add(problem_db)
+    session.commit()
+    session.refresh(problem_db)
+
+    for obj_db in problem_db.objectives:
+        obj_db.ideal = None
+        obj_db.nadir = None
+        session.add(obj_db)
+    session.commit()
+    session.refresh(problem_db)
+    assert all(obj_db.ideal is None for obj_db in problem_db.objectives)
+    assert all(obj_db.nadir is None for obj_db in problem_db.objectives)
+
+    request = CumulusInitializationRequest(problem_id=problem_db.id)
+    response = post_json(client, "/method/cumulus/initialize", request.model_dump(), access_token)
+
+    assert response.status_code == status.HTTP_200_OK, response.text
+
+    session.refresh(problem_db)
+    for obj_db in problem_db.objectives:
+        assert obj_db.ideal is not None
+        assert obj_db.nadir is not None
+
+
+def test_cumulus_initialize_persists_missing_ideal_nadir_for_non_owner_too(
+    client: TestClient, session_and_user: dict
+):
+    """A non-owner with only group-shared read access ALSO gets the estimate persisted.
+
+    The estimate depends only on the problem, so it is persisted regardless of ownership.
+    Otherwise later endpoints, which re-read the problem from the DB, would fail.
+    """
+    session = session_and_user["session"]
+    owner = session_and_user["user"]
+
+    problem_db = ProblemDB.from_problem(dtlz2(5, 3), user=owner)
+    session.add(problem_db)
+    session.commit()
+    session.refresh(problem_db)
+
+    for obj_db in problem_db.objectives:
+        obj_db.ideal = None
+        obj_db.nadir = None
+        session.add(obj_db)
+    session.commit()
+    session.refresh(problem_db)
+
+    dm_user = User(
+        username="dm_user_cumulus_init", password_hash=get_password_hash("dm_pw"), role=UserRole.dm, group="test"
+    )
+    session.add(dm_user)
+    session.commit()
+    session.refresh(dm_user)
+    dm_token = login(client, username="dm_user_cumulus_init", password="dm_pw")  # noqa: S106
+
+    group = Group(name="shared-cumulus-init", owner_id=owner.id, user_ids=[dm_user.id], problem_id=problem_db.id)
+    session.add(group)
+    session.commit()
+
+    request = CumulusInitializationRequest(problem_id=problem_db.id)
+    response = post_json(client, "/method/cumulus/initialize", request.model_dump(), dm_token)
+
+    assert response.status_code == status.HTTP_200_OK, response.text
+
+    session.refresh(problem_db)
+    for obj_db in problem_db.objectives:
+        assert obj_db.ideal is not None
+        assert obj_db.nadir is not None
+
+
+def test_cumulus_initialize_skips_payoff_table_when_ideal_nadir_already_set(client: TestClient):
+    """`/initialize` must not recompute ideal/nadir when they're already fully defined.
+
+    `problem_id=1` (dtlz2) already has ideal/nadir set, so `payoff_table_method` must not be
+    called.
+    """
+    access_token = login(client)
+
+    with mock.patch.object(
+        cumulus_router, "payoff_table_method", wraps=cumulus_router.payoff_table_method
+    ) as mocked_payoff_table_method:
+        request = CumulusInitializationRequest(problem_id=1)
+        response = post_json(client, "/method/cumulus/initialize", request.model_dump(), access_token)
+
+    assert response.status_code == status.HTTP_200_OK, response.text
+    mocked_payoff_table_method.assert_not_called()
+
+
+def test_cumulus_initialize_partial_missing_ideal_nadir_leaves_already_set_objective_untouched(
+    client: TestClient, session_and_user: dict
+):
+    """The fallback must only fill in the symbols that were actually missing, never overwrite.
+
+    `payoff_table_method` returns values for every objective. `f_1`'s bounds are set to values
+    the payoff table wouldn't produce, `(-123.5, 999.0)`, and `f_2`/`f_3` are left `None`. After
+    `/initialize`, `f_2`/`f_3` must be filled in and `f_1` must be unchanged.
+    """
+    session = session_and_user["session"]
+    user = session_and_user["user"]
+    access_token = login(client)
+
+    problem_db = ProblemDB.from_problem(dtlz2(5, 3), user=user)
+    session.add(problem_db)
+    session.commit()
+    session.refresh(problem_db)
+
+    untouched_ideal, untouched_nadir = -123.5, 999.0
+    for obj_db in problem_db.objectives:
+        if obj_db.symbol == "f_1":
+            obj_db.ideal = untouched_ideal
+            obj_db.nadir = untouched_nadir
+        else:
+            obj_db.ideal = None
+            obj_db.nadir = None
+        session.add(obj_db)
+    session.commit()
+    session.refresh(problem_db)
+
+    request = CumulusInitializationRequest(problem_id=problem_db.id)
+    response = post_json(client, "/method/cumulus/initialize", request.model_dump(), access_token)
+
+    assert response.status_code == status.HTTP_200_OK, response.text
+
+    session.refresh(problem_db)
+    for obj_db in problem_db.objectives:
+        if obj_db.symbol == "f_1":
+            assert obj_db.ideal == untouched_ideal
+            assert obj_db.nadir == untouched_nadir
+        else:
+            assert obj_db.ideal is not None
+            assert obj_db.nadir is not None
+
+
+def test_cumulus_initialize_skips_nonfinite_payoff_table_estimate(client: TestClient, session_and_user: dict):
+    """A non-finite (`NaN`/`inf`) payoff-table estimate must never be adopted or persisted.
+
+    A `NaN` would never be re-estimated, since it isn't `None`. `payoff_table_method` is patched
+    to return a `NaN` ideal for `f_2`, so `generate_starting_point` still raises, but `f_2.ideal`
+    must stay `None` while the finite estimates are persisted.
+    """
+    session = session_and_user["session"]
+    user = session_and_user["user"]
+    access_token = login(client)
+
+    problem_db = ProblemDB.from_problem(dtlz2(5, 3), user=user)
+    session.add(problem_db)
+    session.commit()
+    session.refresh(problem_db)
+
+    for obj_db in problem_db.objectives:
+        obj_db.ideal = None
+        obj_db.nadir = None
+        session.add(obj_db)
+    session.commit()
+    session.refresh(problem_db)
+
+    original_payoff_table_method = cumulus_router.payoff_table_method
+
+    def _poisoned_payoff_table_method(problem, solver=None):
+        estimated_ideal, estimated_nadir = original_payoff_table_method(problem, solver)
+        estimated_ideal = {**estimated_ideal, "f_2": float("nan")}
+        return estimated_ideal, estimated_nadir
+
+    with (
+        mock.patch.object(cumulus_router, "payoff_table_method", side_effect=_poisoned_payoff_table_method),
+        pytest.raises(CumulusError),
+    ):
+        request = CumulusInitializationRequest(problem_id=problem_db.id)
+        post_json(client, "/method/cumulus/initialize", request.model_dump(), access_token)
+
+    session.refresh(problem_db)
+    for obj_db in problem_db.objectives:
+        if obj_db.symbol == "f_2":
+            assert obj_db.ideal is None
+            # The nadir estimate for f_2 was still finite, so it should still have been adopted.
+            assert obj_db.nadir is not None
+        else:
+            assert obj_db.ideal is not None
+            assert obj_db.nadir is not None
+
+
 def test_cumulus_solve_asf_partial(client: TestClient):
     """Solve with ASF_PARTIAL and a partial reference point should succeed."""
     access_token = login(client)
@@ -1984,9 +2183,7 @@ def test_cumulus_modify_problem_does_not_claim_convexity_it_cannot_show(client: 
     assert constraint.is_twice_differentiable is True
 
 
-def test_cumulus_objective_constraint_derives_soft_constraint_properties(
-    client: TestClient, session_and_user: dict
-):
+def test_cumulus_objective_constraint_derives_soft_constraint_properties(client: TestClient, session_and_user: dict):
     """Soft constraints get their properties derived too.
 
     They are stored detached from the problem, but later solves hand them to
@@ -2348,9 +2545,7 @@ def test_cumulus_scenario_availability_after_combined_problem(client: TestClient
     combined_problem_id = init_response.json()["problem_id"]
     assert combined_problem_id != problem_id
 
-    response = get_json(
-        client, f"/method/cumulus/scenario-availability?problem_id={combined_problem_id}", access_token
-    )
+    response = get_json(client, f"/method/cumulus/scenario-availability?problem_id={combined_problem_id}", access_token)
 
     assert response.status_code == status.HTTP_200_OK
     data = response.json()

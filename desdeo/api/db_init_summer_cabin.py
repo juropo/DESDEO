@@ -4,6 +4,10 @@ Includes everything from db_init.py and adds:
 - summer_cabin_battery_robust_ev_problem with stripped objectives
   (only E_f_1, f_2, E_f_3 kept as objectives; all others demoted to extra functions)
 - SolutionDescriptionMetaData for that problem
+- summer_cabin_battery_problem_split_scenario's base problem plus its ScenarioModelDB
+  (for testing scenario detection in CUMULUS)
+- a cabin energy problem compiled from an influence diagram
+  (`desdeo.problem.graphical.demo.build_cabin_energy_demo`)
 
 Run from desdeo/api/:
     python db_init_summer_cabin.py
@@ -18,9 +22,16 @@ from sqlmodel import Session, SQLModel
 from desdeo.api.config import ServerConfig, SettingsConfig
 from desdeo.api.db import engine
 from desdeo.api.models import ProblemDB, User, UserRole
-from desdeo.api.models.problem import DescriptionPart, ProblemMetaDataDB, SolutionDescriptionMetaData
+from desdeo.api.models.problem import (
+    DescriptionPart,
+    GraphicalModelMetaData,
+    ProblemMetaDataDB,
+    SolutionDescriptionMetaData,
+)
 from desdeo.api.models.scenario import ScenarioModelDB
 from desdeo.api.routers.user_authentication import get_password_hash
+from desdeo.problem.graphical import build_rooted_junction_tree, compile_diagram
+from desdeo.problem.graphical.demo import build_cabin_energy_demo
 from desdeo.problem.schema import ExtraFunction, Objective
 from desdeo.problem.testproblems import dtlz2, river_pollution_problem, simple_knapsack
 from desdeo.problem.testproblems.summer_cabin_electricity import (
@@ -117,13 +128,14 @@ DESCRIPTION_PARTS = [
         format_spec=".0f",
         suffix=" €",
     ),
-    DescriptionPart(label="  Total investment cost", symbol="E_f_2", format_spec=".0f", suffix=" €"),
+    # f_2 doesn't vary by scenario, so there's no separate expected/worst-case variant -- this is
+    # the one, single investment-cost figure, shown once rather than duplicated under both headings.
+    DescriptionPart(label="  Total investment cost", symbol="f_2", format_spec=".0f", suffix=" €"),
     DescriptionPart(text="Expected performance:"),
     DescriptionPart(label="  Expected electricity cost", symbol="E_f_1", format_spec=".2f", suffix=" €"),
     DescriptionPart(label="  Expected unserved hours", symbol="E_f_3", format_spec=".2f", suffix=" h"),
     DescriptionPart(text="Worst-case performance:"),
     DescriptionPart(label="  Worst-case electricity cost", symbol="robust_f_1", format_spec=".2f", suffix=" €"),
-    DescriptionPart(label="  Worst-case investment cost", symbol="robust_f_2", format_spec=".0f", suffix=" €"),
     DescriptionPart(label="  Worst-case unserved hours", symbol="robust_f_3", format_spec=".1f", suffix=" h"),
 ]
 
@@ -246,6 +258,43 @@ if __name__ == "__main__":
             )
             session.add(desc_metadata_scenario)
             session.commit()
+
+            # Graphical model: a small Bayesian-network/influence-diagram-compiled cabin energy problem.
+            print("Building cabin energy graphical model...")
+            network, annotation = build_cabin_energy_demo()
+            rjt = build_rooted_junction_tree(network, annotation)
+            graphical_problem, index_map = compile_diagram(network, annotation, rjt=rjt)
+            graphical_problem = graphical_problem.model_copy(
+                update={
+                    "name": "Summer cabin energy management (graphical model)",
+                    "description": (
+                        "A Bayesian-network/influence-diagram-compiled cabin energy problem, with "
+                        "uncertainty over weather, solar output, and grid reliability, and a choice "
+                        "between grid and battery power."
+                    ),
+                }
+            )
+
+            # Same persistence pattern as `compile_graphical_model` in `routers/graphical.py`.
+            graphical_db = ProblemDB.from_problem(graphical_problem, user_analyst)
+            session.add(graphical_db)
+            session.flush()
+
+            graphical_metadata_db = ProblemMetaDataDB(problem_id=graphical_db.id)
+            session.add(graphical_metadata_db)
+            session.flush()
+
+            graphical_model_metadata = GraphicalModelMetaData(
+                metadata_id=graphical_metadata_db.id,
+                network_json=network.model_dump_json(),
+                annotation_json=annotation.model_dump_json(),
+                rjt_json=rjt.model_dump_json(),
+                index_map_json=index_map.model_dump_json(),
+            )
+            session.add(graphical_model_metadata)
+            session.commit()
+            session.refresh(graphical_db)
+            print(f"Summer cabin graphical model problem added (id={graphical_db.id}).")
 
         print("Done.")
 

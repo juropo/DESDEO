@@ -519,6 +519,28 @@ export async function apply_scenario_measures(
 	}
 }
 
+/**
+ * Applies the ideal/nadir bounds from `<NetworkPanel>`'s `onCommitEvidence` (keyed by objective
+ * symbol) to `problem`'s objectives. Local only; the backend has already persisted them.
+ *
+ * Returns `problem` itself when nothing changed, which is the common case since the backend
+ * sends the full bounds on every commit, so reactive dependents don't re-run needlessly.
+ */
+export function apply_network_bounds(
+	problem: ProblemInfo,
+	bounds: { ideal?: Record<string, number>; nadir?: Record<string, number> }
+): ProblemInfo {
+	let changed = false;
+	const objectives = problem.objectives.map((o) => {
+		const ideal = bounds.ideal?.[o.symbol] ?? o.ideal;
+		const nadir = bounds.nadir?.[o.symbol] ?? o.nadir;
+		if (ideal === o.ideal && nadir === o.nadir) return o;
+		changed = true;
+		return { ...o, ideal, nadir };
+	});
+	return changed ? { ...problem, objectives } : problem;
+}
+
 type UIConstraintType = '<=0' | '=0' | '<=0 (soft)' | '=0 (soft)';
 
 interface UIConstraint {

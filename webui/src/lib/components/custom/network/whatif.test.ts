@@ -4,8 +4,11 @@ import {
 	createDebouncer,
 	createWhatIfRunner,
 	dominantDeltaIndex,
+	fetchCommitBounds,
 	hasEvidenceDiverged
 } from './whatif';
+import { filterChanceEvidence } from './interaction';
+import type { NetworkModel } from './types';
 
 describe('createDebouncer', () => {
 	beforeEach(() => vi.useFakeTimers());
@@ -154,26 +157,18 @@ describe('createWhatIfRunner', () => {
 		runner.cancel();
 		expect(aborted).toBe(true);
 		expect(onResult).not.toHaveBeenCalled();
-		// onStale(true) fired on request(), but cancel() never calls onStale(false) itself --
-		// callers own resetting their own staleness flag on cancel if they need to.
+		// cancel() doesn't call onStale(false); resetting staleness is up to the caller.
 		expect(staleTransitions).toEqual([true]);
 	});
 
 	it('cancel() prevents callbacks even for a fetcher that ignores the abort signal entirely', async () => {
-		// The component doc comments are explicit that a caller-supplied `fetchWhatIf` is free to
-		// ignore `signal` -- `Promise.resolve('a')` below is exactly that: it never even looks at
-		// its `signal` argument, so `controller.abort()` alone changes nothing about whether it
-		// resolves. The only thing that can still stop `onResult`/`onStale(false)` from firing is
-		// `cancel()` bumping `generation` itself.
+		// This fetcher ignores `signal`, so only the generation guard can silence it.
 		const { runner, onResult, staleTransitions } = makeRunner();
 		runner.request(() => Promise.resolve('a'));
-		// Fires the debounce synchronously -- the fetcher runs and its `.then` is now a pending
-		// microtask, not yet processed (no `await`/microtask-flush has happened yet).
+		// Run the debounce; the fetcher's `.then` is now a pending microtask.
 		vi.advanceTimersByTime(150);
 		runner.cancel();
-		// Flush the pending microtask (the fetcher's already-resolved `.then`) without advancing
-		// any fake timers -- if `cancel()` didn't bump `generation`, this is exactly where the
-		// stale `onResult`/`onStale(false)` would fire.
+		// Flush microtasks; a stale result would fire here.
 		await Promise.resolve();
 		await Promise.resolve();
 		expect(onResult).not.toHaveBeenCalled();
@@ -224,6 +219,57 @@ describe('dominantDeltaIndex', () => {
 	it('respects a custom threshold', () => {
 		expect(dominantDeltaIndex([0.02, -0.03], 0.05)).toBeNull();
 		expect(dominantDeltaIndex([0.02, -0.03], 0.02)).toBe(1);
+	});
+});
+
+describe('fetchCommitBounds', () => {
+	it('calls fetchWhatIf with commit: true and no signal, and maps ideal/nadir through', async () => {
+		const fetchWhatIf = vi.fn().mockResolvedValue({
+			posteriors: {},
+			ideal: { f_1: 1.5 },
+			nadir: { f_1: 9.0 }
+		});
+		const result = await fetchCommitBounds(fetchWhatIf, 42, { weather: 'dry' });
+		expect(fetchWhatIf).toHaveBeenCalledWith(42, { weather: 'dry' }, undefined, true);
+		expect(result).toEqual({ bounds: { ideal: { f_1: 1.5 }, nadir: { f_1: 9.0 } } });
+	});
+
+	it('maps a null ideal/nadir (non-committing response shape) to undefined', async () => {
+		const fetchWhatIf = vi.fn().mockResolvedValue({ posteriors: {}, ideal: null, nadir: null });
+		const result = await fetchCommitBounds(fetchWhatIf, 42, {});
+		expect(result).toEqual({ bounds: { ideal: undefined, nadir: undefined } });
+	});
+
+	it('resolves to an error instead of rejecting when fetchWhatIf fails', async () => {
+		const fetchWhatIf = vi.fn().mockRejectedValue(new Error('boom'));
+		const result = await fetchCommitBounds(fetchWhatIf, 42, {});
+		expect(result.bounds).toBeUndefined();
+		expect(result.error).toBe('boom');
+	});
+
+	it('reports a non-Error rejection with a generic message rather than throwing', async () => {
+		const fetchWhatIf = vi.fn().mockRejectedValue('not an Error instance');
+		const result = await fetchCommitBounds(fetchWhatIf, 42, {});
+		expect(result.bounds).toBeUndefined();
+		expect(result.error).toBe('Failed to fetch commit bounds');
+	});
+
+	it('is never called with a decision-node key once the caller filters to chance evidence', async () => {
+		// Like `handleCommitEvidence`: in 'manual' mode the committed evidence can contain decision
+		// nodes, which must be filtered out before calling `fetchCommitBounds`.
+		const model: NetworkModel = {
+			nodes: [
+				{ id: 'weather', label: 'Weather', kind: 'chance', states: ['dry', 'wet'] },
+				{ id: 'irrigate', label: 'Irrigate', kind: 'decision', states: ['yes', 'no'] }
+			],
+			edges: []
+		};
+		const committed = { weather: 'dry', irrigate: 'yes' };
+		const fetchWhatIf = vi.fn().mockResolvedValue({ posteriors: {}, ideal: {}, nadir: {} });
+
+		await fetchCommitBounds(fetchWhatIf, 42, filterChanceEvidence(model, committed));
+
+		expect(fetchWhatIf).toHaveBeenCalledWith(42, { weather: 'dry' }, undefined, true);
 	});
 });
 

@@ -1,18 +1,7 @@
-"""Tests for `desdeo/problem/graphical/demo.py` -- Phase F of the graphical-models plan.
+"""Tests for `desdeo/problem/graphical/demo.py`.
 
-Not a production compiler fixture (see the plan's Phase F checklist item 1: "it doesn't need to be
-exhaustively tested like a production compiler fixture, but it does need `build_rooted_junction_
-tree`/`compile_diagram` to actually succeed on it"). Checked here: it does compile and solve, and
-the solved values agree with a from-first-principles hand computation over the network's own CPTs
-and the objectives' own utility tables -- an oracle check, not just "the solver returned success".
-
-`gurobipy` is marked per-test, not at module level (matching `desdeo/api/tests/
-test_graphical_router.py`'s own convention) -- a review pass caught the original module-level
-`pytestmark = [pytest.mark.graphical, pytest.mark.gurobipy]` marking every test here `gurobipy`
-even though only `test_profit_solve_matches_hand_computed_expectation` actually solves via
-`GurobipySolver`; the other two never touch gurobipy at all. That made `pytest -m "graphical and
-not gurobipy"` skip tests the plan's own checklist calls out as the ones it actually requires
-(validate_against succeeding, and the compiler itself accepting the diagram).
+Each fixture must compile and solve, and the solved values are checked against a hand computation
+over the network's CPTs and the objectives' utility tables.
 """
 
 import pytest
@@ -20,6 +9,10 @@ import pytest
 from desdeo.problem.graphical import build_rooted_junction_tree, compile_diagram
 from desdeo.problem.graphical.demo import (
     IRRIGATE_STATES,
+    POWER_SOURCE_STATES,
+    build_cabin_energy_annotation,
+    build_cabin_energy_demo,
+    build_cabin_energy_network,
     build_irrigation_demo,
     build_irrigation_demo_annotation,
     build_irrigation_demo_network,
@@ -37,7 +30,7 @@ def test_network_and_annotation_validate_against_each_other():
 
 
 def test_rjt_and_compile_succeed():
-    """The one thing the plan's checklist actually requires: the compiler accepts this diagram."""
+    """The compiler accepts the irrigation diagram."""
     network, annotation = build_irrigation_demo()
     rjt = build_rooted_junction_tree(network, annotation)
     problem, index_map = compile_diagram(network, annotation, rjt=rjt)
@@ -49,8 +42,8 @@ def test_rjt_and_compile_succeed():
 def _hand_computed_expected_profit() -> dict[str, float]:
     """Expected profit for each `irrigate` choice.
 
-    Computed directly from the network's own CPTs and the objective's own utility values --
-    independent of `compile_diagram`'s own machinery.
+    Computed directly from the network's CPTs and the objective's utility values, independently
+    of `compile_diagram`.
     """
     weather = {"dry": 0.3, "normal": 0.4, "wet": 0.3}
     soil_given_weather = {
@@ -104,6 +97,89 @@ def test_profit_solve_matches_hand_computed_expectation():
     expected = _hand_computed_expected_profit()
     best_choice = max(expected, key=expected.get)
     assert result.optimal_objectives["profit"] == pytest.approx(expected[best_choice], abs=1e-6)
-    # A genuine, non-trivial choice -- not every irrigation level ties, so this actually exercises
-    # the decision rather than being indifferent to it.
+    # The choices don't tie, so the decision actually matters.
     assert len(set(expected.values())) == len(expected)
+
+
+def test_cabin_energy_network_and_annotation_validate_against_each_other():
+    """`build_cabin_energy_demo` runs `validate_against` itself; also checked standalone here."""
+    network = build_cabin_energy_network()
+    annotation = build_cabin_energy_annotation()
+    annotation.validate_against(network)  # raises on failure
+
+
+def test_cabin_energy_rjt_and_compile_succeeds():
+    """The compiler accepts a diagram with two objectives and a decision."""
+    network, annotation = build_cabin_energy_demo()
+    rjt = build_rooted_junction_tree(network, annotation)
+    problem, index_map = compile_diagram(network, annotation, rjt=rjt)
+
+    assert {o.symbol for o in problem.objectives} == {"expected_cost", "expected_unmet_demand"}
+    assert set(index_map.decisions) == {"power_source"}
+
+
+def _hand_computed_expected_cabin_energy() -> dict[str, dict[str, float]]:
+    """Expected `expected_cost`/`expected_unmet_demand` for each `power_source` choice.
+
+    Computed directly from the network's CPTs and the objectives' utility values, independently
+    of `compile_diagram`.
+    """
+    weather = {"sunny": 0.6, "cloudy": 0.4}
+    solar_given_weather = {
+        "sunny": {"low": 0.2, "high": 0.8},
+        "cloudy": {"low": 0.8, "high": 0.2},
+    }
+    grid_outage = {"stable": 0.9, "outage": 0.1}
+
+    solar_marginal = {
+        state: sum(weather[w] * solar_given_weather[w][state] for w in weather) for state in ("low", "high")
+    }
+
+    cost = {
+        "grid": {"low": {"stable": 5.0, "outage": 50.0}, "high": {"stable": 5.0, "outage": 50.0}},
+        "battery": {"low": {"stable": 20.0, "outage": 20.0}, "high": {"stable": 0.0, "outage": 0.0}},
+    }
+    unmet_demand = {
+        "grid": {"low": {"stable": 0.0, "outage": 3.0}, "high": {"stable": 0.0, "outage": 3.0}},
+        "battery": {"low": {"stable": 1.0, "outage": 1.0}, "high": {"stable": 0.0, "outage": 0.0}},
+    }
+
+    expected_cost: dict[str, float] = {}
+    expected_unmet_demand: dict[str, float] = {}
+    for choice in POWER_SOURCE_STATES:
+        expected_cost[choice] = sum(
+            solar_marginal[solar] * grid_outage[grid] * cost[choice][solar][grid]
+            for solar in solar_marginal
+            for grid in grid_outage
+        )
+        expected_unmet_demand[choice] = sum(
+            solar_marginal[solar] * grid_outage[grid] * unmet_demand[choice][solar][grid]
+            for solar in solar_marginal
+            for grid in grid_outage
+        )
+    return {"expected_cost": expected_cost, "expected_unmet_demand": expected_unmet_demand}
+
+
+@pytest.mark.gurobipy
+def test_cabin_energy_solve_matches_hand_computed_expectation_and_conflicts():
+    """Minimizing `expected_cost` alone picks `battery`; minimizing `expected_unmet_demand` alone picks `grid`."""
+    network, annotation = build_cabin_energy_demo()
+    problem, _ = compile_diagram(network, annotation)
+    expected = _hand_computed_expected_cabin_energy()
+
+    cost_result = GurobipySolver(problem).solve("expected_cost")
+    assert cost_result.success, cost_result.message
+    best_cost_choice = min(expected["expected_cost"], key=expected["expected_cost"].get)
+    assert cost_result.optimal_objectives["expected_cost"] == pytest.approx(
+        expected["expected_cost"][best_cost_choice], abs=1e-6
+    )
+
+    unmet_result = GurobipySolver(problem).solve("expected_unmet_demand")
+    assert unmet_result.success, unmet_result.message
+    best_unmet_choice = min(expected["expected_unmet_demand"], key=expected["expected_unmet_demand"].get)
+    assert unmet_result.optimal_objectives["expected_unmet_demand"] == pytest.approx(
+        expected["expected_unmet_demand"][best_unmet_choice], abs=1e-6
+    )
+
+    # The objectives conflict.
+    assert best_cost_choice != best_unmet_choice
