@@ -41,13 +41,12 @@ from desdeo.api.models.cumulus import (
 from desdeo.api.models.generic import SolutionInfo
 from desdeo.api.models.generic_states import SolutionReference, SolutionReferenceResponse, StateKind
 from desdeo.api.models.problem import ConstraintDB, ProblemDB
-from desdeo.api.models.scenario import ScenarioModelDB
 from desdeo.api.models.state import CumulusClassificationState
 from desdeo.api.routers.problem import check_solver
 from desdeo.api.routers.user_authentication import get_current_user
 from desdeo.mcdm.cumulus import CumulusScalarization, generate_starting_point, solve_sub_problems
 from desdeo.mcdm.reference_point_method import rpm_intermediate_solutions
-from desdeo.problem import Problem, ScenarioModel
+from desdeo.problem import Problem
 from desdeo.problem.schema import Constraint
 from desdeo.tools import SolverResults, guess_best_solver
 from desdeo.tools.utils import payoff_table_method
@@ -62,6 +61,7 @@ from .utils import (
     copy_problem_metadata,
     get_solver_results_at,
     iter_states_of_kinds,
+    load_scenario_model,
 )
 
 router = APIRouter(prefix="/method/cumulus")
@@ -80,17 +80,6 @@ def _get_scenario_model_id(
         if sm_id is not None:
             return sm_id
     return None
-
-
-def _load_scenario_model(
-    scenario_model_id: int,
-    db_session: Session,
-) -> ScenarioModel | None:
-    """Load a :class:`ScenarioModel` from the DB given its id."""
-    sm_db = db_session.get(ScenarioModelDB, scenario_model_id)
-    if sm_db is None or sm_db.base_problem is None:
-        return None
-    return sm_db.to_scenario_model(base_problem=Problem.from_problemdb(sm_db.base_problem))
 
 
 def _get_objective_constraint_ids(
@@ -139,7 +128,7 @@ def solve_solutions(
 
     session_id = interactive_session.id if interactive_session else None
     scenario_model_id = _get_scenario_model_id(problem_db.id, session_id, db_session)
-    scenario_model = _load_scenario_model(scenario_model_id, db_session) if scenario_model_id is not None else None
+    scenario_model = load_scenario_model(scenario_model_id, db_session) if scenario_model_id is not None else None
 
     results_by_scalarization = solve_sub_problems(
         problem=problem,
