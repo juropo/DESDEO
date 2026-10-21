@@ -57,7 +57,7 @@ class Deviation(BaseModel):
     value: float
     """The design's outcome in this leaf, original direction."""
     improvement: float
-    """Change vs baseline normalised by the leaf's spread, positive = better."""
+    """Change vs baseline normalised by the leaf's spread (the objective's where it is 0), positive = better."""
     improvement_raw: float
     """Unnormalised change vs baseline, positive = better."""
     event_class: EventClass
@@ -296,6 +296,7 @@ def _event_class(
 def _objective_antifragility(
     vals: np.ndarray,
     spread: np.ndarray,
+    objective_spread: float,
     leaves: list[str],
     *,
     baseline_idx: int,
@@ -305,7 +306,10 @@ def _objective_antifragility(
     loss_floor: float | None,
     eps: float,
 ) -> ObjectiveAntifragility:
-    """Antifragility summary of one design and objective from its min-space values and per-leaf spreads."""
+    """Antifragility summary of one design and objective from its min-space values and spreads.
+
+    A deviation is normalised by its leaf's spread, or by ``objective_spread`` where that is 0.
+    """
     sign = -1.0 if maximize else 1.0
     min_floor = None if absolute_floor is None else sign * absolute_floor
     worst = None if np.isnan(vals).all() else float(np.nanmax(vals))
@@ -317,7 +321,8 @@ def _objective_antifragility(
             if li == baseline_idx or np.isnan(value):
                 continue
             imp_raw = float(base - value)
-            imp = imp_raw / spread[li] if spread[li] > 0 else 0.0
+            scale = spread[li] if spread[li] > 0 else objective_spread
+            imp = imp_raw / scale if scale > 0 else 0.0
             deviations.append(
                 Deviation(
                     leaf=leaves[li],
@@ -389,7 +394,9 @@ def antifragility(
 
     For each design and objective, every non-baseline leaf where the design has a value gives a deviation
     from the design's own outcome in ``baseline_leaf``, normalised by that leaf's spread (worst - best) over
-    the compared set of designs (deviation 0 where the spread is 0). D is the largest loss, U the largest
+    the compared set of designs. Where that spread is 0, e.g. when all designs share the same outcome, the
+    objective's spread over all leaves and designs is used instead, so a loss shared by all designs still
+    counts; only if that is also 0 is the deviation 0. D is the largest loss, U the largest
     (or mean) gain, and AF = (U - D) / (U + D + eps) lies in [-1, 1]: -1 means only downside, 1 only upside.
 
     For objectives with a floor, designs are classified following Taleb (*Antifragile*, 2012):
@@ -438,6 +445,9 @@ def antifragility(
     baseline_idx = leaves.index(baseline_leaf)
     arr = _fill_missing(arr, missing)
     _, spread = _leaf_best_and_spread(arr)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        objective_spread = np.nanmax(arr, axis=(0, 1)) - np.nanmin(arr, axis=(0, 1))
 
     return {
         design_id: Antifragility(
@@ -445,6 +455,7 @@ def antifragility(
                 obj: _objective_antifragility(
                     arr[di, :, oi],
                     spread[:, oi],
+                    float(objective_spread[oi]),
                     leaves,
                     baseline_idx=baseline_idx,
                     maximize=maximize[obj],

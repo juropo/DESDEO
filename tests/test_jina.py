@@ -126,8 +126,8 @@ def test_maximize_targets(model):
 
 
 def test_cvar_maximize_rejected(model):
-    """CVaR of a maximised objective is rejected."""
-    with pytest.raises(ValueError, match="CVaR"):
+    """CVaR of a maximised objective is rejected, naming the objective by name and symbol."""
+    with pytest.raises(ValueError, match=r"CVaR is not supported for maximised objectives: .+ \(f_3\)\."):
         build_jina_problem(_maximize_f_3(model), "aggregated", "cvar")
 
 

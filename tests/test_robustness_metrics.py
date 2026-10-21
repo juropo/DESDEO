@@ -279,6 +279,26 @@ def test_antifragility_zero_spread_and_missing():
     assert res["C"].objectives["f"].worst_outcome == pytest.approx(1.0)
 
 
+def test_antifragility_shared_loss_with_zero_leaf_spread():
+    """A loss all designs share in a leaf is normalised by the objective's spread over all leaves."""
+    outcomes = {
+        "A": {"base": {"f": 1.0}, "s1": {"f": 3.0}, "s2": {"f": 0.0}},
+        "B": {"base": {"f": 2.0}, "s1": {"f": 3.0}, "s2": {"f": 1.0}},
+    }
+    res = antifragility(outcomes, {"f": False}, "base", loss_floors={"f": 1.0})
+    a_f = res["A"].objectives["f"]
+    # Leaf s1 has zero spread over the designs; f spans 0..3 over all leaves and designs.
+    assert {d.leaf: d.improvement for d in a_f.deviations}["s1"] == pytest.approx(-2.0 / 3.0)
+    assert a_f.n_loss == 1
+    assert a_f.downside == pytest.approx(2.0 / 3.0)
+    assert a_f.max_loss_raw == pytest.approx(2.0)
+    assert a_f.taleb_class == "fragile"
+
+    # With the same value everywhere there is nothing to normalise by, so the deviations are 0.
+    flat = {"A": {"base": {"f": 1.0}, "s1": {"f": 1.0}}, "B": {"base": {"f": 1.0}, "s1": {"f": 1.0}}}
+    assert antifragility(flat, {"f": False}, "base")["A"].objectives["f"].deviations[0].improvement == 0.0
+
+
 def test_antifragility_errors():
     """Invalid baseline, floor keys and upside modes are rejected."""
     with pytest.raises(ValueError):
