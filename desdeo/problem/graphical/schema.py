@@ -1,24 +1,11 @@
 """`DecisionAnnotation`: the decision/objective overlay on top of a `DiscreteNetwork`.
 
-Phase 2 of `.claude/desdeo-graphical-models-plan.md`. `DiscreteNetwork` (Phase 1) is a pure
-Bayesian network: chance nodes and CPTs only, near-isomorphic to pyAgrum's `BayesNet`. Decision
-structure -- which choices exist, what an objective values, diagram-level constraints, and risk
-transforms -- lives here instead, referencing network nodes **by name** rather than embedding
-into the network itself. That separation is what lets `learn_network(data, structure=...)`
-(Phase 1) relearn CPTs from new data without disturbing decision modelling: the same
-`DecisionAnnotation` instance is expected to keep validating against a network whose DAG and
-variable domains are unchanged but whose potentials have been relearned.
+`DiscreteNetwork` holds only chance nodes and CPTs. Decisions, objectives, diagram-level
+constraints and risk measures live here and reference network nodes by name, so CPTs can be
+relearned (`learn_network(data, structure=...)`) without touching the annotation.
 
-Unlike `DiscreteNetwork`, this module's schemas aren't mirroring a pyAgrum data model, so they
-follow the rest of DESDEO's `Problem` convention instead: elements are addressed by `symbol`
-(matching `Variable`/`Objective`/`Constraint` in `problem/schema.py`), not by `name` the way
-`DiscreteNetwork`'s chance nodes are. `DiagramConstraint` reuses `ConstraintTypeEnum` from
-`problem/schema.py` for the same reason -- it is compiled into an ordinary `Constraint` in
-Phase 4/5, so the standard-form convention (`func <=/= 0`) should already match at this layer.
-
-This module does not import pyAgrum -- see the package-level dependency rule in the plan's
-cross-cutting section. It does import from `problem.schema`; that dependency runs one way only
-(nothing in `problem/schema.py` imports `problem/graphical`).
+Elements are addressed by `symbol`, like `Variable`/`Objective`/`Constraint` in
+`problem/schema.py`. Decision symbols and chance-node names must be disjoint.
 """
 
 from collections import Counter
@@ -35,13 +22,7 @@ CURRENT_SCHEMA_VERSION = 1
 
 
 def _check_unique_symbols(context: str, symbols: list[str]) -> None:
-    """Raise `ValueError` naming each symbol occurring more than once in `symbols`.
-
-    Mirrors `Problem.check_for_non_unique_symbols`'s `Counter`-based approach (`problem/schema.py`)
-    rather than a plain `len(symbols) != len(set(symbols))` check, so the error names each
-    colliding symbol and how many times it occurs. Shared by `_check_internal_structure`'s
-    per-group and cross-group uniqueness checks below.
-    """
+    """Raise `ValueError` naming each symbol occurring more than once in `symbols`."""
     counts = Counter(symbols)
     duplicates = {symbol: count for symbol, count in counts.items() if count > 1}
     if not duplicates:
@@ -55,14 +36,7 @@ def _check_unique_symbols(context: str, symbols: list[str]) -> None:
 def _check_references_known(
     owner_label: str, owner_symbol: str, field_label: str, refs: list[str], known: set[str]
 ) -> None:
-    """Raise `ValueError` naming any of `refs` not present in `known`.
-
-    Shared by `validate_against`'s `information_set`/`parents`/`nodes` cross-reference checks --
-    same "collect unknown references, raise if any" shape each time, varying only in whose
-    reference it is, the field's name (folded into `field_label`, e.g. `"parents reference"`,
-    to keep each check's grammar -- singular vs. plural subject -- exactly as before), and what
-    it's checked against.
-    """
+    """Raise `ValueError` naming any of `refs` not present in `known`."""
     unknown = [ref for ref in refs if ref not in known]
     if unknown:
         msg = f"{owner_label} '{owner_symbol}': {field_label} unknown node(s) {unknown}."
@@ -75,18 +49,13 @@ class DecisionNode(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     symbol: str
-    """Identifies this decision throughout the annotation (`decision_order`, other nodes'
-    `information_set`/`parents`, `DiagramConstraint.nodes`). Distinct namespace from
-    `DiscreteNetwork` variable names -- see the module docstring."""
+    """Identifies this decision throughout the annotation. Must not clash with chance-node names."""
     name: str = ""
     """Optional descriptive name, for UI/visualisation. Mirrors `Objective.name`'s role."""
     states: list[str]
-    """The decision's alternatives, in state-index order -- plays the same role `labels` plays
-    on `DiscreteVariable`, since a decision node has a domain but no network-side counterpart."""
+    """The decision's alternatives, in state-index order."""
     information_set: list[str] = Field(default_factory=list)
-    """Names of nodes observed before this decision is taken: `DiscreteNetwork` chance-node
-    names and/or other decisions' `symbol`s. Empty for a decision made with no prior
-    observations. Resolved and validated against a network by `DecisionAnnotation.validate_against`."""
+    """Chance-node names and/or decision symbols observed before this decision is taken."""
 
     @model_validator(mode="after")
     def _check_states(self) -> Self:
@@ -105,31 +74,22 @@ class DecisionNode(BaseModel):
 class ObjectiveNode(BaseModel):
     """A utility node: one linear objective, valued over its parents' joint state.
 
-    Deliberately kept singular and vector-friendly -- `DecisionAnnotation` holds a *list* of
-    these rather than following pyAgrum's influence-diagram convention of implicitly summing
-    every utility node into one scalar (`ShaferShenoyLIMIDInference.MEU()` does exactly that;
-    confirmed empirically -- see the plan's Phase 2 findings). Multiobjective handling stays with
-    DESDEO's existing methods, one objective per `ObjectiveNode` (design decisions table).
+    Objectives are kept separate rather than summed into one utility as pyAgrum does.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     symbol: str
-    """Distinct namespace from `DiscreteNetwork` variable names -- see the module docstring."""
+    """Distinct namespace from `DiscreteNetwork` variable names."""
     name: str = ""
     parents: list[str]
     """Names of nodes this objective's value depends on: `DiscreteNetwork` chance-node names
     and/or `DecisionNode.symbol`s. Order matches `utility.variables` 1:1."""
     utility: Potential
-    """The utility table over `parents`' joint state. Reuses `Potential`'s tensor+shape schema
-    (variables/shape/values) -- nothing in `Potential` requires its values to be a normalised
-    probability, so the same shape-checked container serves both roles. `utility.variables` must
-    equal `parents` exactly (order included); `utility.shape` is checked against the parents'
-    actual cardinalities by `DecisionAnnotation.validate_against`, since cardinalities live on
-    the network (or on a sibling `DecisionNode`), not on this schema alone."""
+    """The utility table over `parents`' joint state. `utility.variables` must equal `parents`;
+    its shape is checked by `DecisionAnnotation.validate_against`."""
     maximize: bool = False
-    """Whether this objective is to be maximized or minimized -- mirrors `Objective.maximize`
-    in `problem/schema.py`, since Phase 4 compiles one `Objective` per `ObjectiveNode`."""
+    """Whether this objective is to be maximized or minimized, as in `Objective.maximize`."""
 
     @model_validator(mode="after")
     def _check_utility_matches_parents(self) -> Self:
@@ -149,11 +109,7 @@ class ObjectiveNode(BaseModel):
 
 
 class DiagramConstraintKind(StrEnum):
-    """Which quantity a `DiagramConstraint` is linear in, per the Phase 5 constraint taxonomy.
-
-    Recorded here (Phase 2) so it can be surfaced in the API ahead of Phase 5 actually compiling
-    against it; the taxonomy itself doesn't change.
-    """
+    """Which quantity a `DiagramConstraint` is linear in."""
 
     decision = "decision"
     """Linear in z (decision indicators): budget, logic, exclusivity among alternatives. Free."""
@@ -162,15 +118,13 @@ class DiagramConstraintKind(StrEnum):
     expected_value = "expected_value"
     """Linear in mu: an expected-value bound. Free."""
     tail = "tail"
-    """Distributional / tail constraint. Requires a Phase 6 risk-measure transform first."""
+    """Distributional / tail constraint. Requires a risk-measure transform first."""
 
 
 class DiagramConstraint(BaseModel):
     """A diagram-level constraint, expressed in terms of node symbols rather than compiled variables.
 
-    mu/z variables only exist once Phase 4 compiles a specific `RootedJunctionTree`. `kind` fixes
-    which of the Phase 5 taxonomy rows this constraint belongs to; `func` is resolved against that
-    taxonomy at compile time.
+    `kind` determines how `func` is compiled.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -179,9 +133,7 @@ class DiagramConstraint(BaseModel):
     name: str = ""
     kind: DiagramConstraintKind
     nodes: list[str]
-    """Node names/symbols this constraint refers to -- `DiscreteNetwork` chance-node names,
-    `DecisionNode.symbol`s, and/or `ObjectiveNode.symbol`s. Validated for existence by
-    `DecisionAnnotation.validate_against`, same as every other cross-reference in this schema."""
+    """Chance-node names, decision symbols and/or objective symbols this constraint refers to."""
     func: list
     """MathJSON expression over `nodes`, in the same standard form `Constraint.func` uses --
     left-hand side only, compared against zero by `cons_type`."""
@@ -196,22 +148,13 @@ class DiagramConstraint(BaseModel):
 
 
 class RiskMeasureKind(StrEnum):
-    """Which risk measure to apply.
-
-    Only `cvar` is implemented end to end (Phase 6); kept as an enum so the schema doesn't need
-    to change shape when a second risk measure is added.
-    """
+    """Which risk measure to apply. Only `cvar` is implemented."""
 
     cvar = "cvar"
 
 
 class RiskMeasure(BaseModel):
-    """A risk transform recorded against one objective, applied before Phase 4 emits variables.
-
-    Applied as a transformation of the diagram/RJT, not as a constraint appended afterward -- see
-    the plan's Phase 6 section. This schema only records intent; the transformation itself is
-    Phase 6 work.
-    """
+    """A risk transform recorded against one objective, applied to the diagram before compiling."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -233,15 +176,8 @@ class RiskMeasure(BaseModel):
 class DecisionAnnotation(BaseModel):
     """The full decision/objective overlay for one `DiscreteNetwork`.
 
-    Contains nothing the network already provides -- no chance-node domains or CPTs, only what
-    turns a Bayesian network into an influence diagram: decisions, objectives, diagram-level
-    constraints, and risk measures, plus the temporal/memory assumptions governing them.
-
-    Construction validates internal consistency only (symbol uniqueness, cross-references among
-    this annotation's own decisions/objectives/constraints/risk measures). Cross-references into
-    a `DiscreteNetwork` -- existence and state-set matching -- are deliberately *not* checked
-    here; see `validate_against`, which is the entry point the "relearn CPTs, reapply the same
-    annotation" round trip depends on.
+    Construction checks internal consistency only; references into a network are checked by
+    `validate_against`.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -259,9 +195,7 @@ class DecisionAnnotation(BaseModel):
     influence-diagram semantics, and must be a permutation of `decisions`' symbols."""
     no_forgetting: bool = False
     """If true (only meaningful when `decision_order` is set), each decision's information set
-    is treated as also including every earlier decision (per `decision_order`) and its parents --
-    mirrors pyAgrum's `addNoForgettingAssumption`. Left for Phase 3/4 to apply; recorded here
-    since it's a property of the decision structure, not of the RJT or compiler."""
+    also includes every earlier decision and its parents, as pyAgrum's `addNoForgettingAssumption`."""
 
     @model_validator(mode="after")
     def _check_internal_structure(self) -> Self:
@@ -285,9 +219,7 @@ class DecisionAnnotation(BaseModel):
             msg = "DecisionAnnotation must have at least one objective."
             raise ValueError(msg)
 
-        # Decision `information_set`/objective `parents` may reference chance-node names, which
-        # aren't known here (no network available) -- that existence check is `validate_against`'s
-        # job, once a network is on hand. Only symbol-level self-consistency happens here.
+        # Chance-node references are checked in `validate_against`.
 
         objective_symbol_set = set(objective_symbols)
         for risk_measure in self.risk_measures:
@@ -311,26 +243,22 @@ class DecisionAnnotation(BaseModel):
     def validate_against(self, network: DiscreteNetwork) -> None:
         """Raise `ValueError` if any node reference or state-set doesn't match `network`.
 
-        Checks every cross-reference this annotation makes into `network` (chance-node names)
-        and within itself (decision/objective symbols): existence, and -- for `ObjectiveNode`
-        utility tables -- that shapes match the referenced nodes' actual cardinalities. This is
-        the entry point the "relearn CPTs from new data, reapply the same annotation" round trip
-        depends on: a network with the same DAG and variable domains but freshly relearned CPTs
-        must still validate, since none of what's checked here reads potentials.
+        Checks existence of every reference and utility-table shapes against cardinalities. CPT
+        values are not read, so a relearned network with the same structure still validates.
         """
         chance_cardinality = {var.name: len(var.labels) for var in network.variables}
         decision_cardinality = {d.symbol: len(d.states) for d in self.decisions}
         objective_symbols = {o.symbol for o in self.objectives}
 
-        # A decision's own symbol namespace and the network's chance-node namespace are
-        # expected to be disjoint (see the module docstring); enforce that here, since it's only
-        # checkable once both are on hand together.
+        # Decision symbols and chance-node names must be disjoint.
         collisions = set(chance_cardinality) & set(decision_cardinality)
         if collisions:
             msg = f"Decision symbols collide with network variable names: {sorted(collisions)}."
             raise ValueError(msg)
 
         observable = set(chance_cardinality) | set(decision_cardinality)
+        cardinalities = {**chance_cardinality, **decision_cardinality}
+
         for decision in self.decisions:
             _check_references_known(
                 "Decision", decision.symbol, "information_set references", decision.information_set, observable
@@ -339,12 +267,31 @@ class DecisionAnnotation(BaseModel):
         for objective in self.objectives:
             _check_references_known("Objective", objective.symbol, "parents reference", objective.parents, observable)
 
-            cardinalities = {**chance_cardinality, **decision_cardinality}
             expected_shape = [cardinalities[parent] for parent in objective.parents]
             if objective.utility.shape != expected_shape:
                 msg = (
                     f"Objective '{objective.symbol}': utility has shape {objective.utility.shape}, "
                     f"expected {expected_shape} from its parents' domains."
+                )
+                raise ValueError(msg)
+
+        # Decision axes of chance-node potentials aren't checked by `DiscreteNetwork`.
+        for variable in network.variables:
+            potential = network.potentials[variable.name]
+            external_parents = [name for name in potential.variables[1:] if name not in chance_cardinality]
+            _check_references_known(
+                "Chance node",
+                variable.name,
+                "potential's external parents reference",
+                external_parents,
+                decision_cardinality,
+            )
+
+            expected_full_shape = [cardinalities[name] for name in potential.variables]
+            if potential.shape != expected_full_shape:
+                msg = (
+                    f"Chance node '{variable.name}': potential has shape {potential.shape}, "
+                    f"expected {expected_full_shape} from its variables' domains."
                 )
                 raise ValueError(msg)
 

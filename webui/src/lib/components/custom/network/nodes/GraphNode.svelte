@@ -1,11 +1,7 @@
 <script lang="ts">
 	/**
-	 * The single node component registered for every kind (chance/decision/objective/
-	 * deterministic) in `NETWORK_NODE_TYPES` (`./index.ts`). xyflow passes each node's own `type`
-	 * as a prop, so one component that looks up `NODE_KIND_STYLE[type]` for its shape/color/icon
-	 * replaces what used to be four near-identical wrapper files (ChanceNode/DecisionNode/
-	 * DeterministicNode/ObjectiveNode.svelte) differing only in which icon they imported and
-	 * which `NODE_KIND_STYLE` key they hardcoded.
+	 * The node component for every kind in `NETWORK_NODE_TYPES` (`./index.ts`); shape, color and
+	 * icon come from `NODE_KIND_STYLE[type]`.
 	 */
 	import { Handle, Position, type NodeProps } from '@xyflow/svelte';
 	import IconPin from '@lucide/svelte/icons/pin';
@@ -14,8 +10,8 @@
 	import IconArrowDown from '@lucide/svelte/icons/arrow-down';
 	import IconInfo from '@lucide/svelte/icons/info';
 	import { NODE_KIND_STYLE } from '../node-style';
-	import { isStatePinned } from '../interaction';
-	import { BAR_TRANSITION_MS, computeDelta, dominantDeltaIndex } from '../whatif';
+	import { isStatePinned, solutionStateTier } from '../interaction';
+	import { BAR_TRANSITION_MS, computeDelta, dominantDeltaIndex, formatUtility } from '../whatif';
 	import type { NetworkNodeData } from '../view-types';
 	import type { NetworkNodeKind } from '../types';
 
@@ -28,12 +24,8 @@
 	let style = $derived(NODE_KIND_STYLE[kind]);
 	let Icon = $derived(style.icon);
 
-	// Ghost/delta (phase D): `delta[i]` is this node's posterior[i] minus its ghost (prior-or-
-	// last-committed) baseline -- computed here, from the two raw arrays `NetworkView` already
-	// puts on `nodeData`, rather than threaded through as a third precomputed array, so this stays
-	// the one place that owns "what does a bar look like" instead of splitting that across two
-	// components. `dominant` is the single largest-magnitude per-state change worth calling out;
-	// see `dominantDeltaIndex`'s own doc comment for why only one, not a full per-state list.
+	// `delta[i]` is posterior[i] minus the ghost baseline; `dominant` is the largest change worth
+	// calling out (see `dominantDeltaIndex`).
 	let delta = $derived(computeDelta(nodeData.ghostPosterior, nodeData.posterior));
 	let dominant = $derived(dominantDeltaIndex(delta));
 
@@ -50,38 +42,63 @@
 		nodeData.onStateClick?.(state);
 	}
 
-	/** Class string for one state chip at `'expanded'` detail -- factored out (rather than an
-	 *  inline ternary in the template) to keep the template line under printWidth and to give
-	 *  `isPinned` one place to be read from, instead of the three near-identical inline
-	 *  `evidenceState === state || policyState === state` checks this replaces. */
-	function expandedChipClass(pinned: boolean, editable: boolean): string {
-		const tone = pinned ? 'border-primary text-primary' : 'border-border/70 text-muted-foreground';
+	// A followed solution's choice per state (see `solutionStateTier`): dashed/lighter, unlike a pin.
+	type SolutionTier = ReturnType<typeof solutionStateTier>;
+
+	// The compact policy line: the solution's certain choice, or `null` if it depends on more.
+	let solutionChoice = $derived(
+		nodeData.solutionPosterior
+			? (nodeData.states?.find(
+					(_, index) => solutionStateTier(nodeData.solutionPosterior, index) === 'certain'
+				) ?? null)
+			: undefined
+	);
+
+	/** Class string for one state chip at `'expanded'` detail. */
+	function expandedChipClass(pinned: boolean, editable: boolean, tier: SolutionTier): string {
+		const tone = pinned
+			? 'border-primary text-primary'
+			: tier === 'certain'
+				? 'border-primary border-dashed text-primary'
+				: tier === 'possible'
+					? 'border-primary/40 border-dashed text-primary/70'
+					: 'border-border/70 text-muted-foreground';
 		const interactive = editable ? 'cursor-pointer hover:border-primary/70' : 'cursor-default';
 		return `bg-muted/50 relative overflow-hidden rounded-full border px-1.5 py-0.5
 			text-[10px] leading-none transition-colors ${tone} ${interactive}`;
 	}
 
-	/** Class string for one bar segment at `'normal'` detail when a posterior is available.
-	 *  `transition-[width]` (alongside the existing `transition-colors`) is what animates a
-	 *  posterior change (phase D: 200-300ms, "motion is what communicates change") -- applied to
-	 *  `width` only, never to a node's canvas `position`, which is never animated. The actual
-	 *  duration is set via `style:transition-duration` (see the two call sites below) from
-	 *  `BAR_TRANSITION_MS`, not hardcoded in this class string, so that constant stays load-bearing
-	 *  rather than a value nothing reads. */
+	/** Class string for one equal-width segment at `'normal'` detail when there's no posterior. */
+	function segmentClass(pinned: boolean, tier: SolutionTier, hasSolution: boolean): string {
+		const tone = pinned
+			? 'bg-primary'
+			: tier === 'certain'
+				? 'bg-primary/60'
+				: tier === 'possible'
+					? 'bg-primary/25'
+					: hasSolution
+						? 'bg-primary/10'
+						: 'bg-primary/30';
+		return `hover:bg-primary/70 h-full flex-1 cursor-pointer transition-colors ${tone}`;
+	}
+
+	/** Tooltip text for one state the followed solution may choose. */
+	function solutionTitle(state: string, prob: number, tier: SolutionTier): string {
+		return tier === 'certain'
+			? `${state}: From solution`
+			: `${state}: From solution: ${Math.round(prob * 100)}%`;
+	}
+
+	/** Class string for one bar segment at `'normal'` detail when a posterior is available. Width
+	 *  changes animate; duration comes from `BAR_TRANSITION_MS`. */
 	function posteriorBarClass(pinned: boolean, editable: boolean): string {
 		const tone = pinned ? 'bg-primary' : 'bg-primary/40';
 		const interactive = editable ? 'cursor-pointer hover:bg-primary/70' : 'cursor-default';
 		return `h-full transition-[width,background-color] ${tone} ${interactive}`;
 	}
 
-	/** Tooltip text for one state -- current probability, plus the signed change from the ghost
-	 *  baseline when both are available. "Baseline" (not "prior"): the ghost baseline is the
-	 *  unconditioned prior only until the DM commits some evidence, after which it's that committed
-	 *  scenario instead -- see `NetworkView`'s `ghostPosteriors` doc comment. Delta is surfaced here
-	 *  (plain text, always present regardless of color vision) as well as via the visual
-	 *  dominant-delta callout below, so the "pair colour with shape/position, never colour alone"
-	 *  rule (phase D) has a fully-accessible fallback for every state, not just the single dominant
-	 *  one. */
+	/** Tooltip text for one state: probability, plus the signed change from the ghost baseline
+	 *  when both are available, so the delta isn't conveyed by color alone. */
 	function stateTitle(state: string, prob: number | undefined, ghost: number | undefined): string {
 		if (prob == null) return state;
 		const pct = Math.round(prob * 100);
@@ -91,8 +108,7 @@
 		return `${state}: ${pct}% (baseline ${Math.round(ghost * 100)}%, ${sign}${deltaPct}pp)`;
 	}
 
-	// Diamond uses clip-path on a background layer rather than rotating the whole node, so the
-	// label stays horizontal and unclipped instead of needing a counter-rotation hack.
+	// Diamond clips a background layer rather than rotating the node, so the label stays upright.
 	let bgStyle = $derived(
 		style.shape === 'diamond'
 			? 'clip-path: polygon(50% 0%, 100% 50%, 50% 100%, 0% 50%);'
@@ -113,7 +129,13 @@
 	style:border-color={style.colorVar}
 	style:--tw-ring-color={style.colorVar}
 	style={style.shape !== 'double-rect' ? bgStyle : 'border-radius: 0.5rem;'}
+	title={nodeData.offPolicy ? "Off the solution's path — pin it" : undefined}
 >
+	{#if nodeData.offPolicy}
+		<div
+			class="pointer-events-none absolute -inset-1 rounded-[0.6rem] ring-2 ring-amber-500/50"
+		></div>
+	{/if}
 	{#if style.shape === 'double-rect'}
 		<div
 			class="pointer-events-none absolute inset-[3px] rounded-[5px] border"
@@ -147,6 +169,24 @@
 			<IconCheck class="size-2.5" />
 			{nodeData.policyState}
 		</span>
+	{:else if kind === 'decision' && nodeData.detail === 'compact' && solutionChoice !== undefined}
+		<span class="text-muted-foreground flex items-center gap-0.5 text-[10px] leading-none">
+			{#if solutionChoice !== null}
+				<IconCheck class="size-2.5" />
+				{solutionChoice} (solution)
+			{:else}
+				depends
+			{/if}
+		</span>
+	{/if}
+
+	{#if kind === 'objective' && nodeData.detail !== 'compact' && nodeData.utility != null}
+		<span
+			class="text-muted-foreground text-[10px] leading-none tabular-nums"
+			title="Expected value ± standard deviation"
+		>
+			{formatUtility(nodeData.utility, nodeData.utilityStdDev)}
+		</span>
 	{/if}
 
 	{#if nodeData.detail !== 'compact' && nodeData.states?.length}
@@ -156,18 +196,19 @@
 					{@const prob = nodeData.posterior?.[index]}
 					{@const ghost = nodeData.ghostPosterior?.[index]}
 					{@const pinned = isStatePinned(nodeData, state)}
+					{@const tier = solutionStateTier(nodeData.solutionPosterior, index)}
 					<button
 						type="button"
 						disabled={!nodeData.editable}
-						class={expandedChipClass(pinned, nodeData.editable)}
-						title={stateTitle(state, prob, ghost)}
+						class={expandedChipClass(pinned, nodeData.editable, tier)}
+						title={tier
+							? solutionTitle(state, nodeData.solutionPosterior?.[index] ?? 0, tier)
+							: stateTitle(state, prob, ghost)}
 						onclick={(event) => handleStateClick(event, state)}
 					>
 						{#if ghost != null}
-							<!-- Ghost mark: a dashed *line* at the prior/baseline width, distinct in
-							     shape (a line vs. an area fill) from the solid current-value fill
-							     below it -- not just a paler shade of the same color -- so the two
-							     stay distinguishable without relying on color vision (phase D). -->
+							<!-- Ghost mark: a dashed line at the baseline width, distinguishable from the
+							     fill without relying on color. -->
 							<span
 								class="border-foreground/50 pointer-events-none absolute inset-y-0 border-l border-dashed"
 								style:left="{Math.round(ghost * 100)}%"
@@ -206,9 +247,7 @@
 					{/each}
 				</div>
 				{#if nodeData.ghostPosterior}
-					<!-- Ghost bar: the same segmented layout, one tier down, outlined rather than
-					     filled -- the whole-bar baseline this posterior is diffed against (phase D
-					     item 1: "without a baseline a posterior conveys nothing"). -->
+					<!-- Ghost bar: the baseline distribution, outlined rather than filled. -->
 					<div
 						class="border-muted-foreground/50 flex h-1 w-24 overflow-hidden rounded-full border border-dashed"
 						title="Prior/baseline distribution"
@@ -225,19 +264,17 @@
 				{/if}
 			</div>
 		{:else if nodeData.editable}
-			<!-- No posterior yet (e.g. a decision node pre-solve), but still editable -- an
-			     equal-width segment row keeps the click affordance available at this detail level
-			     too, rather than only at 'expanded'. Plain text below is for genuinely
-			     non-interactive nodes (objective/deterministic, or a decision in 'solver' mode). -->
+			<!-- No posterior yet but editable: equal-width segments keep states clickable. -->
 			<div class="bg-muted/50 flex h-1.5 w-24 gap-px overflow-hidden rounded-full">
-				{#each nodeData.states as state (state)}
+				{#each nodeData.states as state, index (state)}
 					{@const pinned = isStatePinned(nodeData, state)}
+					{@const tier = solutionStateTier(nodeData.solutionPosterior, index)}
 					<button
 						type="button"
-						class="hover:bg-primary/70 h-full flex-1 cursor-pointer transition-colors {pinned
-							? 'bg-primary'
-							: 'bg-primary/30'}"
-						title={state}
+						class={segmentClass(pinned, tier, !!nodeData.solutionPosterior)}
+						title={tier
+							? solutionTitle(state, nodeData.solutionPosterior?.[index] ?? 0, tier)
+							: state}
 						onclick={(event) => handleStateClick(event, state)}
 					></button>
 				{/each}
@@ -250,9 +287,7 @@
 
 		{#if dominant !== null && delta}
 			{@const d = delta[dominant]}
-			<!-- Signed delta callout (phase D item 1/6): an up/down *arrow shape* pairs with the
-			     sign/color rather than relying on color alone, and the sign is spelled out in text
-			     too ("+"/no prefix for negative, since Math.round already carries the "-"). -->
+			<!-- Signed delta callout: an arrow shape and spelled-out sign pair with the color. -->
 			<span
 				class="flex items-center gap-0.5 text-[10px] leading-none font-medium {d > 0
 					? 'text-emerald-600 dark:text-emerald-400'

@@ -3,22 +3,19 @@
 Bayesian networks and influence diagrams. Unlike `desdeo/problem/graphical/`, this module uses
 `pyagrum` directly for live inference.
 
-pyAgrum behaviour relied on below (verified empirically):
+pyAgrum behaviour relied on below:
 
-- `setEvidence(...)` on `LazyPropagation`/`ShaferShenoyLIMIDInference` *replaces* the whole
-  evidence set (`setEvidence({})` clears it). This makes cached engines safe to reuse across calls
-  without leaking evidence.
-- `LazyPropagation.addJointTarget(...)` registered once stays valid across later
-  `setEvidence`/`makeInference` cycles.
-- `ShaferShenoyLIMIDInference.posterior(decision)` is a 0/1 vector when the decision's information
-  set is fully pinned by evidence, and a marginal over choices otherwise (see `_read_policy`).
-- `ShaferShenoyLIMIDInference` has no `jointPosterior`; `MEU()` sums all utility nodes, and
-  `posteriorUtility(node)` doesn't collapse to a scalar. So there is no way to get one objective's
-  expected utility when a diagram has more than one objective and a decision (501 in
-  `_compute_utilities`).
-- `gum.GumException` is the base of pyAgrum's errors (unknown node/label, unsolvable LIMID, ...);
-  these are reported as 400.
-- `ShaferShenoyLIMIDInference.MEU()` returns `{"mean": ..., "variance": ...}`.
+- `setEvidence(...)` *replaces* the whole evidence set, so cached engines can be reused safely.
+- `LazyPropagation.addJointTarget(...)` stays valid across later `setEvidence`/`makeInference`.
+- `ShaferShenoyLIMIDInference.posterior(decision)` is one-hot only when the decision's information
+  set is fully pinned by evidence.
+- `ShaferShenoyLIMIDInference` has no `jointPosterior` and `MEU()` sums all utility nodes, so a
+  single objective's expected utility is unavailable with several objectives and a decision. Those
+  requests need every decision resolved (by `decision_evidence` or a `solution`), else 501.
+- `gum.GumException` (unknown node/label, unsolvable LIMID, ...) is reported as 400.
+- `MEU()` returns `nan` instead of raising for zero-probability evidence.
+- Elsewhere, zero-probability evidence raises a bare `Exception` with a `"[pyAgrum]"` message
+  (see `_is_pyagrum_incompatible_evidence`).
 """
 
 import hashlib
@@ -26,7 +23,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
-from math import isfinite, sqrt
+from math import isfinite, prod, sqrt
 from typing import Annotated, Literal
 
 import numpy as np
@@ -41,17 +38,26 @@ from desdeo.api.models import (
     GraphicalModelMetaData,
     ProblemDB,
     ProblemMetaDataDB,
+    StateDB,
     User,
     UserRole,
     UserSavedSolutionDB,
 )
 from desdeo.api.routers.user_authentication import get_current_user
-from desdeo.api.routers.utils import fetch_interactive_session_with_role_check, fetch_problem_with_role_check
+from desdeo.api.routers.utils import (
+    _may_access_state,
+    fetch_interactive_session_with_role_check,
+    fetch_problem_with_role_check,
+    get_solver_results_at,
+)
 from desdeo.problem import Problem, VariableDomainTypeEnum
 from desdeo.problem.graphical import (
     DecisionAnnotation,
+    DecisionPolicy,
     DiscreteNetwork,
+    DiscreteVariable,
     IndexMap,
+    Potential,
     build_rooted_junction_tree,
     compile_diagram,
     read_policy_from_solution,
@@ -92,11 +98,9 @@ class StructureNode(BaseModel):
     label: str
     kind: Literal["chance", "decision", "objective"]
     states: list[str] | None = None
-    """Chance nodes: `DiscreteVariable.labels`. Decisions: `DecisionNode.states`. Objectives have
-    no states (a utility value, not a discrete domain) -- always `None`."""
+    """Chance and decision nodes' state labels; `None` for objectives."""
     description: str | None = None
-    """Chance nodes only: `DiscreteVariable.description`, or `None` if empty. Always `None` for
-    decision/objective nodes."""
+    """Chance nodes' `DiscreteVariable.description`; `None` if empty or for other node kinds."""
 
 
 class StructureEdge(BaseModel):
@@ -115,6 +119,13 @@ class StructureResponse(BaseModel):
     edges: list[StructureEdge]
 
 
+class SolutionRef(BaseModel):
+    """One solution stored in a `StateDB` row, e.g. a CUMULUS `SolutionReferenceResponseLite`."""
+
+    state_id: int
+    solution_index: int
+
+
 class WhatIfRequest(BaseModel):
     """Body for `POST /graphical/whatif`."""
 
@@ -122,10 +133,15 @@ class WhatIfRequest(BaseModel):
     session_id: int | None = None
     evidence: dict[str, str] = {}
     """Chance-node name -> pinned state label (hard evidence only)."""
+    decision_evidence: dict[str, str] = {}
+    """Decision symbol -> pinned state label. Only takes effect when it covers every decision, or
+    when `solution` is given (see `_compute_utilities`)."""
+    solution: SolutionRef | None = None
+    """A solved solution of this problem. Every decision not in `decision_evidence` then follows
+    that solution's decoded policy (see `_compute_utilities_with_decision_pins`)."""
     commit: bool = False
-    """When `True`, a computed utility outside the problem's persisted ideal/nadir widens that bound
-    (see `_ratchet_ideal_nadir`) and the full ideal/nadir are returned. When `False`, ideal/nadir
-    are left untouched."""
+    """Widen the persisted ideal/nadir to cover the computed utilities (`_ratchet_ideal_nadir`) and
+    return them."""
 
 
 class WhatIfResponse(BaseModel):
@@ -135,19 +151,24 @@ class WhatIfResponse(BaseModel):
     """Chance-node name -> per-state probability, in that node's own `labels` order."""
     policy: dict[str, str] | None = None
     """Decision symbol -> chosen state label, only for decisions whose information set is fully
-    pinned by the evidence (see `_read_policy`). `None` when there are no decisions."""
+    pinned by the evidence (see `_read_policy`; with `solution`, `_decode_solved_policy`). `None`
+    when there are no decisions."""
     utilities: dict[str, float]
     """Objective symbol -> expected utility under the given evidence."""
     utility_std_devs: dict[str, float]
     """Objective symbol -> standard deviation of the utility under the given evidence."""
     ideal: dict[str, float] | None = None
     """Objective symbol -> the problem's ideal value after any ratchet. Only set when `commit` is
-    `True`, otherwise `None`.
-
-    Since the ratchet adopts evidence-conditioned utilities, these bounds can be wider than what
-    any actual solution of the problem attains."""
+    `True`. Can be wider than what any actual solution attains."""
     nadir: dict[str, float] | None = None
     """Objective symbol -> the problem's current nadir value, same population rule as `ideal`."""
+    off_policy_decisions: list[str] = []
+    """With `solution`: followed decisions that the pins/evidence put in an information state the
+    solution never reaches, so its choice there is arbitrary (see `_off_policy_decisions`). When
+    non-empty, `utilities`/`utility_std_devs` are empty and `policy` holds only the pins."""
+    decision_posteriors: dict[str, list[float]] = {}
+    """With `solution`: followed decision symbol -> per-state probability under the solution's policy,
+    in the decision's `states` order. Omits pinned and off-policy decisions."""
 
 
 # --- POST /graphical/compile ----------------------------------------------------------------------
@@ -285,6 +306,7 @@ def get_structure(
 
     nodes: list[StructureNode] = []
     edges: list[StructureEdge] = []
+    chance_names = {variable.name for variable in network.variables}
 
     def _add_edge(source: str, target: str) -> None:
         edges.append(StructureEdge(id=f"{source}->{target}", source=source, target=target))
@@ -301,6 +323,11 @@ def get_structure(
         )
     for parent, child in network.arcs:
         _add_edge(parent, child)
+    # Decision parents of chance nodes aren't in `network.arcs`.
+    for node_name, potential in network.potentials.items():
+        for parent in potential.variables[1:]:
+            if parent not in chance_names:
+                _add_edge(parent, node_name)
 
     for decision in annotation.decisions:
         # `validate_against` already rejects decision symbols that collide with chance nodes.
@@ -313,8 +340,7 @@ def get_structure(
             _add_edge(parent, decision.symbol)
 
     for objective in annotation.objectives:
-        # Objective symbols may collide with chance-node names, so prefix them with `util_` (the
-        # same prefix `to_pyagrum_influence_diagram` uses).
+        # Same `util_` prefix as `to_pyagrum_influence_diagram`, to avoid clashing with chance nodes.
         objective_id = f"util_{objective.symbol}"
         nodes.append(StructureNode(id=objective_id, label=objective.name or objective.symbol, kind="objective"))
         for parent in objective.parents:
@@ -442,17 +468,26 @@ def _read_posteriors(engine, network: DiscreteNetwork) -> dict[str, list[float]]
     return {variable.name: engine.posterior(variable.name).toarray().tolist() for variable in network.variables}
 
 
-def _read_policy(engine, annotation: DecisionAnnotation) -> dict[str, str] | None:
-    """`{decision_symbol: chosen_state_label}` for decisions fully determined by the evidence.
+def _read_policy(
+    engine, annotation: DecisionAnnotation, decision_evidence: dict[str, str] | None = None
+) -> dict[str, str] | None:
+    """`{decision_symbol: chosen_state_label}` for decisions fully determined by evidence/pins.
 
-    `None` if there are no decisions. A decision's posterior is one-hot exactly when its
-    information set is fully pinned; otherwise it is a marginal over choices, and the decision is
-    omitted rather than reporting the argmax as if it were the policy.
+    `None` if there are no decisions. `decision_evidence` is used only when it covers every
+    decision, matching `_compute_utilities`. Other decisions are reported when their posterior is
+    one-hot, and omitted otherwise.
     """
     if not annotation.decisions:
         return None
+    decision_evidence = decision_evidence or {}
+    decision_symbols = {decision.symbol for decision in annotation.decisions}
+    if set(decision_evidence) != decision_symbols:
+        decision_evidence = {}
     policy: dict[str, str] = {}
     for decision in annotation.decisions:
+        if decision.symbol in decision_evidence:
+            policy[decision.symbol] = decision_evidence[decision.symbol]
+            continue
         probs = np.asarray(engine.posterior(decision.symbol).toarray())
         best = int(np.argmax(probs))
         if np.isclose(probs[best], 1.0, atol=1e-6):
@@ -460,30 +495,240 @@ def _read_policy(engine, annotation: DecisionAnnotation) -> dict[str, str] | Non
     return policy
 
 
-def _expected_value_no_decision(engine, objective) -> tuple[float, float]:
-    """One `ObjectiveNode`'s `(expected_utility, variance)` from a `LazyPropagation` engine.
+_NEGLIGIBLE_RELATIVE_VARIANCE = 1e-12
+"""A variance at most this times `max(1, mean**2)` is reported as exactly zero."""
 
-    Contracts the joint posterior over the objective's parents against its utility table. The
-    variance `E[U^2] - E[U]^2` is clamped at zero against roundoff. Validation guarantees
-    `objective.parents` is non-empty.
-    """
-    posterior = engine.jointPosterior(set(objective.parents))
+
+def _joint_posterior(engine, nodes: list[str]) -> np.ndarray:
+    """`engine`'s joint posterior over `nodes` (a registered joint target), with axes in `nodes` order."""
+    posterior = engine.jointPosterior(set(nodes))
     order = [v.name() for v in posterior.variablesSequence()]
     probs = np.transpose(posterior.toarray())
-    utility = np.array(objective.utility.values, dtype=float)
-    probs = np.moveaxis(probs, [order.index(p) for p in objective.parents], range(len(objective.parents)))
+    return np.moveaxis(probs, [order.index(node) for node in nodes], range(len(nodes)))
+
+
+def _expected_value_from_table(engine, parents: list[str], utility: np.ndarray) -> tuple[float, float]:
+    """`(expected_utility, variance)` contracting `engine`'s joint posterior over `parents` against `utility`.
+
+    Empty `parents` means `utility` is already the scalar expected value.
+    """
+    if not parents:
+        return float(utility), 0.0
+    probs = _joint_posterior(engine, parents)
     mean = float(np.sum(probs * utility))
-    variance = max(float(np.sum(probs * utility**2) - mean**2), 0.0)
+    variance = float(np.sum(probs * utility**2) - mean**2)
+    # Cancellation noise relative to the mean (e.g. a deterministic outcome) counts as zero.
+    if variance <= _NEGLIGIBLE_RELATIVE_VARIANCE * max(1.0, mean**2):
+        variance = 0.0
     return mean, variance
 
 
-def _compute_utilities(engine, annotation: DecisionAnnotation) -> tuple[dict[str, float], dict[str, float]]:
-    """`({objective_symbol: expected_utility}, {objective_symbol: std_dev})`, current evidence.
+def _expected_value_no_decision(engine, objective) -> tuple[float, float]:
+    """One `ObjectiveNode`'s `(expected_utility, variance)` from a `LazyPropagation` engine."""
+    return _expected_value_from_table(engine, objective.parents, np.array(objective.utility.values, dtype=float))
 
-    - No decisions: per-objective contraction (`_expected_value_no_decision`).
-    - One objective with decisions: `MEU()`. The utility table is negated for minimized
-      objectives (pyAgrum maximizes), so the mean is negated back; the variance is unaffected.
-    - Several objectives with decisions: not implemented (501), see the module docstring.
+
+def _resolve_decision_pins(annotation: DecisionAnnotation, decision_evidence: dict[str, str]) -> dict[str, int]:
+    """`{decision_symbol: 0-based state index}` for every entry in `decision_evidence`.
+
+    Assumes `decision_evidence` has already passed `_validate_decision_evidence`.
+    """
+    states_by_symbol = {decision.symbol: decision.states for decision in annotation.decisions}
+    return {symbol: states_by_symbol[symbol].index(label) for symbol, label in decision_evidence.items()}
+
+
+def _slice_objective_for_decision_pins(objective, decision_pins: dict[str, int]) -> tuple[list[str], np.ndarray]:
+    """`objective.parents`/`utility.values`, with each `decision_pins` axis sliced out at its index.
+
+    Like `_pin_potential` in `adapters/pyagrum.py`, but without a leading own-node axis.
+    """
+    parents = list(objective.parents)
+    values = np.array(objective.utility.values, dtype=float)
+    for symbol, index in decision_pins.items():
+        if symbol not in parents:
+            continue
+        axis = parents.index(symbol)
+        values = values.take(index, axis=axis)
+        parents.pop(axis)
+    return parents, values
+
+
+def _is_pyagrum_incompatible_evidence(e: Exception) -> bool:
+    """Whether `e` is pyAgrum's bare `Exception` for zero-probability evidence, matched by message."""
+    return "[pyAgrum]" in str(e)
+
+
+def _policy_network(
+    network: DiscreteNetwork,
+    annotation: DecisionAnnotation,
+    decision_pins: dict[str, int],
+    policies: dict[str, DecisionPolicy],
+) -> DiscreteNetwork:
+    """`network` plus every decision as an ordinary chance variable.
+
+    A pinned decision gets a parentless one-hot CPT. Any other decision gets a deterministic CPT
+    over its `policies` entry's (effective) information set, which may include earlier decisions.
+    """
+    label_lists: dict[str, list[str]] = {variable.name: variable.labels for variable in network.variables}
+    label_lists.update({decision.symbol: decision.states for decision in annotation.decisions})
+
+    variables = list(network.variables)
+    potentials = dict(network.potentials)
+    for decision in annotation.decisions:
+        symbol = decision.symbol
+        n_states = len(decision.states)
+        variables.append(DiscreteVariable(name=symbol, labels=decision.states))
+        if symbol in decision_pins:
+            info_set: list[str] = []
+            choices = np.array(decision_pins[symbol])
+        else:
+            decision_policy = policies[symbol]
+            info_set = decision_policy.information_set
+            cardinalities = [len(label_lists[node]) for node in info_set]
+            # `policy` keys are row-major flat indices over `info_set`, so a reshape recovers the grid.
+            choices = np.array([decision_policy.policy[i] for i in range(prod(cardinalities))]).reshape(cardinalities)
+        # One-hot along a new leading axis for the decision's own state.
+        values = np.moveaxis(np.eye(n_states)[choices], -1, 0)
+        potentials[symbol] = Potential(variables=[symbol, *info_set], shape=list(values.shape), values=values.tolist())
+
+    arcs = [(parent, node) for node, potential in potentials.items() for parent in potential.variables[1:]]
+    return DiscreteNetwork(name=network.name, variables=variables, arcs=arcs, potentials=potentials)
+
+
+def _off_policy_decisions(
+    network: DiscreteNetwork,
+    annotation: DecisionAnnotation,
+    evidence: dict[str, str],
+    decision_evidence: dict[str, str],
+    policies: dict[str, DecisionPolicy],
+) -> list[str]:
+    """Followed decisions whose information set the request reaches outside the solution's own support.
+
+    The solved MILP leaves a decision's choice unconstrained at information states its own policy
+    gives zero probability, so following it there is arbitrary. Compares, per unpinned decision,
+    the joint posterior over its information set under the request against the pure solution.
+    """
+    followed = [
+        policies[d.symbol]
+        for d in annotation.decisions
+        if d.symbol not in decision_evidence and policies[d.symbol].information_set
+    ]
+    if not followed:
+        return []
+    decision_pins = _resolve_decision_pins(annotation, decision_evidence)
+
+    def _engine(pins: dict[str, int], engine_evidence: dict[str, str]):
+        engine = gum.LazyPropagation(to_pyagrum(_policy_network(network, annotation, pins, policies)))
+        for decision_policy in followed:
+            engine.addJointTarget(set(decision_policy.information_set))
+        engine.setEvidence(engine_evidence)
+        engine.makeInference()
+        return engine
+
+    pure = _engine({}, {})
+    requested = _engine(decision_pins, evidence)
+    tolerance = 1e-9
+    return [
+        decision_policy.symbol
+        for decision_policy in followed
+        if np.any(
+            (_joint_posterior(requested, decision_policy.information_set) > tolerance)
+            & (_joint_posterior(pure, decision_policy.information_set) <= tolerance)
+        )
+    ]
+
+
+def _compute_utilities_with_decision_pins(
+    network: DiscreteNetwork,
+    annotation: DecisionAnnotation,
+    evidence: dict[str, str],
+    decision_evidence: dict[str, str],
+    policies: dict[str, DecisionPolicy] | None = None,
+) -> tuple[dict[str, float], dict[str, float], dict[str, list[float]], dict[str, list[float]] | None]:
+    """`_compute_utilities`'s resolved-decision branch: every decision resolved, no LIMID needed.
+
+    Builds a throwaway `LazyPropagation` engine. Without `policies`, every decision must be in
+    `decision_evidence` and is pinned out of the network and the utility tables. With `policies`,
+    the other decisions follow them as chance variables (`_policy_network`).
+
+    Also returns this engine's posteriors, which the caller must use instead of the cached LIMID
+    engine's (those reflect the LIMID's own optimal policy), and, with `policies`, the unpinned
+    decisions' posteriors (`None` without).
+    """
+    decision_pins = _resolve_decision_pins(annotation, decision_evidence)
+    try:
+        if policies is None:
+            bn = to_pyagrum(network, decision_pins=decision_pins)
+            objective_pins = decision_pins
+        else:
+            bn = to_pyagrum(_policy_network(network, annotation, decision_pins, policies))
+            objective_pins = {}
+        engine = gum.LazyPropagation(bn)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+
+    sliced = {
+        objective.symbol: _slice_objective_for_decision_pins(objective, objective_pins)
+        for objective in annotation.objectives
+    }
+    for parents, _utility in sliced.values():
+        if parents:
+            engine.addJointTarget(set(parents))
+    for variable in network.variables:
+        engine.addTarget(variable.name)
+    if policies is not None:
+        for decision in annotation.decisions:
+            engine.addTarget(decision.symbol)
+
+    try:
+        engine.setEvidence(evidence)
+        engine.makeInference()
+        posteriors = _read_posteriors(engine, network)
+        decision_posteriors = (
+            None
+            if policies is None
+            else {
+                decision.symbol: engine.posterior(decision.symbol).toarray().tolist()
+                for decision in annotation.decisions
+                if decision.symbol not in decision_pins
+            }
+        )
+        means: dict[str, float] = {}
+        std_devs: dict[str, float] = {}
+        for objective in annotation.objectives:
+            parents, utility = sliced[objective.symbol]
+            mean, variance = _expected_value_from_table(engine, parents, utility)
+            means[objective.symbol] = mean
+            std_devs[objective.symbol] = sqrt(variance)
+    except gum.GumException as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+    except Exception as e:
+        # Evidence ruled out by these decisions; anything else is re-raised.
+        if not _is_pyagrum_incompatible_evidence(e):
+            raise
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="evidence is incompatible with the pinned or solution-followed decisions",
+        ) from e
+    return means, std_devs, posteriors, decision_posteriors
+
+
+def _compute_utilities(
+    engine,
+    annotation: DecisionAnnotation,
+    network: DiscreteNetwork | None = None,
+    evidence: dict[str, str] | None = None,
+    decision_evidence: dict[str, str] | None = None,
+) -> tuple[dict[str, float], dict[str, float], dict[str, list[float]] | None]:
+    """`({objective_symbol: expected_utility}, {objective_symbol: std_dev}, posteriors_override)`.
+
+    `posteriors_override` is only set by the pinned-decision branch; otherwise the caller uses
+    `engine`'s own posteriors.
+
+    - No decisions: per-objective contraction.
+    - Every decision pinned: `_compute_utilities_with_decision_pins`.
+    - One objective, not fully pinned: `MEU()`.
+    - Several objectives, not fully pinned: 501.
     """
     if not annotation.decisions:
         means: dict[str, float] = {}
@@ -492,19 +737,36 @@ def _compute_utilities(engine, annotation: DecisionAnnotation) -> tuple[dict[str
             mean, variance = _expected_value_no_decision(engine, objective)
             means[objective.symbol] = mean
             std_devs[objective.symbol] = sqrt(variance)
-        return means, std_devs
+        return means, std_devs, None
+
+    decision_symbols = {decision.symbol for decision in annotation.decisions}
+    if decision_evidence and set(decision_evidence) == decision_symbols:
+        means, std_devs, posteriors, _ = _compute_utilities_with_decision_pins(
+            network, annotation, evidence or {}, decision_evidence
+        )
+        return means, std_devs, posteriors
 
     if len(annotation.objectives) == 1:
         objective = annotation.objectives[0]
         # Undo the negation `to_pyagrum_influence_diagram` applies to minimized objectives.
         sign = 1.0 if objective.maximize else -1.0
         meu = engine.MEU()
-        return {objective.symbol: sign * meu["mean"]}, {objective.symbol: sqrt(max(meu["variance"], 0.0))}
+        if not isfinite(meu["mean"]):
+            # `MEU()` returns `nan` for zero-probability evidence instead of raising.
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="evidence is incompatible with the diagram"
+            )
+        return (
+            {objective.symbol: sign * meu["mean"]},
+            {objective.symbol: sqrt(max(meu["variance"], 0.0))},
+            None,
+        )
 
     msg = (
         "Computing per-objective expected utility is not implemented for a diagram with more "
-        "than one ObjectiveNode and at least one decision: ShaferShenoyLIMIDInference exposes no "
-        "joint-posterior primitive, MEU() sums every utility node into one scalar, and "
+        "than one ObjectiveNode and at least one decision, unless decision_evidence pins every "
+        "decision in the diagram or a solution is given to follow: ShaferShenoyLIMIDInference "
+        "exposes no joint-posterior primitive, MEU() sums every utility node into one scalar, and "
         "posteriorUtility(node) does not collapse to a scalar either."
     )
     raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail=msg)
@@ -536,6 +798,29 @@ def _validate_chance_evidence(network: DiscreteNetwork, evidence: dict[str, str]
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Evidence value '{value}' for node '{node}' isn't one of its own states {chance_labels[node]}.",
+            )
+
+
+def _validate_decision_evidence(annotation: DecisionAnnotation, decision_evidence: dict[str, str]) -> None:
+    """400 if `decision_evidence` references a node that isn't a `DecisionNode`, or a label it doesn't have."""
+    decision_states = {decision.symbol: decision.states for decision in annotation.decisions}
+    unknown_decisions = sorted(set(decision_evidence) - set(decision_states))
+    if unknown_decisions:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"decision_evidence references node(s) that aren't DecisionAnnotation decisions: "
+                f"{unknown_decisions}."
+            ),
+        )
+    for symbol, label in decision_evidence.items():
+        if label not in decision_states[symbol]:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"decision_evidence value '{label}' for decision '{symbol}' isn't one of its "
+                    f"own states {decision_states[symbol]}."
+                ),
             )
 
 
@@ -584,6 +869,40 @@ def _ratchet_ideal_nadir(problem_db: ProblemDB, utilities: dict[str, float], db_
     return any_changed
 
 
+def _fetch_solution_policies(
+    solution: SolutionRef, problem_id: int, meta: GraphicalModelMetaData, user: User, db_session: Session
+) -> dict[str, DecisionPolicy]:
+    """Every decision's policy, decoded from the solution `solution` refers to.
+
+    Raises:
+        HTTPException: 404 if the problem has no `IndexMap`, or the state is missing, not
+            accessible to `user`, or belongs to another problem; 400 for a bad `solution_index`
+            or `z` values that don't fit the `IndexMap`.
+    """
+    if meta.index_map_json is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Problem {problem_id} has no IndexMap yet -- it wasn't compiled via /graphical/compile.",
+        )
+    state = db_session.get(StateDB, solution.state_id)
+    if state is None or state.problem_id != problem_id or not _may_access_state(user, state, db_session):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No state with id={solution.state_id} for problem {problem_id}.",
+        )
+    bad_index = HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=f"State {solution.state_id} has no solution at index {solution.solution_index}.",
+    )
+    if solution.solution_index < 0:
+        raise bad_index
+    try:
+        results = get_solver_results_at(state.state, solution.solution_index)
+    except (AttributeError, IndexError) as e:
+        raise bad_index from e
+    return _read_solution_policies(IndexMap.model_validate_json(meta.index_map_json), results.optimal_variables)
+
+
 @router.post("/whatif")
 def whatif(
     request: WhatIfRequest,
@@ -592,14 +911,18 @@ def whatif(
 ) -> WhatIfResponse:
     """Set hard evidence, run inference, and return posteriors/policy/utilities in one payload.
 
-    Uses a cached engine (see `_engine_cache`). With `request.commit=True`, also ratchets the
-    problem's ideal/nadir (see `_ratchet_ideal_nadir`) and returns them.
+    Uses a cached engine (see `_engine_cache`), except with `request.solution` and some decision
+    unpinned, which uses a fresh one where unpinned decisions follow that solution's policy. With
+    `request.commit=True`, also ratchets the problem's ideal/nadir (see `_ratchet_ideal_nadir`) and
+    returns them.
 
     Raises:
         HTTPException: 404 if the problem or session isn't found or visible, or the problem has no
-            `GraphicalModelMetaData`; 403 if `commit` is `True` and `user` is neither the owner
-            nor an admin/analyst; 400 for invalid evidence or a diagram pyAgrum rejects; 501 for
-            several objectives with decisions (see `_compute_utilities`).
+            `GraphicalModelMetaData`, or for an unusable `solution` (see
+            `_fetch_solution_policies`); 403 if `commit` is `True` and `user` is neither the owner
+            nor an admin/analyst; 400 for invalid evidence/decision_evidence/solution or a diagram
+            pyAgrum rejects; 501 for several objectives with decisions, unless `decision_evidence`
+            pins every decision or `solution` is given (see `_compute_utilities`).
     """
     problem_db = fetch_problem_with_role_check(user, request.problem_id, db_session)
     if problem_db is None:
@@ -619,20 +942,48 @@ def whatif(
     annotation = DecisionAnnotation.model_validate_json(meta.annotation_json)
 
     _validate_chance_evidence(network, request.evidence)
+    _validate_decision_evidence(annotation, request.decision_evidence)
+    # Resolved on both branches below, since it also checks `session_id` ownership.
     cache_key = _resolve_cache_key(user, request.session_id, request.problem_id, db_session)
-    entry = _get_or_build_entry(cache_key, meta.network_json, meta.annotation_json, network, annotation)
 
-    with entry.lock:
-        entry.last_used = time.monotonic()
-        try:
-            entry.engine.setEvidence(request.evidence)
-            entry.engine.makeInference()
-        except gum.GumException as e:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+    off_policy: list[str] = []
+    decision_posteriors: dict[str, list[float]] = {}
+    unpinned = {decision.symbol for decision in annotation.decisions} - set(request.decision_evidence)
+    if request.solution is not None and unpinned:
+        # Every decision is pinned or follows the solution, so the cached LIMID engine isn't used.
+        policies = _fetch_solution_policies(request.solution, request.problem_id, meta, user, db_session)
+        utilities, utility_std_devs, posteriors, decision_posteriors = _compute_utilities_with_decision_pins(
+            network, annotation, request.evidence, request.decision_evidence, policies
+        )
+        off_policy = _off_policy_decisions(network, annotation, request.evidence, request.decision_evidence, policies)
+        if off_policy:
+            utilities, utility_std_devs, decision_posteriors = {}, {}, {}
+            policy = dict(request.decision_evidence)
+        else:
+            policy = _decode_solved_policy(policies, network, annotation, request.evidence, request.decision_evidence)
+    else:
+        entry = _get_or_build_entry(cache_key, meta.network_json, meta.annotation_json, network, annotation)
+        with entry.lock:
+            entry.last_used = time.monotonic()
+            try:
+                entry.engine.setEvidence(request.evidence)
+                entry.engine.makeInference()
+                posteriors = _read_posteriors(entry.engine, network)
+                policy = _read_policy(entry.engine, annotation, request.decision_evidence)
+                utilities, utility_std_devs, posteriors_override = _compute_utilities(
+                    entry.engine, annotation, network, request.evidence, request.decision_evidence
+                )
+            except gum.GumException as e:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+            except Exception as e:
+                # Zero-probability evidence surfaces lazily here; anything else is re-raised.
+                if not _is_pyagrum_incompatible_evidence(e):
+                    raise
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="evidence is incompatible") from e
 
-        posteriors = _read_posteriors(entry.engine, network)
-        policy = _read_policy(entry.engine, annotation)
-        utilities, utility_std_devs = _compute_utilities(entry.engine, annotation)
+            if posteriors_override is not None:
+                # The pinned-decision branch's own engine reflects the actual pins.
+                posteriors = posteriors_override
 
     ideal: dict[str, float] | None = None
     nadir: dict[str, float] | None = None
@@ -649,6 +1000,8 @@ def whatif(
         utility_std_devs=utility_std_devs,
         ideal=ideal,
         nadir=nadir,
+        off_policy_decisions=off_policy,
+        decision_posteriors=decision_posteriors,
     )
 
 
@@ -678,25 +1031,12 @@ class PolicyResponse(BaseModel):
     pinned by `evidence`. Same semantics as `WhatIfResponse.policy`."""
 
 
-def _decode_solved_policy(
-    index_map: IndexMap,
-    network: DiscreteNetwork,
-    annotation: DecisionAnnotation,
-    variable_values: dict[str, list[float] | float],
-    evidence: dict[str, str],
-) -> dict[str, str]:
-    """`{decision_symbol: chosen_state_label}` -- `read_policy_from_solution`, collapsed via `evidence`.
-
-    A decision is included only when all of its information-set members are resolved. Decisions
-    are decoded in `annotation.decision_order` (or declaration order), adding each chosen label to
-    the resolved set, so that later decisions whose information set includes an earlier decision
-    can be resolved too.
-    """
-    label_lists: dict[str, list[str]] = {variable.name: variable.labels for variable in network.variables}
-    label_lists.update({decision.symbol: decision.states for decision in annotation.decisions})
-
+def _read_solution_policies(
+    index_map: IndexMap, variable_values: dict[str, list[float] | float]
+) -> dict[str, DecisionPolicy]:
+    """`read_policy_from_solution`, with its errors reported as 400."""
     try:
-        policies = read_policy_from_solution(index_map, variable_values)
+        return read_policy_from_solution(index_map, variable_values)
     except KeyError as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -707,12 +1047,31 @@ def _decode_solved_policy(
         # `TypeError`: a bare scalar was given for a `z_symbol`.
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
 
+
+def _decode_solved_policy(
+    policies: dict[str, DecisionPolicy],
+    network: DiscreteNetwork,
+    annotation: DecisionAnnotation,
+    evidence: dict[str, str],
+    decision_evidence: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """`{decision_symbol: chosen_state_label}` -- a solution's `policies`, collapsed via `evidence`.
+
+    A decision in `decision_evidence` is reported as pinned. Any other decision is included only
+    when all of its information-set members are resolved. Decisions are decoded in
+    `annotation.decision_order` (or declaration order), adding each chosen label to the resolved
+    set, so that later decisions whose information set includes an earlier decision can be
+    resolved too.
+    """
+    label_lists: dict[str, list[str]] = {variable.name: variable.labels for variable in network.variables}
+    label_lists.update({decision.symbol: decision.states for decision in annotation.decisions})
+
     decoding_order = annotation.decision_order or [decision.symbol for decision in annotation.decisions]
-    resolved = dict(evidence)
-    policy: dict[str, str] = {}
+    resolved = {**evidence, **(decision_evidence or {})}
+    policy: dict[str, str] = dict(decision_evidence or {})
     for symbol in decoding_order:
         decision_policy = policies.get(symbol)
-        if decision_policy is None:
+        if decision_policy is None or symbol in policy:
             continue
         info_indices: list[int] = []
         for node in decision_policy.information_set:
@@ -791,7 +1150,8 @@ def get_policy(
         variable_values = solution.variable_values
 
     _validate_chance_evidence(network, request.evidence)
-    policy = _decode_solved_policy(index_map, network, annotation, variable_values, request.evidence)
+    policies = _read_solution_policies(index_map, variable_values)
+    policy = _decode_solved_policy(policies, network, annotation, request.evidence)
     return PolicyResponse(policy=policy)
 
 
@@ -948,7 +1308,7 @@ def _resolve_target_value(
         if not annotation.decisions:
             mean, _variance = _expected_value_no_decision(engine, objective_by_symbol[target])
             return mean
-        means, _ = _compute_utilities(engine, annotation)
+        means, _, _ = _compute_utilities(engine, annotation)
         return means[target]
 
     if target_state is None:
@@ -1152,9 +1512,7 @@ def sensitivity(
         except gum.GumException as e:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
         finally:
-            # Best-effort restore of the base evidence (every caller sets its own evidence anyway).
-            # Errors are swallowed: if pyAgrum just rejected `request.evidence`, raising here
-            # would replace the 400 above with a 500.
+            # Best-effort restore; raising here would mask the 400 above.
             try:
                 entry.engine.setEvidence(request.evidence)
                 entry.engine.makeInference()

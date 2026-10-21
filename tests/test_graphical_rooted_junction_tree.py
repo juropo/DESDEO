@@ -1,13 +1,7 @@
 """Tests for `desdeo.problem.graphical.rooted_junction_tree` (`RootedJunctionTree` construction).
 
-Phase 3 of `.claude/desdeo-graphical-models-plan.md`. Pure pydantic/pure-Python, like
-`tests/test_graphical_network.py`/`tests/test_graphical_schema.py` -- no pyAgrum involved, so
-none of these are marked `graphical`.
-
-Correctness is checked directly against the "gradual RJT" definition (running intersection,
-information-set containment, one cluster per node) rather than against a specific published
-worked example -- see the module docstring in `desdeo/problem/graphical/rooted_junction_tree.py`
-for why.
+Checked directly against the gradual RJT definition: running intersection, information-set
+containment, one cluster per node.
 """
 
 from collections import deque
@@ -23,13 +17,14 @@ from desdeo.problem.graphical import (
     DiagramConstraint,
     DiagramConstraintKind,
     DiscreteNetwork,
+    DiscreteVariable,
     ObjectiveNode,
     Potential,
     RootedJunctionTree,
     build_rooted_junction_tree,
     clear_rjt_cache,
 )
-from desdeo.problem.graphical.rooted_junction_tree import _CACHE, _CACHE_MAX_SIZE, ClusterSizeWarning
+from desdeo.problem.graphical.rooted_junction_tree import _CACHE, _CACHE_MAX_SIZE, ClusterSizeWarning, _structure_hash
 
 # ── Helpers ──────────────────────────────────────────────────────────────────────────────────
 
@@ -73,10 +68,6 @@ def _is_gradual(rjt: RootedJunctionTree, expected_nodes: set[str]) -> bool:
 
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────────────────────
-#
-# `_chain_network`/`_fork_network`/`_independent_network` are `tests/fixtures/graphical.py`'s
-# `chain_network`/`fork_network`/`independent_network`, imported above under their old private
-# names so the many call sites below didn't need touching.
 
 
 def _objective(symbol: str, parents: list[str], *, cardinality: int = 2) -> ObjectiveNode:
@@ -113,10 +104,7 @@ def test_chain_network_is_gradual():
 def test_fork_network_hub_has_two_children():
     """A -> B, A -> C: A must end up owning a cluster with two tree-children, not raise.
 
-    The objective deliberately touches only B (not C too): an objective spanning {B, C} would
-    fold C into B's family (see `test_two_objectives_sharing_one_ancestor_does_not_conflict`
-    for that case), which changes the resulting tree shape without making it any less valid --
-    this test is specifically about the *unperturbed* fork structure.
+    The objective touches only B, to keep the fork structure unperturbed.
     """
     network = _fork_network()
     annotation = DecisionAnnotation(objectives=[_objective("F", ["B"])])
@@ -139,9 +127,7 @@ def test_independent_chance_nodes_connected_via_shared_objective():
 def test_two_objectives_sharing_one_ancestor_does_not_conflict():
     """A, B, C mutually independent; objectives need {A,B} and {A,C} respectively.
 
-    Both anchors (B and C) end up wanting A; this must resolve via BFS orientation (A gets two
-    children) rather than raising a spurious "double claim" error -- see the module docstring's
-    worked-through A/B/C example.
+    Both anchors want A, which must resolve to A having two children rather than raising.
     """
     network = _independent_network("A", "B", "C")
     annotation = DecisionAnnotation(objectives=[_objective("F1", ["A", "B"]), _objective("F2", ["A", "C"])])
@@ -177,11 +163,7 @@ def test_diagram_constraint_clique_is_satisfiable():
 def test_constraint_referencing_objective_node_folds_its_parents():
     """A constraint naming an `ObjectiveNode` symbol must still get a home cluster.
 
-    `DiagramConstraint.nodes` may legally reference an objective symbol directly (e.g. a tail
-    constraint on F's own distribution -- see
-    `test_validate_against_constraint_may_reference_objective_node` in
-    `test_graphical_schema.py`), but an `ObjectiveNode` has no cardinality and can never own
-    a cluster. The clique this constraint actually needs is over F's own parents.
+    An objective can't own a cluster, so the clique is over F's own parents.
     """
     network = _independent_network("A", "B")
     constraint = DiagramConstraint(symbol="c1", kind=DiagramConstraintKind.tail, nodes=["F"], func=["F"])
@@ -339,6 +321,39 @@ def test_cache_distinguishes_different_structure():
     fork = build_rooted_junction_tree(_fork_network(), fork_annotation)
 
     assert chain is not fork
+    clear_rjt_cache()
+
+
+def test_cache_distinguishes_decision_parent_cardinality():
+    """Networks differing only in B's decision-parent axis size must not share a structure hash."""
+    clear_rjt_cache()
+    a = DiscreteVariable(name="A", labels=["lo", "hi"])
+    b = DiscreteVariable(name="B", labels=["lo", "hi"])
+    objective = ObjectiveNode(
+        symbol="F", parents=["B"], utility=Potential(variables=["B"], shape=[2], values=[0.0, 1.0])
+    )
+    annotation = DecisionAnnotation(decisions=[DecisionNode(symbol="D", states=["lo", "hi"])], objectives=[objective])
+
+    def _network_with_decision_parent(d_axis_size: int) -> DiscreteNetwork:
+        shape = [2, 2, d_axis_size]
+        row = [0.1 * (i + 1) for i in range(d_axis_size)]
+        return DiscreteNetwork(
+            variables=[a, b],
+            arcs=[("A", "B")],
+            potentials={
+                "A": Potential(variables=["A"], shape=[2], values=[0.4, 0.6]),
+                "B": Potential(variables=["B", "A", "D"], shape=shape, values=[[row, row], [row, row]]),
+            },
+        )
+
+    network_ok = _network_with_decision_parent(2)  # D's axis matches annotation's 2-state D.
+    network_bad = _network_with_decision_parent(3)  # D's axis doesn't -- invalid against annotation.
+
+    assert _structure_hash(network_ok, annotation) != _structure_hash(network_bad, annotation)
+
+    build_rooted_junction_tree(network_ok, annotation)  # Warms the cache with the valid structure.
+    with pytest.raises(ValueError, match="shape"):
+        build_rooted_junction_tree(network_bad, annotation)
     clear_rjt_cache()
 
 

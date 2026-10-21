@@ -3,7 +3,7 @@
  * Kept out of the Svelte components so it can be unit tested (see `whatif.test.ts`).
  */
 
-import type { NetworkEvidence } from './types';
+import type { NetworkEvidence, NetworkSolutionRef } from './types';
 
 /** Coalesces a burst of state-chip clicks into one request. */
 export const EVIDENCE_DEBOUNCE_MS = 150;
@@ -135,6 +135,18 @@ export function hasEvidenceDiverged(a: NetworkEvidence, b: NetworkEvidence): boo
 	return aKeys.some((key) => a[key] !== b[key]);
 }
 
+const COMPACT_NUMBER = new Intl.NumberFormat('en', {
+	notation: 'compact',
+	maximumSignificantDigits: 3
+});
+
+/** An expected utility as `"E ± sd"` in compact notation (e.g. `"20.3K ± 88.6K"`), or just `"E"`
+ *  without `stdDev`. */
+export function formatUtility(mean: number, stdDev?: number): string {
+	const formatted = COMPACT_NUMBER.format(mean);
+	return stdDev == null ? formatted : `${formatted} ± ${COMPACT_NUMBER.format(stdDev)}`;
+}
+
 /** Ideal/nadir passed to the host's `onCommitEvidence` after the backend's ratchet has run. */
 export interface CommitBounds {
 	ideal?: Record<string, number>;
@@ -152,20 +164,33 @@ export interface FetchCommitBoundsResult {
  * ideal/nadir ratchet, and resolves to the resulting bounds. Never rejects; failures resolve to
  * an `error` message for the caller to show.
  *
- * `evidence` must already be filtered to chance nodes.
+ * `evidence` must already be filtered to chance nodes; `decisionEvidence`, if given, to decision
+ * nodes (see `filterChanceEvidence`/`filterDecisionEvidence`). `solution`, if given, is the solved
+ * solution unpinned decisions follow.
  */
 export async function fetchCommitBounds(
 	fetchWhatIf: (
 		modelId: string | number,
 		evidence: NetworkEvidence,
 		signal: AbortSignal | undefined,
-		commit: boolean
+		commit: boolean,
+		decisionEvidence?: NetworkEvidence,
+		solution?: NetworkSolutionRef | null
 	) => Promise<{ ideal?: Record<string, number> | null; nadir?: Record<string, number> | null }>,
 	modelId: string | number,
-	evidence: NetworkEvidence
+	evidence: NetworkEvidence,
+	decisionEvidence: NetworkEvidence = {},
+	solution: NetworkSolutionRef | null = null
 ): Promise<FetchCommitBoundsResult> {
 	try {
-		const result = await fetchWhatIf(modelId, evidence, undefined, true);
+		const result = await fetchWhatIf(
+			modelId,
+			evidence,
+			undefined,
+			true,
+			decisionEvidence,
+			solution
+		);
 		return { bounds: { ideal: result.ideal ?? undefined, nadir: result.nadir ?? undefined } };
 	} catch (e) {
 		return { error: e instanceof Error ? e.message : 'Failed to fetch commit bounds' };

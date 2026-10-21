@@ -1,8 +1,4 @@
-"""Schema tests for `DiscreteVariable`, `Potential`, and `DiscreteNetwork`'s structural validators.
-
-Phase 1 of `.claude/desdeo-graphical-models-plan.md`. No pyAgrum involved here -- see
-`tests/test_graphical_pyagrum_adapter.py` for the adapter round-trip tests.
-"""
+"""Schema tests for `DiscreteVariable`, `Potential`, and `DiscreteNetwork`'s structural validators."""
 
 import pytest
 from pydantic import ValidationError
@@ -115,6 +111,16 @@ def test_potential_values_shape_mismatch_raises():
     """`values`'s actual nested shape must match the declared `shape`."""
     with pytest.raises(ValidationError, match="has shape"):
         Potential(variables=["C"], shape=[3], values=[0.5, 0.5])
+
+
+def test_potential_duplicate_variables_raises():
+    """A repeated name in `variables` (e.g. a decision parent listed twice) is rejected."""
+    with pytest.raises(ValidationError, match="variables must be unique"):
+        Potential(
+            variables=["B", "A", "D", "D"],
+            shape=[2, 2, 2, 2],
+            values=[[[[0.0] * 2] * 2] * 2] * 2,
+        )
 
 
 # ── DiscreteNetwork ──────────────────────────────────────────────────────────────────────────
@@ -240,6 +246,58 @@ def test_potential_shape_disagrees_with_variable_domains_raises():
             potentials={
                 "A": Potential(variables=["A"], shape=[2], values=[0.5, 0.5]),
                 "B": Potential(variables=["B", "A"], shape=[2, 2], values=[[0.5, 0.5], [0.5, 0.5]]),
+            },
+        )
+
+
+def test_potential_external_parent_is_left_unchecked():
+    """A potential naming a parent outside the network (e.g. a decision symbol) is not rejected.
+
+    That cross-check belongs to `DecisionAnnotation.validate_against`.
+    """
+    a = DiscreteVariable(name="A", labels=["0", "1"])
+    network = DiscreteNetwork(
+        variables=[a],
+        arcs=[],
+        potentials={"A": Potential(variables=["A", "D"], shape=[2, 2], values=[[0.5, 0.5], [0.5, 0.5]])},
+    )
+    assert network.potentials["A"].variables == ["A", "D"]
+
+
+def test_potential_known_parent_mismatch_raises_alongside_external_parent():
+    """A known (chance) parent mismatch still raises even with an external parent also present."""
+    a = DiscreteVariable(name="A", labels=["0", "1"])
+    b = DiscreteVariable(name="B", labels=["0", "1"])
+    with pytest.raises(ValidationError, match="but the network's arcs give it parents"):
+        DiscreteNetwork(
+            variables=[a, b],
+            arcs=[],
+            potentials={
+                "A": Potential(variables=["A"], shape=[2], values=[0.5, 0.5]),
+                "B": Potential(
+                    variables=["B", "A", "D"],
+                    shape=[2, 2, 2],
+                    values=[[[0.5, 0.5], [0.5, 0.5]], [[0.5, 0.5], [0.5, 0.5]]],
+                ),
+            },
+        )
+
+
+def test_potential_known_shape_mismatch_raises_alongside_external_parent():
+    """A known-axis shape mismatch still raises even with an external parent also present."""
+    a = DiscreteVariable(name="A", labels=["0", "1"])
+    b = DiscreteVariable(name="B", labels=["low", "mid", "high"])
+    with pytest.raises(ValidationError, match="expected"):
+        DiscreteNetwork(
+            variables=[a, b],
+            arcs=[("A", "B")],
+            potentials={
+                "A": Potential(variables=["A"], shape=[2], values=[0.5, 0.5]),
+                "B": Potential(
+                    variables=["B", "A", "D"],
+                    shape=[2, 2, 2],
+                    values=[[[0.5, 0.5], [0.5, 0.5]], [[0.5, 0.5], [0.5, 0.5]]],
+                ),
             },
         )
 

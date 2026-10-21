@@ -6,8 +6,8 @@ Includes everything from db_init.py and adds:
 - SolutionDescriptionMetaData for that problem
 - summer_cabin_battery_problem_split_scenario's base problem plus its ScenarioModelDB
   (for testing scenario detection in CUMULUS)
-- a cabin energy problem compiled from an influence diagram
-  (`desdeo.problem.graphical.demo.build_cabin_energy_demo`)
+- an Oil Wildcatter problem compiled from an influence diagram
+  (`desdeo.problem.graphical.demo.build_oil_wildcatter_demo`)
 
 Run from desdeo/api/:
     python db_init_summer_cabin.py
@@ -31,7 +31,7 @@ from desdeo.api.models.problem import (
 from desdeo.api.models.scenario import ScenarioModelDB
 from desdeo.api.routers.user_authentication import get_password_hash
 from desdeo.problem.graphical import build_rooted_junction_tree, compile_diagram
-from desdeo.problem.graphical.demo import build_cabin_energy_demo
+from desdeo.problem.graphical.demo import build_oil_wildcatter_demo
 from desdeo.problem.schema import ExtraFunction, Objective
 from desdeo.problem.testproblems import dtlz2, river_pollution_problem, simple_knapsack
 from desdeo.problem.testproblems.summer_cabin_electricity import (
@@ -128,8 +128,7 @@ DESCRIPTION_PARTS = [
         format_spec=".0f",
         suffix=" €",
     ),
-    # f_2 doesn't vary by scenario, so there's no separate expected/worst-case variant -- this is
-    # the one, single investment-cost figure, shown once rather than duplicated under both headings.
+    # f_2 doesn't vary by scenario, so it is listed once.
     DescriptionPart(label="  Total investment cost", symbol="f_2", format_spec=".0f", suffix=" €"),
     DescriptionPart(text="Expected performance:"),
     DescriptionPart(label="  Expected electricity cost", symbol="E_f_1", format_spec=".2f", suffix=" €"),
@@ -259,18 +258,19 @@ if __name__ == "__main__":
             session.add(desc_metadata_scenario)
             session.commit()
 
-            # Graphical model: a small Bayesian-network/influence-diagram-compiled cabin energy problem.
-            print("Building cabin energy graphical model...")
-            network, annotation = build_cabin_energy_demo()
+            # Oil Wildcatter problem compiled from an influence diagram
+            print("Building Oil Wildcatter graphical model...")
+            network, annotation = build_oil_wildcatter_demo()
             rjt = build_rooted_junction_tree(network, annotation)
             graphical_problem, index_map = compile_diagram(network, annotation, rjt=rjt)
             graphical_problem = graphical_problem.model_copy(
                 update={
-                    "name": "Summer cabin energy management (graphical model)",
+                    "name": "Oil Wildcatter (graphical model)",
                     "description": (
-                        "A Bayesian-network/influence-diagram-compiled cabin energy problem, with "
-                        "uncertainty over weather, solar output, and grid reliability, and a choice "
-                        "between grid and battery power."
+                        "A Bayesian-network/influence-diagram-compiled version of Raiffa's classic Oil "
+                        "Wildcatter case: whether to run a $10,000 seismic test, then whether to drill, "
+                        "under uncertainty about the site's geological structure, the test's reading, "
+                        "and the oil price. Objectives: investment cost, oil produced, and profit."
                     ),
                 }
             )
@@ -294,7 +294,7 @@ if __name__ == "__main__":
             session.add(graphical_model_metadata)
             session.commit()
             session.refresh(graphical_db)
-            print(f"Summer cabin graphical model problem added (id={graphical_db.id}).")
+            print(f"Oil Wildcatter graphical model problem added (id={graphical_db.id}).")
 
         print("Done.")
 

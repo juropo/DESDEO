@@ -1,60 +1,18 @@
 """Tests for `desdeo.problem.graphical.compile`.
 
-Phase 4 of `.claude/desdeo-graphical-models-plan.md`. Per the plan's checklist, the oracle tests
-are built before (well, alongside) the compiler, not after, and every case is checked against
-*two* independent oracles plus the compiler under test:
+Each case is checked against independent oracles as well as the compiled MILP:
 
-1. **Brute force** (`_brute_force_optimum`): enumerates every deterministic policy and every
-   chance-node joint state directly in plain Python/NumPy, with no dependency on this package's
-   own RJT/MILP machinery (only `kahn_topological_order` and `effective_information_sets`, which
-   are Phase 1/3 utilities *about* the diagram's semantics, not about compiling one). Obviously
-   correct, catches everything, but scales combinatorially -- kept to tiny diagrams. The only
-   oracle that supports multi-objective annotations (`_expected_utilities` already returns a
-   dict keyed by objective symbol) -- see `_pyagrum_meu`'s own docstring for why pyAgrum can't.
-2. **pyAgrum** (`_to_pyagrum_influence_diagram` + `ShaferShenoyLIMIDInference`/`LazyPropagation`):
-   builds the same diagram directly in pyAgrum and asks its own inference engine for the MEU.
-   Restricted to single-objective annotations -- `posteriorUtility(node)`, the per-utility-node
-   escape hatch the Phase 2 findings expected to need for multi-objective comparison, turns out
-   *not* to collapse to a scalar (confirmed empirically; see `_pyagrum_meu`'s docstring), so
-   `MEU()['mean']` is used instead, matching what the plan's checklist actually asked for
-   ("single-objective unconstrained cases"). `addNoForgettingAssumption` is required to match
-   classical (non-LIMID) semantics whenever `annotation.no_forgetting` is set (not merely
-   `decision_order` -- also confirmed empirically, see `_pyagrum_meu`).
-3. Property-based generation of small random Bayesian networks (`gum.randomBN`, same style as
-   `test_graphical_pyagrum_adapter.py`) with a decision and an objective grafted on, checked
-   against both oracles above.
+1. **Brute force** (`_brute_force_optimum`): enumerates every deterministic policy and chance-node
+   joint state in plain Python/NumPy. Supports multi-objective annotations; tiny diagrams only.
+2. **pyAgrum** (`to_pyagrum_influence_diagram` + `ShaferShenoyLIMIDInference`/`LazyPropagation`):
+   single-objective only (see `_pyagrum_meu`).
+3. Property-based random small networks (`gum.randomBN`) with a decision and objective grafted on.
 
-pyAgrum is a hard dependency (see the plan's design decisions) but every test here also solves
-the compiled MILP via gurobipy, so the module is marked both `graphical` and `gurobipy` for
-selection (`pytest -m "graphical and gurobipy"`), not skip -- `pytest -m "not gurobipy"` still
-deselects it correctly for a machine/CI run without a Gurobi license.
+Diagram constraints use `_brute_force_optimum_feasible` and `_brute_force_marginal`. Risk measures
+(CVaR, Herrala, Terho & Oliveira 2025) use `_brute_force_cvar`, plus the Rockafellar & Uryasev
+relationships `CVaR_alpha -> E[utility]` as `alpha -> 1` and `CVaR_alpha <= E[utility]`.
 
-**Phase 5 additions** (`_build_diagram_constraint`, `DiagramConstraint` compilation): the
-"decision"-kind and "probability"/"expected_value"-kind cases below get their own oracle checks,
-since neither existing oracle (`_pyagrum_meu` doesn't model diagram-level side constraints at all;
-`_brute_force_optimum` enumerates *every* policy, not just feasible ones) covers a constrained
-diagram as-is. `_brute_force_optimum_feasible` restricts `_brute_force_optimum`'s own enumeration
-to policies passing a feasibility predicate (decision-kind); `_brute_force_marginal` computes
-P(node == state) under one fixed policy directly from the network's own CPTs, independent of the
-compiler's mu/`IndexMap` machinery (probability/expected_value-kind, read back via `_read_back_policy`
--- factored out of what was `_read_back_policy_and_reverify`'s own inline block, now shared).
-
-**Phase 6 additions** (`_build_risk_measure`, `RiskMeasure`/CVaR compilation, Herrala, Terho &
-Oliveira 2025): the paper's own Section 4/Appendix A only report solve-time plots for their
-risk-averse pig farm experiment, no exact reproducible published CVaR number, so validation here
-does not (cannot) check against a published numeric value -- see `test_pig_farm_cvar_matches_
-brute_force_oracle`'s docstring. Instead: (1) `_brute_force_cvar` (built on
-`_utility_distribution_for_policy` + `_cvar_from_distribution`, both independent of
-`_build_risk_measure`'s own eta/lambda/rho machinery -- the textbook VaR/CVaR definition applied
-directly to a from-first-principles utility distribution) is the CVaR analogue of
-`_brute_force_optimum`, checked against a literal instance of the paper's own pig farm running
-example (Section 2.1) plus several small hand-built and property-based random diagrams; (2) two
-literature relationships from Rockafellar & Uryasev (2000, cited by the paper itself for CVaR):
-`CVaR_alpha -> E[utility]` as `alpha -> 1`, checked at `alpha=0.999` against Phase 4's own
-already-oracle-tested `_build_objective` expected-value `Objective`, compiled *side by side on the
-same `Problem`* as the `RiskMeasure`'s own `Objective` -- a real regression-style cross-check
-between two independently-built code paths in this module, not just self-consistency; and
-`CVaR_alpha <= E[utility]` for every `alpha`, plus `CVaR_alpha` monotone non-decreasing in `alpha`.
+Every test solves via gurobipy, so the module is marked `gurobipy` as well as `graphical`.
 """
 
 import itertools
@@ -190,12 +148,7 @@ def _brute_force_optimum_feasible(
     objective_symbol: str,
     feasible,
 ) -> float:
-    """`_brute_force_optimum`, restricted to policies for which `feasible(policy)` is true.
-
-    `policy` is the same `{decision_symbol: (info_order, {info_state: chosen_state})}` mapping
-    `_enumerate_policies` yields -- the ground truth for a `kind == "decision"` `DiagramConstraint`
-    test, which is exactly a hard restriction on which deterministic policies are legal.
-    """
+    """`_brute_force_optimum`, restricted to policies for which `feasible(policy)` is true."""
     cardinality = _cardinalities(network, annotation)
     eff = effective_information_sets(annotation)
     order = _topological_order(network, annotation)
@@ -220,13 +173,7 @@ def _brute_force_marginal(
     node: str,
     state_index: int,
 ) -> float:
-    """P(`node` == `state_index`) under one fixed deterministic policy.
-
-    Direct from the network's own CPTs -- independent of the compiler's own mu/`IndexMap`
-    marginalisation machinery, so it's a real check of a `kind in {"probability",
-    "expected_value"}` `DiagramConstraint`'s effect, not a restatement of it. Same iteration shape
-    as `_expected_utilities`, accumulating probability mass instead of utility.
-    """
+    """P(`node` == `state_index`) under one fixed deterministic policy, from the network's CPTs."""
     var_names = [variable.name for variable in network.variables]
     total = 0.0
 
@@ -258,13 +205,7 @@ def _utility_distribution_for_policy(
     policy_by_decision: dict[str, tuple[list[str], dict]],
     objective_symbol: str,
 ) -> dict[float, float]:
-    """`{utility_value: probability_mass}` for one objective under one fixed deterministic policy.
-
-    Same iteration shape as `_expected_utilities`, but bucketing probability mass by utility value
-    instead of summing `prob * util` into one scalar -- the full realizable distribution a Phase 6
-    `RiskMeasure`/CVaR oracle needs, independent of this package's own mu/`_build_risk_measure`
-    machinery (only network CPTs and the objective's own utility table are read).
-    """
+    """`{utility_value: probability_mass}` for one objective under one fixed deterministic policy."""
     var_names = [variable.name for variable in network.variables]
     objective = next(o for o in annotation.objectives if o.symbol == objective_symbol)
     utility_array = np.array(objective.utility.values, dtype=float)
@@ -298,11 +239,7 @@ def _utility_distribution_for_policy(
 def _cvar_from_distribution(mass_by_value: dict[float, float], alpha: float) -> float:
     """Textbook CVaR_alpha of `mass_by_value`'s *lower* tail (Rockafellar & Uryasev 2000).
 
-    Sort ascending, accumulate probability mass until `alpha` is reached (the boundary value's own
-    mass taken fractionally so the tail used is exactly `alpha`, matching VaR_alpha's definition as
-    the alpha-quantile), and return the probability-weighted average of that tail. No dependency on
-    this package's own `_build_risk_measure`/eta/lambda/rho machinery -- a from-first-principles
-    oracle, not a restatement of the MILP.
+    The boundary value's mass is taken fractionally so the tail is exactly `alpha`.
     """
     remaining = alpha
     weighted = 0.0
@@ -318,14 +255,9 @@ def _cvar_from_distribution(mass_by_value: dict[float, float], alpha: float) -> 
 def _brute_force_cvar(
     network: DiscreteNetwork, annotation: DecisionAnnotation, objective_symbol: str, alpha: float
 ) -> float:
-    """The exact CVaR_alpha optimum for `objective_symbol`.
+    """The exact CVaR_alpha optimum for `objective_symbol`, by enumerating every policy.
 
-    Enumerates every deterministic policy and computes each one's full utility distribution from
-    first principles. Mirrors `_brute_force_optimum`'s policy search, but optimizes
-    `_cvar_from_distribution` (in the same sign convention `_build_risk_measure`'s compiled
-    `Objective` uses -- see the module docstring's "Sign convention for a minimizing target":
-    negate the distribution, take the lower-tail CVaR of *that*, negate back) instead of the plain
-    expectation.
+    Minimized objectives are negated, take the lower-tail CVaR, and negate back.
     """
     cardinality = _cardinalities(network, annotation)
     eff = effective_information_sets(annotation)
@@ -348,28 +280,14 @@ def _brute_force_cvar(
 
 
 # ── Oracle 2: pyAgrum's own LIMID inference ─────────────────────────────────────────────────────
-# `_to_pyagrum_influence_diagram` was promoted to a public adapter function,
-# `adapters.pyagrum.to_pyagrum_influence_diagram`, since Phase 7's `/graphical/whatif` needs the
-# exact same diagram-building logic outside this test module. Imported above, not redefined here.
 
 
 def _pyagrum_meu(network: DiscreteNetwork, annotation: DecisionAnnotation, objective_symbol: str) -> float:
     """The expected utility for `objective_symbol`, computed via pyAgrum's own inference.
 
-    Restricted to single-objective diagrams, matching the plan's own oracle-test scoping ("pyAgrum
-    `ShaferShenoyLIMIDInference.MEU()` for single-objective unconstrained cases") -- `MEU()` sums
-    every utility node into one scalar (the Phase 2 finding), and `posteriorUtility(node)` turns
-    out *not* to be the per-node escape hatch that finding suggested: it stays indexed by that
-    node's own remaining decision/chance parents rather than collapsing to a single expected
-    value (confirmed empirically -- it returns the raw, un-reduced utility table), so recovering
-    one objective's share of a multi-objective MEU needs more than reading it directly. Out of
-    scope here; every test case in this module has exactly one `ObjectiveNode`.
-
-    `ShaferShenoyLIMIDInference` also refuses to run at all ("This LIMID/Influence Diagram is not
-    solvable") on a diagram with *zero* decision nodes -- unsurprising, since ID solving is
-    fundamentally about policies -- so the decision-less case (a plain expectation over a
-    Bayesian network) uses a different pyAgrum entry point: `LazyPropagation` over the plain
-    `BayesNet` part, contracted against the utility table directly.
+    Single-objective only: `MEU()` sums every utility node, and `posteriorUtility(node)` doesn't
+    reduce to a scalar. Diagrams without decisions use `LazyPropagation`, since
+    `ShaferShenoyLIMIDInference` refuses them.
     """
     if len(annotation.objectives) != 1:
         msg = "_pyagrum_meu only supports single-objective annotations (see the docstring)."
@@ -401,13 +319,8 @@ def _pyagrum_meu(network: DiscreteNetwork, annotation: DecisionAnnotation, objec
     inference = gum.ShaferShenoyLIMIDInference(diagram)
 
     if annotation.no_forgetting:
-        # `decision_order` alone is *not* enough to trigger this: per `DecisionAnnotation`'s own
-        # docstring, `no_forgetting` is a separate flag that must also be set -- `decision_order`
-        # without it still means each decision uses only its own declared `information_set`
-        # (LIMID semantics), just with an extra temporal-ordering constraint. Confirmed empirically
-        # that this overload wants decision *names*, not the node ids the docstring itself claims
-        # -- the id overload raises `NotFound: No element with the key <>` even for a plainly
-        # valid id.
+        # Needed only with `no_forgetting`, not `decision_order` alone. Takes decision names;
+        # the id overload raises `NotFound`.
         inference.addNoForgettingAssumption(list(annotation.decision_order))
 
     inference.makeInference()
@@ -431,13 +344,8 @@ def _compiled_optimum(network: DiscreteNetwork, annotation: DecisionAnnotation, 
 def _read_back_policy(annotation: DecisionAnnotation, index_map: IndexMap, result):
     """Reconstruct `{decision_symbol: (info_order, {info_state: chosen_state})}` from a solved `z`.
 
-    Thin adapter over `read_policy_from_solution` (Phase E's promotion of what used to be this
-    function's own inline block into real library code, `compile.py`) -- decodes that function's
-    flat-index-keyed `DecisionPolicy.policy` into the tuple-keyed shape `_expected_utilities`/
-    `_enumerate_policies` (this module's own independent brute-force oracle) already expect, and
-    re-asserts the "a genuinely solved binary z has exactly one 1.0 per block" property directly
-    (a solver-correctness check that belongs to this test module's oracle role, not to the library
-    function itself -- see its own docstring for why it doesn't assert this).
+    Wraps `read_policy_from_solution` in the shape the brute-force oracle uses, and asserts each
+    `z` block has exactly one 1.0.
     """
     policies = read_policy_from_solution(
         index_map, {sym: result.optimal_variables[sym] for sym in (dm.z_symbol for dm in index_map.decisions.values())}
@@ -468,11 +376,7 @@ def _read_back_policy_and_reverify(
 ) -> None:
     """Reconstruct the solved policy from `IndexMap` + solved `z`, confirm brute force agrees.
 
-    Exercises `IndexMap` itself -- the plan calls it "load-bearing for reading policies back out
-    of solutions" (Phase E), but nothing else in this module reads it. Every other assertion in
-    this suite only checks the compiled *objective value*; a silently permuted
-    `DecisionIndexMap.information_set`/`states` ordering would still pass all of those (the MILP
-    itself doesn't care what order `IndexMap` reports) yet break exactly this readback.
+    Catches `IndexMap` ordering errors, which objective values alone wouldn't reveal.
     """
     problem, index_map = compile_diagram(network, annotation)
     result = GurobipySolver(problem).solve(objective_symbol)
@@ -606,13 +510,42 @@ def test_decision_observes_chance_node():
     _assert_all_agree(network, annotation, "fmatch")
 
 
-def test_read_policy_from_solution_returns_full_policy_function():
-    """`read_policy_from_solution` (Phase E) reports a per-information-state function.
+def test_chance_node_cpt_conditions_on_decision():
+    """B's own CPT conditions on both a chance parent A and a decision D.
 
-    Not one collapsed choice -- the whole point of promoting it out of the test-private helper.
-    Reuses `test_decision_observes_chance_node`'s own fixture: D observes A and is rewarded for
-    matching it, so the optimal policy genuinely differs by information state (`D="s0"` when
-    `A="lo"`, `D="s1"` when `A="hi"`) -- a single collapsed "the" choice would be meaningless here.
+    D has no information set, so the optimal policy is driven by D's effect on B's distribution:
+    P(B=hi | D=low) = 0.3, P(B=hi | D=high) = 0.75.
+    """
+    network = DiscreteNetwork(
+        variables=[DiscreteVariable(name="A", labels=["lo", "hi"]), DiscreteVariable(name="B", labels=["lo", "hi"])],
+        arcs=[("A", "B")],
+        potentials={
+            "A": Potential(variables=["A"], shape=[2], values=[0.5, 0.5]),
+            "B": Potential(
+                variables=["B", "A", "D"],
+                shape=[2, 2, 2],
+                values=[[[0.8, 0.4], [0.6, 0.1]], [[0.2, 0.6], [0.4, 0.9]]],
+            ),
+        },
+    )
+    annotation = DecisionAnnotation(
+        decisions=[DecisionNode(symbol="D", states=["low", "high"])],
+        objectives=[
+            ObjectiveNode(
+                symbol="fB",
+                parents=["B"],
+                utility=Potential(variables=["B"], shape=[2], values=[0.0, 1.0]),
+                maximize=True,
+            )
+        ],
+    )
+    _assert_all_agree(network, annotation, "fB")
+
+
+def test_read_policy_from_solution_returns_full_policy_function():
+    """`read_policy_from_solution` reports a per-information-state function.
+
+    D observes A and is rewarded for matching it, so the policy differs by information state.
     """
     network = DiscreteNetwork(
         variables=[DiscreteVariable(name="A", labels=["lo", "hi"])],
@@ -716,12 +649,7 @@ def test_two_decisions_without_no_forgetting_is_worse_or_equal():
     without_memory = _make(False)
     _assert_all_agree(network, with_memory, "fchain")
 
-    # pyAgrum's own solver refuses this second diagram outright ("This LIMID/Influence Diagram
-    # is not solvable") -- confirmed empirically that `decisionOrderExists()` is False for it:
-    # with no_forgetting off, D2 has no information set and no arc from/through D1 either, so
-    # pyAgrum can't derive *any* decision order from the graph, even though brute force and the
-    # compiler both handle "decisions with no temporal graph link between them" just fine (there
-    # is nothing to order -- each is an independent choice). So only brute force checks this half.
+    # pyAgrum can't derive a decision order here ("not solvable"), so only brute force checks it.
     brute_force_without_memory = _brute_force_optimum(network, without_memory, "fchain")
     compiled_without_memory = _compiled_optimum(network, without_memory, "fchain")
     assert compiled_without_memory == pytest.approx(brute_force_without_memory, abs=1e-6)
@@ -733,13 +661,7 @@ def test_two_decisions_without_no_forgetting_is_worse_or_equal():
 def test_multi_objective_including_all_zero_utility():
     """Two objectives compiled together, one with an all-zero utility table.
 
-    Regression test for a bug the code review caught: an all-zero utility table used to compile
-    to `func = [0.0]`, which looks like valid MathJSON (a single-literal terminal) but isn't a
-    node any backend's parser matches as an entire `func` -- and since `GurobipyEvaluator` parses
-    every objective at construction, one degenerate objective made the *whole* compiled `Problem`
-    unsolvable, not just its own. pyAgrum's own oracle can't check multi-objective diagrams (see
-    `_pyagrum_meu`'s docstring), so this is checked against brute force only -- `_expected_utilities`
-    already returns a value per objective symbol, exactly for this case.
+    Checked against brute force only, since the pyAgrum oracle is single-objective.
     """
     network = DiscreteNetwork(
         variables=[DiscreteVariable(name="A", labels=["lo", "hi"])],
@@ -811,19 +733,11 @@ def test_random_small_diagrams_all_oracles_agree(seed, n, domain_size, ratio_arc
     _assert_all_agree(network, annotation, "obj")
 
 
-# ── Phase G hardening: compile_diagram robustness against a caller-supplied rjt ─────────────────
+# ── compile_diagram robustness against a caller-supplied rjt ────────────────────────────────────
 
 
 def test_malformed_root_cluster_separator_raises():
-    """A caller-supplied `rjt` whose root cluster has a non-empty separator is rejected.
-
-    Regression test for the audit's root-mass finding: the total-probability-mass constraint
-    used to pin `root_map.separator_symbols[0] == 1`, which only equals the root's own total mass
-    because `build_rooted_junction_tree` always produces a singleton root cluster (empty
-    separator). A hand-built `rjt` violating that invariant -- `rjt.clusters[rjt.root].separator
-    != []` -- used to compile without error and solve to a silently wrong optimum. Now rejected
-    outright at compile time, naming the offending cluster.
-    """
+    """A caller-supplied `rjt` whose root cluster has a non-empty separator is rejected."""
     network = DiscreteNetwork(
         variables=[DiscreteVariable(name="A", labels=["lo", "hi"]), DiscreteVariable(name="B", labels=["lo", "hi"])],
         arcs=[("A", "B")],
@@ -850,15 +764,13 @@ def test_malformed_root_cluster_separator_raises():
         compile_diagram(network, annotation, rjt=bad_rjt)
 
 
-# ── Phase 5: DiagramConstraint compilation ──────────────────────────────────────────────────────
+# ── DiagramConstraint compilation ───────────────────────────────────────────────────────────────
 
 
 def test_decision_constraint_exclusivity_changes_optimum():
     """A `kind == "decision"` exclusivity constraint over two unconditional decisions' states.
 
-    Checked against `_brute_force_optimum_feasible`, restricted to policies that actually satisfy
-    the same exclusivity condition -- the "enumerate only feasible policies" oracle the task asks
-    for, not just a before/after objective-value comparison.
+    Checked against `_brute_force_optimum_feasible` with the same exclusivity condition.
     """
     network = DiscreteNetwork(variables=[], arcs=[], potentials={})
     annotation = DecisionAnnotation(
@@ -908,14 +820,8 @@ def test_decision_constraint_exclusivity_changes_optimum():
 def test_probability_constraint_on_decision_marginal_changes_optimum():
     """A `kind == "probability"` bound on a decision's own marginal, P(D == "s1") <= 0.5.
 
-    D perfectly matching A (the unconstrained optimum) would put P(D == "s1") == P(A == "hi")
-    == 0.7, violating the bound -- so the constraint is genuinely binding. Checked against
-    `_brute_force_marginal` (independent of the compiler's own mu machinery) on the actual solved
-    policy, read back via `IndexMap` the same way `_read_back_policy_and_reverify` does -- and,
-    with real power (unlike a bare "the returned policy satisfies the bound" check, which every
-    policy in this tiny 4-policy space would trivially pass or fail regardless of whether the
-    *optimum* was computed correctly), against `_brute_force_optimum_feasible`'s own enumeration
-    restricted to the same bound via `_brute_force_marginal`.
+    The unconstrained optimum gives P(D == "s1") == 0.7, so the bound is binding. Checked against
+    `_brute_force_marginal` on the solved policy and against `_brute_force_optimum_feasible`.
     """
     network = DiscreteNetwork(
         variables=[DiscreteVariable(name="A", labels=["lo", "hi"])],
@@ -975,12 +881,7 @@ def test_probability_constraint_on_decision_marginal_changes_optimum():
 def test_expected_value_constraint_on_decision_cost_changes_optimum():
     """A `kind == "expected_value"` bound on a weighted cost over D's own states.
 
-    Same diagram as the probability test above, but the constraint is a genuine weighted linear
-    combination (2 * P(D == "s0") + 5 * P(D == "s1") <= 3.0) rather than a single state's
-    probability -- `probability`/`expected_value` compile identically (see the module docstring),
-    so this exercises that the substitution composes correctly under `Add`/`Multiply`, not just a
-    lone `At`. Checked against `_brute_force_optimum_feasible`, restricted by the same weighted
-    bound via `_brute_force_marginal`, for real oracle power (see the probability test above).
+    2 * P(D == "s0") + 5 * P(D == "s1") <= 3.0, exercising substitution under `Add`/`Multiply`.
     """
     network = DiscreteNetwork(
         variables=[DiscreteVariable(name="A", labels=["lo", "hi"])],
@@ -1045,7 +946,7 @@ def test_expected_value_constraint_on_decision_cost_changes_optimum():
 
 
 def test_tail_constraint_raises():
-    """`kind == "tail"` is rejected at compile time -- Phase 6's risk-measure transform, not this."""
+    """`kind == "tail"` is rejected at compile time; it needs a risk-measure transform."""
     network = DiscreteNetwork(
         variables=[DiscreteVariable(name="A", labels=["lo", "hi"])],
         arcs=[],
@@ -1164,16 +1065,7 @@ def test_constraint_at_index_out_of_range_raises():
 
 
 def test_constraint_multiply_of_two_node_terms_raises():
-    """A `Multiply` of two node-derived `At` terms is bilinear, not linear -- rejected.
-
-    Regression test for the code review's most severe finding: this used to compile silently
-    with `is_linear=True`/`is_convex=True`/`is_twice_differentiable=True` hardcoded regardless,
-    corrupting `Problem.is_linear` (an `all()` over every element -- one lying constraint poisons
-    solver selection for the whole `Problem`) and risking a genuinely quadratic constraint being
-    handed to a pure-MILP solver on the strength of that false flag. `["Multiply", At_A, At_B]`
-    would compute an independence-assuming *product* of two marginals, not a joint-event
-    probability either way -- out of this compiler's scope regardless (see the module docstring).
-    """
+    """A `Multiply` of two node-derived `At` terms is bilinear, not linear -- rejected."""
     network = DiscreteNetwork(
         variables=[
             DiscreteVariable(name="A", labels=["lo", "hi"]),
@@ -1206,13 +1098,7 @@ def test_constraint_multiply_of_two_node_terms_raises():
 
 
 def test_constraint_referencing_undeclared_node_raises():
-    """A node referenced in `func` but missing from `DiagramConstraint.nodes` is rejected.
-
-    Regression test: this used to compile cleanly and only fail at *solve* time with an opaque
-    `GurobipyEvaluatorError: No expression with name A found in the gurobipy model`, naming
-    neither the constraint nor the missing `nodes` entry -- exactly the class of error this module
-    claims to prevent at compile time.
-    """
+    """A node referenced in `func` but missing from `DiagramConstraint.nodes` is rejected."""
     network = DiscreteNetwork(
         variables=[DiscreteVariable(name="A", labels=["lo", "hi"])],
         arcs=[],
@@ -1245,17 +1131,7 @@ def test_constraint_referencing_undeclared_node_raises():
 
 
 def test_constraint_referencing_colliding_objective_symbol_raises():
-    """A bare `func` reference to a name colliding with an `ObjectiveNode.symbol` is rejected.
-
-    Regression test for the code review's second finding, collision variant: nothing in the
-    schema forbids an `ObjectiveNode.symbol` from colliding with a chance-node name (only
-    decision/chance collisions are checked -- see `DecisionAnnotation.validate_against`). Before
-    the fix, a bare reference like this fell straight through `_substitute_at_nodes` unsubstituted
-    (its scope check only covered `diagram_constraint.nodes`) and would have silently resolved at
-    solve time to whatever compiled `Problem` symbol happens to share that name -- here, the
-    objective's own compiled expression -- instead of erroring, producing a constraint meaning
-    something completely different from what was written, with no error anywhere.
-    """
+    """A bare `func` reference to a name colliding with an `ObjectiveNode.symbol` is rejected."""
     network = DiscreteNetwork(
         variables=[
             DiscreteVariable(name="A", labels=["lo", "hi"]),
@@ -1292,17 +1168,7 @@ def test_constraint_referencing_colliding_objective_symbol_raises():
 
 
 def test_constraint_referencing_risk_measure_symbol_raises():
-    """A bare `func` reference to a `RiskMeasure.symbol` is rejected, the same as an `ObjectiveNode`.
-
-    Regression test for a Phase 6 code-review finding: `RiskMeasure.symbol` compiles to a real
-    `Objective` in the emitted `Problem`, exactly like an `ObjectiveNode.symbol` -- but
-    `compile_diagram`'s `objective_symbols` (built only from `annotation.objectives`) used to leave
-    every risk-measure symbol invisible to both `_build_diagram_constraint`'s `referenced_objectives`
-    rejection and `_substitute_at_nodes`'s undeclared-reference guard. Before the fix, a
-    `probability`/`expected_value`-kind constraint referencing a risk measure's own symbol compiled
-    silently and was *actually enforced* as a live bound on the compiled CVaR value -- a working
-    back-door around the deliberate `kind == "tail"` rejection.
-    """
+    """A bare `func` reference to a `RiskMeasure.symbol` is rejected, the same as an `ObjectiveNode`."""
     network = DiscreteNetwork(
         variables=[DiscreteVariable(name="W", labels=["lose", "win"])],
         arcs=[],
@@ -1334,16 +1200,7 @@ def test_constraint_referencing_risk_measure_symbol_raises():
 
 
 def test_constraint_referencing_risk_measure_internal_symbol_raises():
-    """A bare `func` reference to a risk measure's own internal `eta` variable is rejected.
-
-    Regression test for the same Phase 6 code-review finding as above, internal-symbol variant:
-    `eta_<risk_measure_symbol>` (and the `lambda`/`lambda_bar`/`rho`/`rho_bar` symbols alongside it)
-    are this module's own reserved MILP implementation variables, never meant to be reachable from
-    a `DiagramConstraint` under any `kind`. Before the fix this silently bound against the internal
-    eta variable directly and only failed at *solve* time with a bare `IndexError` from inside the
-    evaluator -- exactly the "silently passed through unsubstituted" failure mode the module
-    docstring says is supposed to be rejected at compile time.
-    """
+    """A bare `func` reference to a risk measure's own internal `eta` variable is rejected."""
     network = DiscreteNetwork(
         variables=[DiscreteVariable(name="W", labels=["lose", "win"])],
         arcs=[],
@@ -1375,16 +1232,7 @@ def test_constraint_referencing_risk_measure_internal_symbol_raises():
 
 
 def test_constraint_referencing_compiler_internal_mu_symbol_raises():
-    """A bare `func` reference to this module's own internal `mu_<node>` symbol is rejected.
-
-    Regression test: `known_symbols` (feeding `_substitute_at_nodes`'s undeclared-reference
-    guard) used to cover chance/decision nodes, objectives, and risk-measure internals, but not
-    the compiler's own `mu_*`/`z_*`/`sep_*` namespace. A `DiagramConstraint.func` written directly
-    over `mu_A` (bypassing the `At`-substitution path entirely) used to fall straight through
-    `_substitute_at_nodes` unsubstituted and still compile with hardcoded `is_linear=True`, even
-    though `["Multiply", "mu_A", "mu_A"]` is a genuinely bilinear expression -- poisoning
-    `Problem.is_linear` for the whole model.
-    """
+    """A bare `func` reference to this module's own internal `mu_<node>` symbol is rejected."""
     network = DiscreteNetwork(
         variables=[DiscreteVariable(name="A", labels=["lo", "hi"])],
         arcs=[],
@@ -1411,16 +1259,7 @@ def test_constraint_referencing_compiler_internal_mu_symbol_raises():
 
 
 def test_constraint_at_unknown_symbol_raises():
-    """`["At", sym, k]` where `sym` isn't even a known node/objective/risk-measure symbol is rejected.
-
-    Regression test: `_substitute_at_nodes`'s `if node in known_symbols:` guard meant nothing
-    happened for an entirely unknown `sym` -- execution fell through to the generic list-walk
-    below, which recursed into `"At"` as an ordinary operator and the unknown symbol as an
-    unmatched leaf, silently returning `["At", "Z", 1]` unchanged (`is_node_derived=False`)
-    instead of raising at compile time. The module's own docstring claims this case raises;
-    before the fix it didn't, surfacing only as an opaque error once the solver backend tried to
-    evaluate a reference to a symbol that was never compiled.
-    """
+    """`["At", sym, k]` where `sym` isn't even a known node/objective/risk-measure symbol is rejected."""
     network = DiscreteNetwork(
         variables=[DiscreteVariable(name="A", labels=["lo", "hi"])],
         arcs=[],
@@ -1447,16 +1286,7 @@ def test_constraint_at_unknown_symbol_raises():
 
 
 def test_constraint_node_in_operator_position_raises():
-    """A node symbol appearing in operator position (`func[0]`) is rejected.
-
-    Regression test: the generic list-walk branch of `_substitute_at_nodes` only ever recursed
-    into `func[1:]` (the operands), never checking `func[0]` (the operator) against
-    `known_symbols` at all -- contradicting the module's own docstring, which already claims a
-    node reference "in operator position" raises `ValueError`. Before the fix, `["A", 1]` (node
-    `"A"` used nonsensically as an operator) passed straight through unsubstituted and
-    unflagged, surfacing only as an opaque error once a solver backend's own MathJSON parser
-    tried to interpret `"A"` as an operator it doesn't recognise.
-    """
+    """A node symbol appearing in operator position (`func[0]`) is rejected."""
     network = DiscreteNetwork(
         variables=[DiscreteVariable(name="A", labels=["lo", "hi"])],
         arcs=[],
@@ -1485,16 +1315,9 @@ def test_constraint_node_in_operator_position_raises():
 def test_probability_constraint_on_chance_node_via_nonowning_cluster():
     """A `kind == "probability"` bound on a chance node read out of a *non-owning* cluster's mu.
 
-    `RootedJunctionTree.find_containing_cluster([node])` doesn't always return `node`'s own
-    cluster: here `X` (cardinality 3) has two cardinality-4 CPT parents `P1`/`P2`, so `X`'s own
-    cluster (`{P1, P2, X}`, state space 48) is larger than `Y`'s cluster (`{X, Y}`, state space 6
-    -- `Y`'s only CPT parent is `X`), so `find_containing_cluster(["X"])` picks `Y`'s cluster
-    instead (the "smallest by state_space_size" rule -- see `Cluster.find_containing_cluster`).
-    This is exactly the configuration most likely to hide an index/ordering bug in the
-    marginal-substitution machinery -- nothing else in this suite exercises it. `X`'s CPT is
-    deliberately independent of `P1`/`P2`'s actual values (the same distribution over `X` for
-    every `(P1, P2)` combination), so the true marginal P(X == k) is just that fixed
-    distribution's own k'th entry, checkable by inspection rather than by hand-summing a 4x4 joint.
+    `X`'s own cluster (state space 48) is larger than `Y`'s (`{X, Y}`, 6), so
+    `find_containing_cluster(["X"])` picks `Y`'s. `X`'s CPT ignores its parents, so P(X == k) is
+    read directly off it.
     """
     network = DiscreteNetwork(
         variables=[
@@ -1555,7 +1378,7 @@ def test_probability_constraint_on_chance_node_via_nonowning_cluster():
     assert not infeasible_result.success
 
 
-# ── Phase 6: RiskMeasure / CVaR compilation ─────────────────────────────────────────────────────
+# ── RiskMeasure / CVaR compilation ──────────────────────────────────────────────────────────────
 
 
 def test_cvar_hand_computed_maximize():
@@ -1594,12 +1417,7 @@ def test_cvar_hand_computed_maximize():
 def test_cvar_hand_computed_minimize_sign_convention():
     """The same distribution/values as above, but as a cost to *minimize*.
 
-    Exercises `_build_risk_measure`'s sign-flip path directly: internally CVaR is computed over
-    the negated (maximize-convention) values, then negated back -- the result should be the
-    risk-averse average of the worst (highest) alpha-tail *costs*, i.e.
-    (0.2*30 + 0.3*20 + 0.1*10) / 0.6 = 13.0 / 0.6 (compare against the maximize case above: here
-    the *high* values 30/20 dominate the tail, not the low value 10, since a cost-minimizer's
-    risk-averse tail is the expensive outcomes).
+    The tail is now the highest costs: (0.2*30 + 0.3*20 + 0.1*10) / 0.6 = 13.0 / 0.6.
     """
     network = DiscreteNetwork(
         variables=[DiscreteVariable(name="A", labels=["s0", "s1", "s2"])],
@@ -1627,11 +1445,7 @@ def test_cvar_hand_computed_minimize_sign_convention():
 
 
 def test_cvar_degenerate_single_utility_value():
-    """A constant utility (|U| == 1): the epsilon/M degenerate case in `_cvar_epsilon`/`big_m`.
-
-    CVaR_alpha of a one-point distribution is that point, for any alpha -- checked directly, not
-    just against `_brute_force_cvar` (which would degenerate the same way for the same reason).
-    """
+    """A constant utility (|U| == 1): the epsilon/M degenerate case in `_cvar_epsilon`/`big_m`."""
     network = DiscreteNetwork(
         variables=[DiscreteVariable(name="A", labels=["lo", "hi"])],
         arcs=[],
@@ -1653,15 +1467,10 @@ def test_cvar_degenerate_single_utility_value():
 
 
 def test_risk_averse_decision_prefers_safe_over_risky_bet():
-    """A genuine EV-optimal vs. CVaR-optimal policy divergence -- the point of a risk measure.
+    """EV-optimal and CVaR-optimal policies differ.
 
-    D chooses between a deterministic "safe" payoff of 5 and a "gamble" that pays 0 or 12 with
-    equal probability (EV 6 > 5, so an *expected-value*-maximizing policy always gambles -- see
-    `unconstrained_ev` below). At alpha=0.5, CVaR_0.5(gamble) = 0.0 (the worst half of its own
-    outcomes is the losing branch) while CVaR_0.5(safe) = 5.0 (constant, so equal to itself for
-    any alpha) -- a risk-averse policy should choose "safe" instead, the opposite of the
-    EV-optimal choice. Checked against `_brute_force_cvar`'s own independent policy search, not
-    just the hand-computed values.
+    D chooses a safe payoff of 5 or a gamble paying 0 or 12 with equal probability. EV prefers the
+    gamble (6 > 5); at alpha=0.5, CVaR prefers safe (5 > 0).
     """
     network = DiscreteNetwork(
         variables=[DiscreteVariable(name="W", labels=["lose", "win"])],
@@ -1694,29 +1503,14 @@ def test_risk_averse_decision_prefers_safe_over_risky_bet():
 def _pig_farm_network() -> DiscreteNetwork:
     """The single-value-node pig farm problem, reduced to one treatment period.
 
-    Herrala, Terho & Oliveira 2025, Section 2.1 -- exact parameters from the paper, confirmed
-    against the PDF directly (page 2): healthy price 1000 DKK, ill price 300 DKK, treatment cost
-    100 DKK, test specificity 80%/sensitivity 90%, cure probability 0.5 with treatment / 0.1
-    without (spontaneous), disease-development probability 0.1 with treatment / 0.2 without,
+    Herrala, Terho & Oliveira 2025, Section 2.1: healthy price 1000 DKK, ill price 300 DKK,
+    treatment cost 100 DKK, test specificity 80%/sensitivity 90%, cure probability 0.5 with
+    treatment / 0.1 without, disease-development probability 0.1 with treatment / 0.2 without,
     initial disease probability 0.1.
 
-    **A genuine reformulation, not a simplification of the numbers.** DESDEO's `DiscreteNetwork`
-    cannot express the paper's own structure directly: a chance node's CPT may only be conditioned
-    on other chance nodes, never a decision (`rooted_junction_tree.py`'s own module docstring,
-    Phase 3's confirmed finding), but the pig farm ID's core feature is exactly that the
-    treatment decision D1 changes the *chance* transition into the next period's health state --
-    an arc pyAgrum's own `InfluenceDiagram` supports (decisions are ordinary DAG parents there)
-    but this package's `DiscreteNetwork`/`DecisionAnnotation` split deliberately doesn't allow.
-    Reformulated here as two independent chance nodes, both conditioned on `H1` only (never on
-    `D1`): `CT` ("counterfactual outcome if treated") and `CN` ("counterfactual outcome if not
-    treated") -- both are always drawn, jointly with `H1`, regardless of which choice `D1` actually
-    makes, and the `ObjectiveNode`'s own utility table (built by `_pig_farm_annotation`) selects
-    the branch matching `D1`'s actual value while ignoring the other. Since `CT`/`CN` are
-    conditionally independent given `H1` by construction, this reproduces exactly the same joint
-    distribution over (H1, D1, realized outcome) as the paper's own decision-conditioned CPT would
-    -- a faithful reformulation forced by this compiler's current expressiveness, not a different
-    problem. Worth a maintainer's attention if a future phase wants genuinely decision-conditioned
-    chance nodes.
+    The treatment-dependent transition is modelled as two counterfactual chance nodes conditioned
+    on `H1` only, `CT` (treated) and `CN` (not treated); the utility table selects the one
+    matching `D1`. This gives the same joint distribution as a decision-conditioned CPT.
     """
     return DiscreteNetwork(
         name="pig_farm",
@@ -1743,9 +1537,7 @@ def _pig_farm_annotation(alpha: float) -> DecisionAnnotation:
     """`_pig_farm_network`'s decision/objective/risk overlay.
 
     One treatment decision informed by the test result, one profit objective (market price minus
-    treatment cost), and a `RiskMeasure` at `alpha` (the paper's own Section 4.1 experiment uses
-    `1 - alpha = 0.85`, i.e. `alpha = 0.15`, confirmed against the PDF page 7 -- see
-    `test_pig_farm_cvar_matches_brute_force_oracle`).
+    treatment cost), and a `RiskMeasure` at `alpha` (the paper's Section 4.1 uses `alpha = 0.15`).
     """
     return DecisionAnnotation(
         decisions=[DecisionNode(symbol="D1", states=["treat", "notreat"], information_set=["T1"])],
@@ -1772,20 +1564,10 @@ def _pig_farm_annotation(alpha: float) -> DecisionAnnotation:
 
 
 def test_pig_farm_cvar_matches_brute_force_oracle():
-    """A literal instance of the paper's own running example (Section 2.1).
+    """The paper's running example (Section 2.1) at its Section 4.1 level, `alpha = 0.15`.
 
-    Compiled at the paper's own Section 4.1 experimental confidence level
-    (`1 - alpha = 0.85`, i.e. `alpha = 0.15`). The paper's own Section 4/Appendix A only report
-    solve-time comparison plots for this exact experiment (checked directly against the PDF and
-    the full extracted text -- no exact reproducible numeric CVaR value is published anywhere in
-    the paper), so this cannot be checked against a published number. Checked instead against
-    `_brute_force_cvar` -- a from-first-principles oracle enumerating every deterministic policy
-    and every chance realization directly, independent of `_build_risk_measure`'s own
-    eta/lambda/rho machinery -- and via `IndexMap` read-back of `eta`, confirming it lands within
-    `utility_values`' own range (not exact membership -- see `RiskMeasureIndexMap.eta_symbol`'s own
-    docstring: constraints (11)-(18) only pin `eta` to *some* alpha-quantile of the compiled
-    distribution, not necessarily a realizable utility value itself; the code review pass caught
-    this exact test asserting more than the formulation actually guarantees).
+    The paper publishes no exact CVaR value, so this checks against `_brute_force_cvar`, and that
+    the read-back `eta` lies within the utility range.
     """
     network = _pig_farm_network()
     annotation = _pig_farm_annotation(alpha=0.15)
@@ -1811,11 +1593,7 @@ def test_pig_farm_cvar_matches_brute_force_oracle():
     [(301, 4, 2, 1.2, 0.3), (302, 4, 2, 1.0, 0.6), (303, 5, 3, 1.5, 0.25)],
 )
 def test_random_small_diagrams_cvar_matches_brute_force(seed, n, domain_size, ratio_arc, alpha):
-    """A random small BN plus a grafted-on decision/objective/risk measure.
-
-    Checked against `_brute_force_cvar` -- same generation style as Phase 4's
-    `test_random_small_diagrams_all_oracles_agree`, extended with a `RiskMeasure`.
-    """
+    """A random small BN plus a grafted-on decision/objective/risk measure, against `_brute_force_cvar`."""
     gum.initRandom(seed)
     network = from_pyagrum(gum.randomBN(n=n, domain_size=domain_size, ratio_arc=ratio_arc))
     base = _graft_decision_and_objective(network, np.random.default_rng(seed))
@@ -1827,24 +1605,11 @@ def test_random_small_diagrams_cvar_matches_brute_force(seed, n, domain_size, ra
 
 
 def test_cvar_approaches_expected_value_and_is_bounded_and_monotone():
-    """Two literature relationships from Rockafellar & Uryasev (2000), cited by the paper itself.
+    """Two relationships from Rockafellar & Uryasev (2000), on a no-decision diagram.
 
-    Checked as an oracle independent of this module's own internal consistency, on a no-decision
-    diagram (so mu is uniquely pinned -- see the module docstring -- and every objective/risk
-    measure compiled against the same `Problem` reads the identical fixed distribution, letting
-    the comparisons below isolate the mathematical property from any policy-search confound):
-
-    - `CVaR_alpha -> E[utility]` as `alpha -> 1`: checked at `alpha=0.999` against `f1`, Phase 4's
-      own already-oracle-tested `_build_objective` expected-value `Objective` -- a real
-      regression-style cross-check between two independently-built code paths
-      (`_build_objective`/`_build_risk_measure`) in this same module, both compiled onto the same
-      `Problem` and read off the *same* solve (no decisions, so which objective is "solved for"
-      doesn't matter -- the feasible mu is unique either way). The tolerance is derived, not
-      arbitrary: excluding at most `1 - alpha` probability mass from CVaR_alpha's tail can move it
-      by at most `(1 - alpha) * (max(u) - min(u))` away from the full expectation.
-    - `CVaR_alpha <= E[utility]` for every `alpha`, and `CVaR_alpha` monotone non-decreasing in
-      `alpha` -- both checked directly against `f1`'s own compiled expected value and across a
-      sweep of `RiskMeasure`s at different `alpha`, all compiled into the one `Problem`.
+    - `CVaR_alpha -> E[utility]` as `alpha -> 1`: at `alpha=0.999`, within
+      `(1 - alpha) * (max(u) - min(u))` of the expected-value objective `f1` from the same solve.
+    - `CVaR_alpha <= E[utility]` for every `alpha`, and `CVaR_alpha` is non-decreasing in `alpha`.
     """
     utility_values = [10.0, 12.0, 15.0, 20.0]
     probabilities = [0.4, 0.3, 0.2, 0.1]

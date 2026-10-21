@@ -1,9 +1,4 @@
-"""Tests for `desdeo.problem.graphical.adapters.pyagrum`.
-
-Phase 1 of `.claude/desdeo-graphical-models-plan.md`. pyAgrum is a hard dependency (see the
-plan's design decisions), so these tests need no install-skip logic -- just the `graphical`
-marker for selection (`pytest -m graphical`), same as `gurobipy`/`cvxpy`/`pyomo`.
-"""
+"""Tests for `desdeo.problem.graphical.adapters.pyagrum`."""
 
 from pathlib import Path
 
@@ -25,13 +20,10 @@ pytestmark = pytest.mark.graphical
 
 
 def _assert_networks_equivalent(a: DiscreteNetwork, b: DiscreteNetwork) -> None:
-    """Structure exact, CPT floats with a tolerance -- per the plan's round-trip test note.
+    """Structure exact, CPT floats with a tolerance.
 
-    Compares by variable/node name rather than list position: a DAG's topological order isn't
-    unique, so `DiscreteNetwork.variables`'s list order is allowed to differ across an
-    equivalent round trip (see `from_pyagrum`'s docstring) as long as every node's own
-    `Potential.variables` order -- the one that's actually load-bearing for axis alignment --
-    matches exactly.
+    Compared by name, since a DAG's topological order isn't unique; each `Potential.variables`
+    order must match exactly.
     """
     variables_a = {var.name: var for var in a.variables}
     variables_b = {var.name: var for var in b.variables}
@@ -61,14 +53,7 @@ def _assert_networks_equivalent(a: DiscreteNetwork, b: DiscreteNetwork) -> None:
     ],
 )
 def test_round_trip_random_networks(seed, n, domain_size, ratio_arc):
-    """`from_pyagrum(to_pyagrum(net)) == net` (up to the tolerance in `_assert_networks_equivalent`).
-
-    `net` here is `from_pyagrum(gum.randomBN(...))` -- see the docstring note on why the
-    property is anchored at our own schema rather than at an independently-generated one: the
-    round trip direction the checklist item names is `from_pyagrum(to_pyagrum(net))`, which
-    requires starting from a `DiscreteNetwork`, and pyAgrum's own generator is the simplest
-    source of realistic random *networks* to seed one from.
-    """
+    """`from_pyagrum(to_pyagrum(net)) == net`, seeded from `from_pyagrum(gum.randomBN(...))`."""
     gum.initRandom(seed)
     bn = gum.randomBN(n=n, domain_size=domain_size, ratio_arc=ratio_arc)
     net = from_pyagrum(bn)
@@ -90,18 +75,10 @@ def test_round_trip_is_a_fixed_point():
 
 
 # ── Variable kind fidelity ──────────────────────────────────────────────────────────────────
-#
-# `_diverse_kind_network` is `tests/fixtures/graphical.py`'s `diverse_kind_network`, imported
-# above under its old private name so call sites didn't need touching.
 
 
 def test_round_trip_preserves_every_variable_kind():
-    """Each `DiscreteVariableKind`'s kind-specific fields (not just `labels`) survive the round trip.
-
-    Compared by name (see `_assert_networks_equivalent`): with no arcs constraining them, these
-    five independent roots aren't guaranteed to keep the same list position through
-    `to_pyagrum`/`from_pyagrum`.
-    """
+    """Each `DiscreteVariableKind`'s kind-specific fields (not just `labels`) survive the round trip."""
     net = _diverse_kind_network()
 
     round_tripped = from_pyagrum(to_pyagrum(net))
@@ -159,15 +136,101 @@ def test_to_pyagrum_inference_matches_hand_computed_posterior():
     np.testing.assert_allclose(sorted(posterior_b), sorted([expected_b_low, expected_b_high]))
 
 
+def test_to_pyagrum_decision_pins_slices_out_the_pinned_axis():
+    """`decision_pins` slices a chance node's decision parent out of its CPT."""
+    a = DiscreteVariable(name="A", labels=["lo", "hi"])
+    b = DiscreteVariable(name="B", labels=["lo", "hi"])
+    network = DiscreteNetwork(
+        variables=[a, b],
+        arcs=[("A", "B")],
+        potentials={
+            "A": Potential(variables=["A"], shape=[2], values=[0.5, 0.5]),
+            "B": Potential(
+                variables=["B", "A", "D"],
+                shape=[2, 2, 2],
+                values=[[[0.8, 0.4], [0.6, 0.1]], [[0.2, 0.6], [0.4, 0.9]]],
+            ),
+        },
+    )
+
+    bn = to_pyagrum(network, decision_pins={"D": 1})
+
+    assert {v.name() for v in bn.cpt("B").variablesSequence()} == {"B", "A"}
+    np.testing.assert_allclose(bn.cpt("B")[{"A": "lo"}].tolist(), [0.4, 0.6])
+    np.testing.assert_allclose(bn.cpt("B")[{"A": "hi"}].tolist(), [0.1, 0.9])
+
+
+def test_to_pyagrum_decision_pin_matching_own_node_name_is_not_sliced():
+    """`decision_pins` naming a chance node's own name must not slice that node's own axis."""
+    a = DiscreteVariable(name="A", labels=["lo", "hi"])
+    b = DiscreteVariable(name="B", labels=["lo", "hi"])
+    network = DiscreteNetwork(
+        variables=[a, b],
+        arcs=[],
+        potentials={
+            "A": Potential(variables=["A"], shape=[2], values=[0.5, 0.5]),
+            "B": Potential(variables=["B"], shape=[2], values=[0.3, 0.7]),
+        },
+    )
+
+    bn = to_pyagrum(network, decision_pins={"A": 0})
+
+    assert {v.name() for v in bn.cpt("A").variablesSequence()} == {"A"}
+    np.testing.assert_allclose(bn.cpt("A").toarray(), [0.5, 0.5])
+
+
+def test_to_pyagrum_decision_pin_out_of_range_raises_value_error():
+    """An out-of-range pin state raises a clear `ValueError`, not a bare numpy `IndexError`."""
+    a = DiscreteVariable(name="A", labels=["lo", "hi"])
+    b = DiscreteVariable(name="B", labels=["lo", "hi"])
+    network = DiscreteNetwork(
+        variables=[a, b],
+        arcs=[("A", "B")],
+        potentials={
+            "A": Potential(variables=["A"], shape=[2], values=[0.5, 0.5]),
+            "B": Potential(
+                variables=["B", "A", "D"],
+                shape=[2, 2, 2],
+                values=[[[0.8, 0.4], [0.6, 0.1]], [[0.2, 0.6], [0.4, 0.9]]],
+            ),
+        },
+    )
+
+    with pytest.raises(ValueError, match="out of range"):
+        to_pyagrum(network, decision_pins={"D": 5})
+
+    with pytest.raises(ValueError, match="out of range"):
+        to_pyagrum(network, decision_pins={"D": -1})
+
+
+def test_to_pyagrum_unresolved_decision_parent_raises_value_error():
+    """No (or incomplete) `decision_pins` for a decision-referencing potential: a clear `ValueError`."""
+    a = DiscreteVariable(name="A", labels=["lo", "hi"])
+    b = DiscreteVariable(name="B", labels=["lo", "hi"])
+    network = DiscreteNetwork(
+        variables=[a, b],
+        arcs=[("A", "B")],
+        potentials={
+            "A": Potential(variables=["A"], shape=[2], values=[0.5, 0.5]),
+            "B": Potential(
+                variables=["B", "A", "D"],
+                shape=[2, 2, 2],
+                values=[[[0.8, 0.4], [0.6, 0.1]], [[0.2, 0.6], [0.4, 0.9]]],
+            ),
+        },
+    )
+
+    with pytest.raises(ValueError, match="'D'.*'B'|'B'.*'D'"):
+        to_pyagrum(network)
+
+
 # ── File import/export via pyAgrum's own readers/writers ───────────────────────────────────
 
 
 def test_save_and_load_network_round_trip(tmp_path: Path):
     """BIF is a plain-text format pyAgrum both reads and writes; structure survives the trip.
 
-    BIF normalises every variable to a generic labelized-like representation, so `kind` isn't
-    expected to survive here -- that's what `test_round_trip_preserves_every_variable_kind`
-    (an in-memory `to_pyagrum`/`from_pyagrum` trip, no file format involved) covers instead.
+    BIF doesn't preserve `kind`.
     """
     gum.initRandom(31)
     net = from_pyagrum(gum.randomBN(n=6, domain_size=3, ratio_arc=1.3))
@@ -203,11 +266,7 @@ def sampled_csv(tmp_path: Path) -> tuple[Path, DiscreteNetwork]:
 
 
 def test_learn_network_with_fixed_structure_keeps_the_dag(sampled_csv):
-    """Structure-fixed learning (the CPT-relearning path) never changes the DAG.
-
-    This is the entry point the "decision structure lives in a separate overlay" design
-    decision relies on -- see `learn_network`'s docstring.
-    """
+    """Structure-fixed learning (the CPT-relearning path) never changes the DAG."""
     csv_path, net = sampled_csv
 
     learned = learn_network(csv_path, structure=net)

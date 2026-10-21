@@ -1,8 +1,6 @@
 """Tests for `desdeo.problem.graphical.schema` (`DecisionAnnotation` and friends).
 
-Phase 2 of `.claude/desdeo-graphical-models-plan.md`. No pyAgrum in the schema/validator tests
-(pure pydantic, like `tests/test_graphical_network.py`); the round-trip test at the bottom uses
-`learn_network` (Phase 1, pyAgrum-backed) and is marked `graphical` accordingly.
+The round-trip test at the bottom uses pyAgrum-backed `learn_network` and is marked `graphical`.
 """
 
 from pathlib import Path
@@ -17,6 +15,8 @@ from desdeo.problem.graphical import (
     DecisionNode,
     DiagramConstraint,
     DiagramConstraintKind,
+    DiscreteNetwork,
+    DiscreteVariable,
     ObjectiveNode,
     Potential,
     RiskMeasure,
@@ -112,15 +112,8 @@ def test_objective_node_self_dependency_raises():
 
 
 def test_objective_node_duplicate_parents_raises():
-    """Duplicate entries in `parents` are rejected.
-
-    Regression test: a duplicate parent (e.g. `["A", "A"]`) used to pass construction cleanly and
-    only surface deep inside the compiler as a bare `IndexError` out of `_extract_expr` (an empty
-    projection group, since the off-diagonal states of a repeated-dimension target are
-    unreachable -- see `compile.py`'s `_group_flat_indices_by_projection`), instead of a clear
-    error naming the objective at the point the mistake was actually made.
-    """
-    with pytest.raises(ValidationError, match="duplicate entries in parents"):
+    """Duplicate entries in `parents` are rejected."""
+    with pytest.raises(ValidationError, match="variables must be unique"):
         ObjectiveNode(
             symbol="F",
             parents=["A", "A"],
@@ -235,13 +228,7 @@ def test_diagram_constraint_duplicate_symbol_with_objective_raises():
 
 
 def test_diagram_constraint_empty_func_raises():
-    """An empty `func` is rejected at construction, not left to crash `operator = func[0]` later.
-
-    Regression test: `func == []` used to construct cleanly and only raise a bare `IndexError`
-    once the compiler (or any other code reading `func[0]`, e.g. `_substitute_at_nodes`) actually
-    tried to use it -- inconsistent with how other malformed-input cases in this module (duplicate
-    states, self-reference) are already schema-level rejections rather than compile-time crashes.
-    """
+    """An empty `func` is rejected at construction."""
     with pytest.raises(ValidationError, match="non-empty func"):
         DiagramConstraint(symbol="C1", kind=DiagramConstraintKind.decision, nodes=["D"], func=[])
 
@@ -319,6 +306,64 @@ def test_validate_against_decision_symbol_colliding_with_network_name_raises():
     annotation = DecisionAnnotation(decisions=[decision], objectives=[objective])
     with pytest.raises(ValueError, match="collide with network variable names"):
         annotation.validate_against(_chance_network())
+
+
+# ── validate_against: a chance node's potential referencing a decision ──
+
+
+def _network_with_decision_referencing_potential():
+    """A (prior) -> B, B's own CPT also conditions on decision 'D' (not a network variable)."""
+    a = DiscreteVariable(name="A", labels=["lo", "hi"])
+    b = DiscreteVariable(name="B", labels=["lo", "hi"])
+    return DiscreteNetwork(
+        variables=[a, b],
+        arcs=[("A", "B")],
+        potentials={
+            "A": Potential(variables=["A"], shape=[2], values=[0.4, 0.6]),
+            "B": Potential(
+                variables=["B", "A", "D"],
+                shape=[2, 2, 2],
+                values=[[[0.8, 0.4], [0.6, 0.1]], [[0.2, 0.6], [0.4, 0.9]]],
+            ),
+        },
+    )
+
+
+def test_validate_against_chance_potential_referencing_known_decision_passes():
+    """B's CPT naming decision 'D' as a parent validates once 'D' is a declared decision."""
+    network = _network_with_decision_referencing_potential()
+    decision = DecisionNode(symbol="D", states=["low", "high"])
+    objective = ObjectiveNode(
+        symbol="F", parents=["B"], utility=Potential(variables=["B"], shape=[2], values=[0.0, 1.0])
+    )
+    annotation = DecisionAnnotation(decisions=[decision], objectives=[objective])
+
+    annotation.validate_against(network)  # raises nothing
+
+
+def test_validate_against_chance_potential_unknown_external_parent_raises():
+    """B's CPT naming 'D' as a parent is rejected when no decision 'D' exists at all."""
+    network = _network_with_decision_referencing_potential()
+    objective = ObjectiveNode(
+        symbol="F", parents=["B"], utility=Potential(variables=["B"], shape=[2], values=[0.0, 1.0])
+    )
+    annotation = DecisionAnnotation(objectives=[objective])
+
+    with pytest.raises(ValueError, match="external parents reference unknown"):
+        annotation.validate_against(network)
+
+
+def test_validate_against_chance_potential_decision_shape_mismatch_raises():
+    """'D' exists, but with 3 states -- a shape mismatch, distinct from an unknown reference."""
+    network = _network_with_decision_referencing_potential()
+    decision = DecisionNode(symbol="D", states=["low", "mid", "high"])
+    objective = ObjectiveNode(
+        symbol="F", parents=["B"], utility=Potential(variables=["B"], shape=[2], values=[0.0, 1.0])
+    )
+    annotation = DecisionAnnotation(decisions=[decision], objectives=[objective])
+
+    with pytest.raises(ValueError, match="potential has shape"):
+        annotation.validate_against(network)
 
 
 # ── Round trip: relearn CPTs, reapply the same annotation ──────────────────────────────────

@@ -9,13 +9,10 @@ import type { NetworkNodeKind } from './types';
  *  Driven by container width *and* zoom — see `computeDetailLevel` in `lod.ts`. */
 export type DetailLevel = 'compact' | 'normal' | 'expanded';
 
-/** Cross-highlight state for a node — see phase C (ancestor/active-trail highlighting) and
- *  `dag-algorithms.ts`. Phase A only ever sets `'normal'`; the field exists now so phase C
- *  doesn't have to touch every node component again. */
+/** Cross-highlight state for a node (see `dag-algorithms.ts`). */
 export type HighlightState = 'normal' | 'dimmed' | 'active';
 
-/** Context passed to the `nodeChrome` snippet (phase B) — just enough for a method UI to decide
- *  what badge, if any, to render for a given node, without needing the whole `NetworkNodeModel`. */
+/** Context passed to the `nodeChrome` snippet, enough for a method UI to pick a badge. */
 export interface NetworkChromeContext {
 	id: string;
 	kind: NetworkNodeKind;
@@ -34,25 +31,28 @@ export interface NetworkNodeData extends Record<string, unknown> {
 	 *  chance nodes always, and for decision nodes only in `decisionMode: 'manual'`. See
 	 *  `isNodeEditable` in `interaction.ts`. */
 	editable: boolean;
-	/** This node's currently pinned hard-evidence state, if any (phase B contract; see
-	 *  `NetworkEvidence`). */
+	/** This node's currently pinned hard-evidence state, if any (see `NetworkEvidence`). */
 	evidenceState?: string;
 	/** This node's state under the currently solved policy — decision nodes only, and only
 	 *  meaningful in `decisionMode: 'solver'` (see `NetworkPolicy`). */
 	policyState?: string;
 	/** Per-state posterior probabilities, aligned with `states` (see `NetworkPosteriors`). */
 	posterior?: number[];
-	/** Baseline distribution `posterior` is diffed against — the prior (no evidence at all) until
-	 *  the DM commits some evidence, at which point it becomes that committed evidence's own
-	 *  posteriors (see `NetworkView`'s `ghostPosteriors`/`committedEvidence`/`onCommitEvidence`
-	 *  props, phase D). Rendered behind/alongside `posterior` as a ghost mark; without it a
-	 *  posterior bar conveys nothing on its own. */
+	/** Baseline distribution `posterior` is diffed against: the prior, or the committed evidence's
+	 *  posteriors. Rendered as a ghost mark. */
 	ghostPosterior?: number[];
-	/** Set when `posterior` came back identical to `ghostPosterior` (within floating-point noise)
-	 *  *and* that's provably because this node is d-separated from the current evidence set — see
-	 *  `explainNoChange` in `null-explanation.ts`. Shown instead of leaving the DM to assume the
-	 *  tool silently failed to update. */
+	/** Unpinned decision nodes only: per-state probability under the followed solution's policy,
+	 *  aligned with `states` (see `WhatIfResult.decisionPosteriors`). */
+	solutionPosterior?: number[];
+	/** Whether pins/evidence moved this followed decision off the solution's path. */
+	offPolicy?: boolean;
+	/** Set when `posterior` equals `ghostPosterior` because this node is d-separated from the
+	 *  current evidence (see `explainNoChange` in `null-explanation.ts`). */
 	nullExplanation?: string;
+	/** Objective nodes only: expected utility and its standard deviation under the current what-if
+	 *  (see `NetworkUtilities`). */
+	utility?: number;
+	utilityStdDev?: number;
 	/** Fired when an editable state is clicked; `NetworkView` supplies a closure bound to this
 	 *  node's id. */
 	onStateClick?: (state: string) => void;

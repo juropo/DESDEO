@@ -11,14 +11,16 @@ from fastapi.testclient import TestClient
 from sqlmodel import Session, select
 
 import desdeo.tools.utils as tools_utils
-
 from desdeo.api.models import (
+    CumulusClassificationState,
     GraphicalModelMetaData,
     Group,
     InteractiveSessionDB,
     ObjectiveDB,
     ProblemDB,
     ProblemMetaDataDB,
+    ReferencePoint,
+    StateDB,
     User,
     UserRole,
     UserSavedSolutionDB,
@@ -38,7 +40,14 @@ from desdeo.problem.graphical import (
     build_rooted_junction_tree,
     compile_diagram,
 )
-from desdeo.problem.graphical.adapters.pyagrum import to_pyagrum_influence_diagram
+from desdeo.problem.graphical.adapters.pyagrum import to_pyagrum, to_pyagrum_influence_diagram
+from desdeo.problem.graphical.demo import (
+    OIL_PRICE_PRIOR,
+    STRUCTURE_PRIOR,
+    build_irrigation_demo,
+    build_oil_wildcatter_demo,
+)
+from desdeo.tools import SolverResults
 from desdeo.tools.gurobipy_solver_interfaces import GurobipySolver
 
 from .conftest import delete_json, get_json, login, post_json
@@ -83,6 +92,59 @@ def _no_decision_annotation() -> DecisionAnnotation:
         objectives=[
             ObjectiveNode(symbol="f1", parents=["B"], utility=Potential(variables=["B"], shape=[2], values=[0.0, 10.0]))
         ]
+    )
+
+
+def _impossible_evidence_network() -> DiscreteNetwork:
+    """`Structure` (left unobserved by the tests using this) -> `Observed`, whose CPT is `"e0"` with certainty.
+
+    Pinning `Observed="e1"` has zero joint probability, so reading `Structure`'s posterior raises
+    pyAgrum's bare `Exception`.
+    """
+    return DiscreteNetwork(
+        variables=[
+            DiscreteVariable(name="Structure", labels=["s0", "s1", "s2"]),
+            DiscreteVariable(name="Observed", labels=["e0", "e1"]),
+        ],
+        arcs=[("Structure", "Observed")],
+        potentials={
+            "Structure": Potential(variables=["Structure"], shape=[3], values=[0.5, 0.3, 0.2]),
+            "Observed": Potential(
+                variables=["Observed", "Structure"], shape=[2, 3], values=[[1.0, 1.0, 1.0], [0.0, 0.0, 0.0]]
+            ),
+        },
+    )
+
+
+def _impossible_evidence_no_decision_annotation() -> DecisionAnnotation:
+    return DecisionAnnotation(
+        objectives=[
+            ObjectiveNode(
+                symbol="f1",
+                parents=["Observed"],
+                utility=Potential(variables=["Observed"], shape=[2], values=[0.0, 10.0]),
+            )
+        ]
+    )
+
+
+def _impossible_evidence_single_decision_annotation() -> DecisionAnnotation:
+    """One blind decision `D`, with `f1` parented on `[D, Structure]` so its MEU needs `Structure`'s posterior.
+
+    Tests leave `D` unpinned so that `MEU()` is used.
+    """
+    return DecisionAnnotation(
+        decisions=[DecisionNode(symbol="D", states=["s0", "s1"], information_set=[])],
+        objectives=[
+            ObjectiveNode(
+                symbol="f1",
+                parents=["D", "Structure"],
+                utility=Potential(
+                    variables=["D", "Structure"], shape=[2, 3], values=[[0.0, 1.0, 2.0], [3.0, 4.0, 5.0]]
+                ),
+                maximize=True,
+            )
+        ],
     )
 
 
@@ -316,6 +378,45 @@ def test_structure_returns_nodes_and_edges(client: TestClient, session_and_user:
     assert ("D", "util_fmatch") in edges
     # Every edge carries a stable id derived from its endpoints.
     assert all(e["id"] == f"{e['source']}->{e['target']}" for e in data["edges"])
+
+
+def test_structure_includes_decision_parent_edge_from_chance_potential(client: TestClient, session_and_user: dict):
+    """A chance node's own potential naming a decision parent must appear as an edge too."""
+    session: Session = session_and_user["session"]
+    access_token = login(client)
+    problem = session.exec(select(ProblemDB)).first()
+
+    network = DiscreteNetwork(
+        variables=[
+            DiscreteVariable(name="A", labels=["lo", "hi"]),
+            DiscreteVariable(name="B", labels=["lo", "hi"]),
+        ],
+        arcs=[("A", "B")],
+        potentials={
+            "A": Potential(variables=["A"], shape=[2], values=[0.4, 0.6]),
+            "B": Potential(
+                variables=["B", "A", "D"],
+                shape=[2, 2, 2],
+                values=[[[0.8, 0.4], [0.6, 0.1]], [[0.2, 0.6], [0.4, 0.9]]],
+            ),
+        },
+    )
+    annotation = DecisionAnnotation(
+        decisions=[DecisionNode(symbol="D", states=["s0", "s1"])],
+        objectives=[
+            ObjectiveNode(
+                symbol="f1", parents=["B"], utility=Potential(variables=["B"], shape=[2], values=[0.0, 10.0])
+            )
+        ],
+    )
+    _persist_graphical_metadata(session, problem.id, network, annotation)
+
+    response = get_json(client, f"/graphical/{problem.id}/structure", access_token)
+    assert response.status_code == 200
+    data = response.json()
+
+    edges = {(e["source"], e["target"]) for e in data["edges"]}
+    assert ("D", "B") in edges
 
 
 def test_structure_404_when_no_graphical_metadata(client: TestClient, session_and_user: dict):
@@ -823,7 +924,7 @@ def test_whatif_engine_cache_invalidated_by_content_change(
 def test_whatif_multi_objective_with_decision_raises_501(client: TestClient, session_and_user: dict):
     """More than one objective plus at least one decision is an honest 501, not a wrong number.
 
-    See `_compute_utilities`.
+    See `_compute_utilities`. The message points at `decision_evidence` as the way out.
     """
     session: Session = session_and_user["session"]
     access_token = login(client)
@@ -842,6 +943,521 @@ def test_whatif_multi_objective_with_decision_raises_501(client: TestClient, ses
     payload = {"problem_id": problem.id, "evidence": {}}
     response = post_json(client, "/graphical/whatif", payload, access_token)
     assert response.status_code == 501
+    assert "decision_evidence" in response.json()["detail"]
+
+
+def test_whatif_oil_wildcatter_partially_pinned_or_unpinned_decisions_still_raises_501(
+    client: TestClient, session_and_user: dict
+):
+    """`decision_evidence` must cover *every* decision to lift the 501, not just some of them.
+
+    Uses the real Oil Wildcatter fixture (three objectives, two decisions): leaving `decision_evidence`
+    empty, or pinning only `test` (leaving `drill` unresolved), both still 501.
+    """
+    session: Session = session_and_user["session"]
+    access_token = login(client)
+
+    problem = session.exec(select(ProblemDB)).first()
+    network, annotation = build_oil_wildcatter_demo()
+    _persist_graphical_metadata(session, problem.id, network, annotation)
+
+    unpinned_payload = {"problem_id": problem.id, "evidence": {}}
+    unpinned_response = post_json(client, "/graphical/whatif", unpinned_payload, access_token)
+    assert unpinned_response.status_code == 501
+
+    partially_pinned_payload = {
+        "problem_id": problem.id,
+        "evidence": {},
+        "decision_evidence": {"test": "yes"},
+    }
+    partially_pinned_response = post_json(client, "/graphical/whatif", partially_pinned_payload, access_token)
+    assert partially_pinned_response.status_code == 501
+
+
+def test_whatif_decision_evidence_unknown_decision_or_bad_label_is_400(
+    client: TestClient, session_and_user: dict
+):
+    """`decision_evidence` referencing an unknown decision, or a label outside its own states, is 400."""
+    session: Session = session_and_user["session"]
+    access_token = login(client)
+
+    problem = session.exec(select(ProblemDB)).first()
+    network = _decision_network()
+    annotation = _decision_annotation()
+    _persist_graphical_metadata(session, problem.id, network, annotation)
+
+    unknown_decision_payload = {
+        "problem_id": problem.id,
+        "evidence": {},
+        "decision_evidence": {"ZZZ": "s0"},
+    }
+    unknown_response = post_json(client, "/graphical/whatif", unknown_decision_payload, access_token)
+    assert unknown_response.status_code == 400
+
+    bad_label_payload = {
+        "problem_id": problem.id,
+        "evidence": {},
+        "decision_evidence": {"D": "not_a_state"},
+    }
+    bad_label_response = post_json(client, "/graphical/whatif", bad_label_payload, access_token)
+    assert bad_label_response.status_code == 400
+
+
+def test_whatif_fully_pinned_decisions_multi_objective_matches_hand_computed_expectation(
+    client: TestClient, session_and_user: dict
+):
+    """Pinning every decision via `decision_evidence` lifts the 501 for the Oil Wildcatter demo.
+
+    `test`/`drill` are both pinned to `"yes"`. Expectations are hand-computed from the demo's
+    constants.
+    """
+    session: Session = session_and_user["session"]
+    access_token = login(client)
+
+    problem = session.exec(select(ProblemDB)).first()
+    network, annotation = build_oil_wildcatter_demo()
+    _persist_graphical_metadata(session, problem.id, network, annotation)
+
+    payload = {
+        "problem_id": problem.id,
+        "evidence": {},
+        "decision_evidence": {"test": "yes", "drill": "yes"},
+    }
+    response = post_json(client, "/graphical/whatif", payload, access_token)
+    assert response.status_code == 200, response.text
+    data = response.json()
+
+    structure_prior = np.array(STRUCTURE_PRIOR)  # [dry, wet, soaking]
+    oil_price_prior = np.array(OIL_PRICE_PRIOR)  # [low, baseline, high]
+    barrels = np.array([0.0, 1200.0, 2700.0])  # oil_produced by structure, drill="yes"
+    price = np.array([70.0, 100.0, 130.0])  # $/barrel by oil_price
+    investment = 10_000.0 + 70_000.0  # test cost + drill cost, both run
+
+    expected_oil = float(np.dot(structure_prior, barrels))
+    expected_oil_var = float(np.dot(structure_prior, barrels**2)) - expected_oil**2
+
+    profit_table = np.outer(barrels, price) - investment  # [structure, oil_price]
+    joint = np.outer(structure_prior, oil_price_prior)
+    expected_profit = float(np.sum(joint * profit_table))
+    expected_profit_var = float(np.sum(joint * profit_table**2)) - expected_profit**2
+
+    assert data["utilities"]["investment"] == pytest.approx(investment)
+    assert data["utility_std_devs"]["investment"] == pytest.approx(0.0)
+    assert data["utilities"]["oil_produced"] == pytest.approx(expected_oil)
+    assert data["utility_std_devs"]["oil_produced"] == pytest.approx(expected_oil_var**0.5)
+    assert data["utilities"]["profit"] == pytest.approx(expected_profit)
+    assert data["utility_std_devs"]["profit"] == pytest.approx(expected_profit_var**0.5)
+    assert data["policy"] == {"test": "yes", "drill": "yes"}
+
+    # `test_result`'s CPT resolves to the right conditional for each `test` pin.
+    test_yes_engine = gum.LazyPropagation(to_pyagrum(network, decision_pins={"test": 0, "drill": 0}))
+    test_yes_engine.makeInference()
+    # P(test_result | structure, test="yes"), rows = structure (dry/wet/soaking).
+    test_result_given_structure = np.array(
+        [[0.6, 0.3, 0.1, 0.0], [0.3, 0.4, 0.3, 0.0], [0.1, 0.4, 0.5, 0.0]]
+    )
+    expected_test_result_given_yes = structure_prior @ test_result_given_structure
+    assert test_yes_engine.posterior("test_result").toarray() == pytest.approx(expected_test_result_given_yes)
+
+    # The response's own `posteriors` must come from this same pinned engine, not the cached
+    # LIMID engine's optimal (and here different) policy -- see `whatif`'s use of
+    # `_compute_utilities`'s `posteriors_override`.
+    assert data["posteriors"]["test_result"] == pytest.approx(expected_test_result_given_yes.tolist())
+
+    test_no_engine = gum.LazyPropagation(to_pyagrum(network, decision_pins={"test": 1, "drill": 1}))
+    test_no_engine.makeInference()
+    assert test_no_engine.posterior("test_result").toarray() == pytest.approx([0.0, 0.0, 0.0, 1.0])
+
+    # Mixed pins, since both "yes" pins above share index 0.
+    mixed_payload_a = {
+        "problem_id": problem.id,
+        "evidence": {},
+        "decision_evidence": {"test": "no", "drill": "yes"},
+    }
+    mixed_response_a = post_json(client, "/graphical/whatif", mixed_payload_a, access_token)
+    assert mixed_response_a.status_code == 200, mixed_response_a.text
+    mixed_data_a = mixed_response_a.json()
+    assert mixed_data_a["utilities"]["investment"] == pytest.approx(70_000.0)
+    assert mixed_data_a["utilities"]["oil_produced"] == pytest.approx(900.0)
+    assert mixed_data_a["utilities"]["profit"] == pytest.approx(17_300.0)
+
+    mixed_payload_b = {
+        "problem_id": problem.id,
+        "evidence": {},
+        "decision_evidence": {"test": "yes", "drill": "no"},
+    }
+    mixed_response_b = post_json(client, "/graphical/whatif", mixed_payload_b, access_token)
+    assert mixed_response_b.status_code == 200, mixed_response_b.text
+    mixed_data_b = mixed_response_b.json()
+    assert mixed_data_b["utilities"]["investment"] == pytest.approx(10_000.0)
+    assert mixed_data_b["utilities"]["oil_produced"] == pytest.approx(0.0)
+    assert mixed_data_b["utilities"]["profit"] == pytest.approx(-10_000.0)
+
+
+def test_whatif_decision_evidence_incompatible_with_evidence_is_400(client: TestClient, session_and_user: dict):
+    """Evidence that's impossible given the pinned decisions is a 400, not an uncaught 500.
+
+    With `test="no"` pinned, `test_result="NS"` has zero joint probability.
+    """
+    session: Session = session_and_user["session"]
+    access_token = login(client)
+
+    problem = session.exec(select(ProblemDB)).first()
+    network, annotation = build_oil_wildcatter_demo()
+    _persist_graphical_metadata(session, problem.id, network, annotation)
+
+    payload = {
+        "problem_id": problem.id,
+        "evidence": {"test_result": "NS"},
+        "decision_evidence": {"test": "no", "drill": "no"},
+    }
+    response = post_json(client, "/graphical/whatif", payload, access_token)
+    assert response.status_code == 400, response.text
+    assert "incompatible" in response.json()["detail"].lower()
+
+
+def test_whatif_no_decision_impossible_evidence_combination_is_400(client: TestClient, session_and_user: dict):
+    """A no-decision network's zero-joint-probability evidence is a 400, not an uncaught 500."""
+    session: Session = session_and_user["session"]
+    access_token = login(client)
+
+    problem = session.exec(select(ProblemDB)).first()
+    network = _impossible_evidence_network()
+    annotation = _impossible_evidence_no_decision_annotation()
+    _persist_graphical_metadata(session, problem.id, network, annotation)
+
+    payload = {"problem_id": problem.id, "evidence": {"Observed": "e1"}}
+    response = post_json(client, "/graphical/whatif", payload, access_token)
+    assert response.status_code == 400, response.text
+    assert "incompatible" in response.json()["detail"].lower()
+
+
+def test_whatif_single_objective_decision_nan_meu_is_400(client: TestClient, session_and_user: dict):
+    """A decision diagram whose `MEU()` returns `nan` (zero-probability evidence) is a 400, not a serialization 500."""
+    session: Session = session_and_user["session"]
+    access_token = login(client)
+
+    problem = session.exec(select(ProblemDB)).first()
+    network = _impossible_evidence_network()
+    annotation = _impossible_evidence_single_decision_annotation()
+    _persist_graphical_metadata(session, problem.id, network, annotation)
+
+    payload = {"problem_id": problem.id, "evidence": {"Structure": "s0", "Observed": "e1"}}
+    response = post_json(client, "/graphical/whatif", payload, access_token)
+    assert response.status_code == 400, response.text
+    assert "incompatible" in response.json()["detail"].lower()
+
+
+def test_whatif_partial_decision_evidence_single_objective_has_no_effect(
+    client: TestClient, session_and_user: dict
+):
+    """A partial `decision_evidence` on a single-objective, two-decision diagram changes nothing.
+
+    Neither decision is in `policy` without evidence on `A`; pinning only `D2` changes neither
+    `policy` nor `utilities`.
+    """
+    session: Session = session_and_user["session"]
+    access_token = login(client)
+
+    problem = session.exec(select(ProblemDB)).first()
+    network = _two_decision_no_forgetting_network()
+    annotation = _two_decision_no_forgetting_annotation()
+    _persist_graphical_metadata(session, problem.id, network, annotation)
+
+    baseline_payload = {"problem_id": problem.id, "evidence": {}, "decision_evidence": {}}
+    baseline_response = post_json(client, "/graphical/whatif", baseline_payload, access_token)
+    assert baseline_response.status_code == 200, baseline_response.text
+    baseline_data = baseline_response.json()
+
+    partial_payload = {"problem_id": problem.id, "evidence": {}, "decision_evidence": {"D2": "t0"}}
+    partial_response = post_json(client, "/graphical/whatif", partial_payload, access_token)
+    assert partial_response.status_code == 200, partial_response.text
+    partial_data = partial_response.json()
+
+    assert partial_data == baseline_data
+    assert "D2" not in (partial_data["policy"] or {})
+
+
+def test_whatif_fully_pinned_single_objective_decision_returns_pinned_policys_utility_not_meu(
+    client: TestClient, session_and_user: dict
+):
+    """A fully pinned `decision_evidence` reports that policy's own expected utility, not the MEU.
+
+    Irrigation demo: `"heavy"` is optimal (`2780.625`); pinning `"none"` must report its own
+    expected profit (`2458.75`, hand-computed).
+    """
+    session: Session = session_and_user["session"]
+    access_token = login(client)
+
+    problem = session.exec(select(ProblemDB)).first()
+    network, annotation = build_irrigation_demo()
+    _persist_graphical_metadata(session, problem.id, network, annotation)
+
+    diagram = to_pyagrum_influence_diagram(network, annotation)
+    inference = gum.ShaferShenoyLIMIDInference(diagram)
+    inference.makeInference()
+    meu = inference.MEU()["mean"]
+    assert meu == pytest.approx(2780.625)  # "heavy" is the actual optimum, not the pin below
+
+    payload = {"problem_id": problem.id, "evidence": {}, "decision_evidence": {"irrigate": "none"}}
+    response = post_json(client, "/graphical/whatif", payload, access_token)
+    assert response.status_code == 200, response.text
+    data = response.json()
+
+    assert data["policy"] == {"irrigate": "none"}
+    assert data["utilities"]["profit"] == pytest.approx(2458.75)
+    assert data["utilities"]["profit"] != pytest.approx(meu)
+
+
+def _store_solution_state(
+    session: Session, problem_id: int, results: list[SolverResults], session_id: int | None = None
+) -> StateDB:
+    """Persist `results` as a CUMULUS solve state of `problem_id`, like a real CUMULUS iteration."""
+    state = StateDB.create(
+        session,
+        problem_id=problem_id,
+        session_id=session_id,
+        state=CumulusClassificationState(preferences=ReferencePoint(aspiration_levels={}), solver_results=results),
+    )
+    session.commit()
+    session.refresh(state)
+    return state
+
+
+def _oil_wildcatter_with_solved_state(session: Session) -> tuple[ProblemDB, SolverResults, StateDB]:
+    """Oil Wildcatter attached to a problem, solved for expected `profit`, stored as a state."""
+    problem = session.exec(select(ProblemDB)).first()
+    network, annotation = build_oil_wildcatter_demo()
+    _persist_graphical_metadata_with_index_map(session, problem.id, network, annotation)
+    compiled, _ = compile_diagram(network, annotation)
+    result = GurobipySolver(compiled).solve("profit")
+    assert result.success, result.message
+    return problem, result, _store_solution_state(session, problem.id, [result])
+
+
+@pytest.mark.gurobipy
+def test_whatif_solution_unpinned_decisions_follow_solved_policy(client: TestClient, session_and_user: dict):
+    """With `solution` and no pins, utilities are the solved policy's own expected values.
+
+    The expected-`profit` optimum runs the test and drills only on an open/closed-structure
+    reading. Its expected values are hand-computed from the demo's constants, and must also match
+    the solved MILP's own objective values, which are expectations too.
+    """
+    session: Session = session_and_user["session"]
+    access_token = login(client)
+    problem, result, state = _oil_wildcatter_with_solved_state(session)
+
+    payload = {
+        "problem_id": problem.id,
+        "evidence": {},
+        "solution": {"state_id": state.id, "solution_index": 0},
+    }
+    response = post_json(client, "/graphical/whatif", payload, access_token)
+    assert response.status_code == 200, response.text
+    data = response.json()
+
+    structure_prior = np.array(STRUCTURE_PRIOR)  # [dry, wet, soaking]
+    barrels = np.array([0.0, 1200.0, 2700.0])
+    # P(test_result in {OS, CS} | structure, test="yes").
+    p_drill_given_structure = np.array([0.3 + 0.1, 0.4 + 0.3, 0.4 + 0.5])
+    expected_price = float(np.dot(OIL_PRICE_PRIOR, [70.0, 100.0, 130.0]))
+    expected_oil = float(np.sum(structure_prior * p_drill_given_structure * barrels))
+    expected_investment = 10_000.0 + 70_000.0 * float(np.dot(structure_prior, p_drill_given_structure))
+    expected_profit = expected_price * expected_oil - expected_investment
+
+    assert data["utilities"]["investment"] == pytest.approx(expected_investment)
+    assert data["utilities"]["oil_produced"] == pytest.approx(expected_oil)
+    assert data["utilities"]["profit"] == pytest.approx(expected_profit)
+    for symbol, value in result.optimal_objectives.items():
+        assert data["utilities"][symbol] == pytest.approx(value)
+
+    # `drill` depends on `test_result`, which isn't observed, so only `test` is resolved.
+    assert data["policy"] == {"test": "yes"}
+    assert data["posteriors"]["test_result"][3] == pytest.approx(0.0)  # the test was run
+
+    observed_payload = {**payload, "evidence": {"test_result": "CS"}}
+    observed_response = post_json(client, "/graphical/whatif", observed_payload, access_token)
+    assert observed_response.status_code == 200, observed_response.text
+    assert observed_response.json()["policy"] == {"test": "yes", "drill": "yes"}
+    assert observed_response.json()["off_policy_decisions"] == []
+
+
+@pytest.mark.gurobipy
+def test_whatif_solution_decision_posteriors(client: TestClient, session_and_user: dict):
+    """`decision_posteriors` holds each followed decision's state probabilities under the solution.
+
+    The profit-optimal policy always tests and drills on an OS/CS reading, so `P(drill="yes")` is
+    `P(test_result in {OS, CS} | test="yes")`. Pinned and off-policy decisions are omitted.
+    """
+    session: Session = session_and_user["session"]
+    access_token = login(client)
+    problem, _result, state = _oil_wildcatter_with_solved_state(session)
+    solution = {"state_id": state.id, "solution_index": 0}
+
+    def _whatif(**fields) -> dict:
+        response = post_json(client, "/graphical/whatif", {"problem_id": problem.id, **fields}, access_token)
+        assert response.status_code == 200, response.text
+        return response.json()
+
+    data = _whatif(solution=solution)
+    p_drill = float(np.dot(STRUCTURE_PRIOR, [0.3 + 0.1, 0.4 + 0.3, 0.4 + 0.5]))
+    assert data["decision_posteriors"]["test"] == pytest.approx([1.0, 0.0])  # [yes, no]
+    assert data["decision_posteriors"]["drill"] == pytest.approx([p_drill, 1.0 - p_drill])
+    assert 0.0 < p_drill < 1.0
+
+    observed = _whatif(solution=solution, evidence={"test_result": "CS"})
+    assert observed["decision_posteriors"]["drill"] == pytest.approx([1.0, 0.0])
+
+    off_path = _whatif(solution=solution, decision_evidence={"test": "no"})
+    assert off_path["off_policy_decisions"] == ["drill"]
+    assert off_path["decision_posteriors"] == {}
+
+    drill_pinned = _whatif(solution=solution, decision_evidence={"drill": "yes"})
+    assert drill_pinned["decision_posteriors"] == {"test": pytest.approx([1.0, 0.0])}
+
+    assert _whatif(solution=solution, decision_evidence={"test": "yes", "drill": "no"})["decision_posteriors"] == {}
+    assert _whatif(decision_evidence={"test": "yes", "drill": "no"})["decision_posteriors"] == {}
+
+
+@pytest.mark.gurobipy
+def test_whatif_solution_pin_overrides_solved_policy(client: TestClient, session_and_user: dict):
+    """A pinned decision overrides the solution; the other decision still follows it.
+
+    Pinning `drill="yes"` keeps the solved `test="yes"`. With both decisions pinned the solution
+    is irrelevant, so the result matches the pins-only path.
+    """
+    session: Session = session_and_user["session"]
+    access_token = login(client)
+    problem, _result, state = _oil_wildcatter_with_solved_state(session)
+    solution = {"state_id": state.id, "solution_index": 0}
+
+    drill_payload = {"problem_id": problem.id, "decision_evidence": {"drill": "yes"}, "solution": solution}
+    drill_response = post_json(client, "/graphical/whatif", drill_payload, access_token)
+    assert drill_response.status_code == 200, drill_response.text
+    drill_data = drill_response.json()
+    assert drill_data["utilities"]["investment"] == pytest.approx(80_000.0)
+    assert drill_data["policy"] == {"test": "yes", "drill": "yes"}
+    assert drill_data["off_policy_decisions"] == []
+
+    # Deterministic `investment` (test followed, drill pinned): roundoff in the variance is
+    # reported as an exact zero, not e.g. 0.000122.
+    no_drill_payload = {
+        "problem_id": problem.id,
+        "evidence": {"test_result": "OS"},
+        "decision_evidence": {"drill": "no"},
+        "solution": solution,
+    }
+    no_drill_response = post_json(client, "/graphical/whatif", no_drill_payload, access_token)
+    assert no_drill_response.status_code == 200, no_drill_response.text
+    assert no_drill_response.json()["utilities"]["investment"] == pytest.approx(10_000.0)
+    assert no_drill_response.json()["utility_std_devs"]["investment"] == 0.0
+
+    for both in ({"test": "yes", "drill": "no"}, {"test": "no", "drill": "no"}):
+        with_solution = post_json(
+            client,
+            "/graphical/whatif",
+            {"problem_id": problem.id, "decision_evidence": both, "solution": solution},
+            access_token,
+        )
+        without_solution = post_json(
+            client, "/graphical/whatif", {"problem_id": problem.id, "decision_evidence": both}, access_token
+        )
+        assert with_solution.status_code == 200, with_solution.text
+        assert without_solution.status_code == 200, without_solution.text
+        assert with_solution.json()["utilities"] == pytest.approx(without_solution.json()["utilities"])
+        assert with_solution.json()["posteriors"] == pytest.approx(without_solution.json()["posteriors"])
+        assert with_solution.json()["off_policy_decisions"] == []
+
+
+@pytest.mark.gurobipy
+def test_whatif_solution_pin_moving_followed_decision_off_path_reports_it(
+    client: TestClient, session_and_user: dict
+):
+    """A pin that puts a followed decision where the solution never goes yields no utilities.
+
+    The profit-optimal solution runs the test, so `drill`'s choice at `test="no"` is left
+    unconstrained by the MILP. Pinning `test="no"` reports `drill` as off-policy instead of
+    using that arbitrary choice.
+    """
+    session: Session = session_and_user["session"]
+    access_token = login(client)
+    problem, _result, state = _oil_wildcatter_with_solved_state(session)
+    solution = {"state_id": state.id, "solution_index": 0}
+
+    payload = {"problem_id": problem.id, "decision_evidence": {"test": "no"}, "solution": solution}
+    response = post_json(client, "/graphical/whatif", payload, access_token)
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert data["off_policy_decisions"] == ["drill"]
+    assert data["utilities"] == {}
+    assert data["utility_std_devs"] == {}
+    assert data["policy"] == {"test": "no"}
+    # Upstream of `drill`, the posteriors still reflect the pin.
+    assert data["posteriors"]["test_result"] == pytest.approx([0.0, 0.0, 0.0, 1.0])
+
+
+@pytest.mark.gurobipy
+def test_whatif_solution_unusable_reference_is_404_or_400(client: TestClient, session_and_user: dict):
+    """Missing / inaccessible / other-problem states are 404; a bad index or stale `z` is 400."""
+    session: Session = session_and_user["session"]
+    owner = session_and_user["user"]
+    access_token = login(client)
+    problem, result, state = _oil_wildcatter_with_solved_state(session)
+
+    def whatif_with(solution: dict, token: str = access_token):
+        return post_json(client, "/graphical/whatif", {"problem_id": problem.id, "solution": solution}, token)
+
+    assert whatif_with({"state_id": 999_999, "solution_index": 0}).status_code == 404
+
+    other_problem = session.exec(select(ProblemDB)).all()[1]
+    other_state = _store_solution_state(session, other_problem.id, [result])
+    assert whatif_with({"state_id": other_state.id, "solution_index": 0}).status_code == 404
+
+    # A state in the owner's own interactive session, seen by a user who can see the problem.
+    owner_session = InteractiveSessionDB(user_id=owner.id, info="owner's session")
+    session.add(owner_session)
+    session.commit()
+    session.refresh(owner_session)
+    private_state = _store_solution_state(session, problem.id, [result], session_id=owner_session.id)
+    dm_user = User(username="dm_user_whatif", password_hash=get_password_hash("dm_pw"), role=UserRole.dm, group="test")
+    session.add(dm_user)
+    session.commit()
+    session.refresh(dm_user)
+    session.add(Group(name="shared-whatif", owner_id=owner.id, user_ids=[dm_user.id], problem_id=problem.id))
+    session.commit()
+    dm_token = login(client, username="dm_user_whatif", password="dm_pw")  # noqa: S106
+    assert whatif_with({"state_id": private_state.id, "solution_index": 0}, dm_token).status_code == 404
+    assert whatif_with({"state_id": private_state.id, "solution_index": 0}).status_code == 200
+
+    assert whatif_with({"state_id": state.id, "solution_index": 1}).status_code == 400
+    assert whatif_with({"state_id": state.id, "solution_index": -1}).status_code == 400
+
+    _, index_map = compile_diagram(*build_oil_wildcatter_demo())
+    stale_variables = {**result.optimal_variables, index_map.decisions["test"].z_symbol: [1.0]}
+    stale_result = result.model_copy(update={"optimal_variables": stale_variables})
+    stale_state = _store_solution_state(session, problem.id, [stale_result])
+    assert whatif_with({"state_id": stale_state.id, "solution_index": 0}).status_code == 400
+
+
+def test_whatif_solution_without_index_map_is_404(client: TestClient, session_and_user: dict):
+    """A problem whose metadata has no `IndexMap` can't decode a solution's policy, unless it's not needed."""
+    session: Session = session_and_user["session"]
+    access_token = login(client)
+
+    problem = session.exec(select(ProblemDB)).first()
+    network, annotation = build_oil_wildcatter_demo()
+    _persist_graphical_metadata(session, problem.id, network, annotation)
+    results = SolverResults(optimal_objectives={}, optimal_variables={}, success=True, message="")
+    state = _store_solution_state(session, problem.id, [results])
+
+    payload = {"problem_id": problem.id, "solution": {"state_id": state.id, "solution_index": 0}}
+    response = post_json(client, "/graphical/whatif", payload, access_token)
+    assert response.status_code == 404, response.text
+
+    # With every decision pinned the solution isn't needed, so it isn't decoded.
+    pinned_payload = {**payload, "decision_evidence": {"test": "yes", "drill": "yes"}}
+    pinned_response = post_json(client, "/graphical/whatif", pinned_payload, access_token)
+    assert pinned_response.status_code == 200, pinned_response.text
 
 
 def test_whatif_ownership_enforced_for_problem(client: TestClient, session_and_user: dict):

@@ -5,6 +5,7 @@ import {
 	createWhatIfRunner,
 	dominantDeltaIndex,
 	fetchCommitBounds,
+	formatUtility,
 	hasEvidenceDiverged
 } from './whatif';
 import { filterChanceEvidence } from './interaction';
@@ -230,8 +231,15 @@ describe('fetchCommitBounds', () => {
 			nadir: { f_1: 9.0 }
 		});
 		const result = await fetchCommitBounds(fetchWhatIf, 42, { weather: 'dry' });
-		expect(fetchWhatIf).toHaveBeenCalledWith(42, { weather: 'dry' }, undefined, true);
+		expect(fetchWhatIf).toHaveBeenCalledWith(42, { weather: 'dry' }, undefined, true, {}, null);
 		expect(result).toEqual({ bounds: { ideal: { f_1: 1.5 }, nadir: { f_1: 9.0 } } });
+	});
+
+	it('passes decision pins and the followed solution through', async () => {
+		const fetchWhatIf = vi.fn().mockResolvedValue({ posteriors: {} });
+		const solution = { stateId: 7, solutionIndex: 2 };
+		await fetchCommitBounds(fetchWhatIf, 42, {}, { test: 'yes' }, solution);
+		expect(fetchWhatIf).toHaveBeenCalledWith(42, {}, undefined, true, { test: 'yes' }, solution);
 	});
 
 	it('maps a null ideal/nadir (non-committing response shape) to undefined', async () => {
@@ -269,7 +277,7 @@ describe('fetchCommitBounds', () => {
 
 		await fetchCommitBounds(fetchWhatIf, 42, filterChanceEvidence(model, committed));
 
-		expect(fetchWhatIf).toHaveBeenCalledWith(42, { weather: 'dry' }, undefined, true);
+		expect(fetchWhatIf).toHaveBeenCalledWith(42, { weather: 'dry' }, undefined, true, {}, null);
 	});
 });
 
@@ -293,5 +301,19 @@ describe('hasEvidenceDiverged', () => {
 
 	it('is order-independent', () => {
 		expect(hasEvidenceDiverged({ a: '1', b: '2' }, { b: '2', a: '1' })).toBe(false);
+	});
+});
+
+describe('formatUtility', () => {
+	it('formats mean and std dev compactly', () => {
+		expect(formatUtility(20286, 88631.4)).toBe('20.3K ± 88.6K');
+	});
+
+	it('keeps small numbers as-is and shows a zero std dev', () => {
+		expect(formatUtility(738, 0)).toBe('738 ± 0');
+	});
+
+	it('omits the std dev when not given', () => {
+		expect(formatUtility(-1500)).toBe('-1.5K');
 	});
 });

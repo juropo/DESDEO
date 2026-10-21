@@ -1,15 +1,13 @@
 <script lang="ts">
 	/**
-	 * `<NetworkView>` — structure-only network visualisation (graphical models plan, frontend
-	 * phase A). No backend calls: renders a `NetworkModel`'s DAG structure on a Svelte Flow canvas
-	 * plus a table view, with client-side ancestor-set highlighting on hover/select.
+	 * `<NetworkView>` — structure-only network visualisation. No backend calls: renders a
+	 * `NetworkModel`'s DAG on a Svelte Flow canvas plus a table view, with ancestor-set highlighting
+	 * on hover/select.
 	 *
-	 * Layout is elk-computed on demand (mount, if the model carries no usable layout yet, or the
-	 * explicit "Re-layout" button) and written back onto the bindable `model` prop so callers can
-	 * persist it — re-running layout on every mount would destroy spatial memory across method UIs.
+	 * Layout is elk-computed on mount (if the model has no usable layout) or via "Re-layout", and
+	 * written back onto the bindable `model` so callers can persist it.
 	 *
-	 * Level of detail (`compact` / `normal` / `expanded`, see `lod.ts`) is driven by the canvas
-	 * container's width *and* the current zoom, or pinned to `'compact'` via the `compact` prop.
+	 * Level of detail (see `lod.ts`) follows container width and zoom, or is pinned by `compact`.
 	 */
 	import { onMount, untrack, type Snippet } from 'svelte';
 	import { SvelteFlow, Background, Controls, type Viewport } from '@xyflow/svelte';
@@ -20,6 +18,7 @@
 	import IconCheck from '@lucide/svelte/icons/check';
 	import IconInfo from '@lucide/svelte/icons/info';
 	import NetworkTable from './NetworkTable.svelte';
+	import FitViewOnReady from './FitViewOnReady.svelte';
 	import { NETWORK_NODE_TYPES } from './nodes';
 	import { computeElkLayout, layoutCoversModel } from './layout';
 	import { computeDetailLevel } from './lod';
@@ -37,7 +36,9 @@
 		NetworkEvidence,
 		NetworkModel,
 		NetworkPolicy,
-		NetworkPosteriors
+		NetworkPosteriors,
+		NetworkUtilities,
+		NetworkUtilityStdDevs
 	} from './types';
 	import type {
 		HighlightState,
@@ -47,47 +48,39 @@
 	} from './view-types';
 
 	interface Props {
-		/** Bindable so a computed layout (auto, or from "Re-layout") can be persisted by the
-		 *  caller — see the plan's design decision on where compiled-model metadata lives. */
+		/** Bindable so a computed layout can be persisted by the caller. */
 		model: NetworkModel;
 		/** Hard evidence pinned per node id. Bindable: editable nodes (see `isNodeEditable`) toggle
 		 *  it on click, but a method UI or `<NetworkPanel>` is free to set/read it directly too —
 		 *  e.g. to seed evidence from elsewhere in its own UI. */
 		evidence?: NetworkEvidence;
-		/** Per-node posterior probabilities to render as state bars (phase B is UI-only — this is
-		 *  the wire shape a real compiled-diagram what-if response fills in later, not a live
-		 *  computation done here). */
+		/** Per-node posterior probabilities to render as state bars. */
 		posteriors?: NetworkPosteriors;
-		/** Baseline distribution each of `posteriors`' bars is diffed against — the prior (no
-		 *  evidence at all) or, once the DM has committed some evidence via `onCommitEvidence`,
-		 *  that committed evidence's own posteriors. Entirely caller-owned (phase D): this
-		 *  component never fetches or computes it itself, only renders the ghost mark/signed delta
-		 *  it implies (see `GraphNode`'s `delta`/`ghostPosterior` handling) and decides whether
-		 *  `evidence` currently diverges from `committedEvidence` for the Commit button below. */
+		/** Baseline distribution each posterior bar is diffed against (the prior, or the committed
+		 *  evidence's posteriors). Caller-owned. */
 		ghostPosteriors?: NetworkPosteriors;
-		/** The evidence the caller currently considers "accepted" — e.g. already folded into a
-		 *  method's own reference-point ranges. Compared against `evidence` (via
-		 *  `hasEvidenceDiverged`) purely to decide whether there's anything exploratory left to
-		 *  commit; this component never mutates it itself. Defaults to `{}` (nothing committed
-		 *  yet), so a caller that never wires up commit machinery still gets a correctly-disabled
-		 *  Commit button (nothing to diverge from) rather than a crash. */
+		/** The evidence the caller considers accepted. Compared against `evidence` to enable the
+		 *  Commit button; never mutated here. */
 		committedEvidence?: NetworkEvidence;
 		/** A solved policy's chosen state per decision node, shown read-only in
 		 *  `decisionMode: 'solver'`. */
 		policy?: NetworkPolicy;
-		/** True while a what-if refresh triggered by the current `evidence` is in flight (or
-		 *  debounced, about to be) — dims the whole canvas+table rather than let a partial update
-		 *  (some node's bars already refreshed, others not yet) read as a bug. Entirely
-		 *  caller-driven: this component owns no fetching of its own (see `NetworkPanel`, or the
-		 *  Cumulus demo's own debounced mock, for what actually sets this). */
+		/** Expected utility (and its std dev) per objective node id, shown on objective nodes. */
+		utilities?: NetworkUtilities;
+		utilityStdDevs?: NetworkUtilityStdDevs;
+		/** Per-state probability of each decision under a followed solution's policy, highlighted
+		 *  on unpinned decision nodes (see `WhatIfResult.decisionPosteriors`). */
+		decisionPosteriors?: NetworkPosteriors;
+		/** Followed decisions moved off the solution's path, flagged on their nodes. */
+		offPolicyDecisions?: string[];
+		/** True while a what-if refresh is in flight or debounced; dims the canvas and table so
+		 *  partial updates don't show. Caller-driven. */
 		stale?: boolean;
 		/** `'solver'` (default): decision nodes display `policy`'s choice, read-only. `'manual'`:
 		 *  decision nodes become clickable like chance nodes, writing the chosen state into
 		 *  `evidence` instead. */
 		decisionMode?: DecisionMode;
-		/** Externally driven highlight set — e.g. hovering an objective in a reference-point widget
-		 *  (phase C) — unioned with the hover/select ancestor highlighting this component already
-		 *  computes on its own. */
+		/** Externally driven highlight set, unioned with the hover/select ancestor highlighting. */
 		highlight?: Iterable<string> | null;
 		/** Injected per-node chrome (a badge, icon, etc.) so a method UI can decorate nodes without
 		 *  forking this component or `GraphNode`. Receives `{ id, kind, label }` for the node being
@@ -100,14 +93,7 @@
 		onNodeSelect?: (id: string | null) => void;
 		onNodeHover?: (id: string | null) => void;
 		onEvidenceChange?: (evidence: NetworkEvidence) => void;
-		/** Fired when the DM clicks "Commit evidence" — the explicit exploratory-vs-committed
-		 *  boundary the plan's phase D calls for. This component does nothing else on commit
-		 *  (doesn't touch `evidence`, `ghostPosteriors`, or `committedEvidence` itself): promoting
-		 *  the current evidence/posteriors into the new baseline, or triggering a real method's own
-		 *  range recomputation, is entirely the caller's decision to make — see the plan's phase D
-		 *  findings for why ("hold ranges fixed, show clipping" was chosen over silent
-		 *  recompute-and-warn, precisely because no such recompute machinery exists yet to make a
-		 *  "warn" claim honest). */
+		/** Fired when the DM clicks "Commit evidence". What committing means is up to the caller. */
 		onCommitEvidence?: (evidence: NetworkEvidence) => void;
 	}
 
@@ -118,6 +104,10 @@
 		ghostPosteriors,
 		committedEvidence = {},
 		policy,
+		utilities,
+		utilityStdDevs,
+		decisionPosteriors,
+		offPolicyDecisions,
 		stale = false,
 		decisionMode = 'solver',
 		highlight = null,
@@ -139,20 +129,16 @@
 	let hoveredId = $state<string | null>(null);
 	let selectedId = $state<string | null>(null);
 	let relayouting = $state(false);
+	let layoutVersion = $state(0);
 
 	let detailLevel = $derived(computeDetailLevel(containerWidth, viewport.zoom, compact));
 
-	// Rebuilt only when `model.nodes`/`model.edges` themselves change (that's all `buildAdjacency`
-	// reads), not on every hover/select -- `highlightedIds` below used to call `ancestralSet`
-	// without this, which rebuilt the adjacency maps from scratch on every single hover event.
+	// Rebuilt only when nodes/edges change, not on every hover/select.
 	let adjacency = $derived.by((): Adjacency => buildAdjacency(model));
 
-	// Free (structural, backend-independent) slice of phase C: hovering/selecting a node lights
-	// up its ancestor set. Full active-trail-given-evidence highlighting needs evidence state
-	// that only exists once phase D's what-if machinery lands.
+	// Hovering/selecting a node lights up its ancestor set.
 	let highlightFocusId = $derived(hoveredId ?? selectedId);
-	// Unioned with the externally supplied `highlight` prop (phase C: cross-highlighting driven
-	// by other UI, e.g. hovering an objective in a reference-point widget) — see `mergeHighlightSets`.
+	// Unioned with the externally supplied `highlight` prop.
 	let highlightedIds = $derived.by((): Set<string> | null => {
 		const internal = highlightFocusId ? ancestralSet(model, [highlightFocusId], adjacency) : null;
 		return mergeHighlightSets(internal, highlight);
@@ -175,14 +161,8 @@
 		return highlights.has(id) ? 'active' : 'dimmed';
 	}
 
-	// Structural reconciliation: reruns on node/edge-set changes, detail-level changes
-	// (resize/zoom), and evidence/policy/posteriors/decisionMode/chrome changes -- deliberately
-	// *not* on highlight changes (hover/select), which the lightweight effect below handles
-	// instead. Rebuilding this whole array (including a fresh `onStateClick` closure per node)
-	// on every hover/select used to make each mouse move over the canvas reallocate N node
-	// objects and N throwaway closures for what is otherwise only a `highlight` field flip.
-	// Existing node positions (including manual drags) are preserved via `prevPositions`; only
-	// genuinely new nodes fall back to the persisted layout or the origin.
+	// Structural reconciliation. Deliberately not rerun on highlight changes, which the lighter
+	// effect below handles. Existing node positions, including manual drags, are preserved.
 	$effect(() => {
 		const nodes = model.nodes;
 		const edges = model.edges;
@@ -191,6 +171,10 @@
 		const evidenceSnapshot = evidence;
 		const committedSnapshot = committedEvidence;
 		const policySnapshot = policy;
+		const utilitiesSnapshot = utilities;
+		const utilityStdDevsSnapshot = utilityStdDevs;
+		const decisionPosteriorsSnapshot = decisionPosteriors;
+		const offPolicySnapshot = offPolicyDecisions;
 		const posteriorSnapshot = posteriors;
 		const ghostSnapshot = ghostPosteriors;
 		const mode = decisionMode;
@@ -224,17 +208,15 @@
 							n.kind === 'decision' && mode === 'solver' ? policySnapshot?.[n.id] : undefined,
 						posterior,
 						ghostPosterior,
-						// Only worth explaining a *zero* delta -- explainNoChange itself no-ops when
-						// `computeDelta` finds an actual change (or nothing to compare at all).
-						// `committedSnapshot` is the conditioning set: `ghostPosterior` already
-						// reflects it, so the d-separation query is "is nodeId separated from the
-						// evidence *added since the commit*, given the commit" -- see
-						// `explainNoChange`'s own doc comment for why an unconditioned query is
-						// wrong the moment anything has ever been committed. `adjacency` (already
-						// `$derived.by` off `model` above) is passed through so this doesn't rebuild
-						// it from scratch per node, per reconciliation.
-						// `?? undefined`: NetworkNodeData's contract uses "absent" (not `null`) for
-						// "nothing to explain", matching every other optional field on it.
+						solutionPosterior:
+							n.kind === 'decision' && evidenceSnapshot[n.id] === undefined
+								? decisionPosteriorsSnapshot?.[n.id]
+								: undefined,
+						offPolicy: evidenceSnapshot[n.id] === undefined && offPolicySnapshot?.includes(n.id),
+						utility: utilitiesSnapshot?.[n.id],
+						utilityStdDev: utilityStdDevsSnapshot?.[n.id],
+						// Explains a zero delta via d-separation from the evidence added since the
+						// commit, given the committed evidence.
 						nullExplanation:
 							explainNoChange(
 								model,
@@ -283,6 +265,7 @@
 			const layout = await computeElkLayout(model);
 			model = { ...model, layout };
 			flowNodes = flowNodes.map((n) => ({ ...n, position: layout.positions[n.id] ?? n.position }));
+			layoutVersion++;
 		} finally {
 			relayouting = false;
 		}
@@ -341,17 +324,8 @@
 			]}
 		/>
 		<div class="flex items-center gap-2">
-			<!-- Evidence-mode disclosure (phase D item 2): the backend only ever conditions on
-			     evidence (pyAgrum `setEvidence`) -- never a causal intervention -- and has no
-			     soft-evidence/likelihood parameter. Said plainly here rather than building a mode
-			     toggle or a "soft evidence" affordance the backend can't actually honour. Always
-			     visible (not gated to wider viewports -- the toolbar already `flex-wrap`s instead of
-			     needing to hide anything to fit) since this is a safety disclosure, not decoration:
-			     the evidence chips/pins/Commit button stay fully interactive at every width, so the
-			     note explaining what that evidence actually means has to too. `aria-label` (not just
-			     `title`, which a touch UI has no way to trigger) carries the full sentence as this
-			     element's accessible name; the short visible text is what a sighted user reads
-			     without needing to hover. -->
+			<!-- Evidence is always conditioned on (pyAgrum `setEvidence`), never an intervention or
+			     soft evidence. `aria-label` carries the full sentence. -->
 			<span
 				class="text-muted-foreground flex items-center gap-1 text-xs"
 				title={EVIDENCE_MODE_NOTE}
@@ -380,16 +354,11 @@
 	</div>
 
 	<!--
-		Both panes stay permanently mounted; only visibility/sizing changes with `viewMode`. Using
-		{#if} to swap DOM structure per mode would tear down and recreate the canvas container
-		(and with it `containerEl`, the ResizeObserver target, and the SvelteFlow viewport) every
-		time the user toggled modes — this way canvas zoom/pan state and the ResizeObserver both
-		survive mode switches.
+		Both panes stay mounted; only visibility changes with `viewMode`, so canvas zoom/pan and the
+		ResizeObserver survive mode switches.
 	-->
 	<div class="relative flex min-h-0 flex-1 flex-col gap-2">
-		<!-- Dims the *whole* canvas+table pane, not just the nodes whose bars are about to change --
-		     a partial update (some nodes refreshed, others not yet) reads as a bug, so staleness is
-		     shown before any per-node data actually changes (see `stale`'s own doc comment). -->
+		<!-- Dims the whole pane so a partial update doesn't show. -->
 		<div
 			class="pointer-events-none absolute inset-0 z-20 flex items-start justify-center pt-2 transition-opacity duration-300"
 			class:opacity-0={!stale}
@@ -425,6 +394,7 @@
 				>
 					<Background />
 					<Controls showLock={false} />
+					<FitViewOnReady trigger={layoutVersion} />
 				</SvelteFlow>
 			</div>
 			<div

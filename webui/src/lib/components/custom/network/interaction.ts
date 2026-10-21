@@ -1,55 +1,41 @@
 /**
- * Pure helpers behind the phase B embedding contract — evidence toggling, decision-node
- * editability, and cross-highlight merging — kept separate from `NetworkView.svelte` so they're
- * unit-testable the same way `dag-algorithms.ts` is, without needing a component-testing setup
- * (none exists in this repo yet; `dag-algorithms.test.ts` is the precedent this follows).
+ * Pure helpers for evidence toggling, decision-node editability, and highlight merging, kept out
+ * of `NetworkView.svelte` so they're unit-testable.
  */
 
-import type { DecisionMode, NetworkEvidence, NetworkModel, NetworkNodeKind } from './types';
+import type {
+	DecisionMode,
+	NetworkEvidence,
+	NetworkModel,
+	NetworkNodeKind,
+	NetworkPolicy
+} from './types';
 
 /**
- * The one-line explanation `NetworkView` shows next to its evidence controls (phase D). The real
- * backend (`WhatIfRequest.evidence`, `desdeo/api/routers/graphical.py`) only ever calls pyAgrum's
- * `setEvidence` — conditioning/observation, never a do-operator intervention — and has no
- * soft-evidence/likelihood parameter at all. Rather than build a mode toggle or a "soft evidence"
- * slider the backend can't honour, this is said plainly in the UI instead: see `NetworkEvidence`'s
- * own doc comment in `types.ts` for the full reasoning, and the plan's phase D findings for why
- * this was chosen over a visibly-disabled affordance.
+ * The explanation `NetworkView` shows next to its evidence controls: the backend only conditions
+ * on evidence (pyAgrum `setEvidence`), never interventions or soft evidence.
  */
 export const EVIDENCE_MODE_NOTE =
 	'Evidence here is observational (conditioning on what is known), not a causal intervention — setting a state updates belief given it, it does not simulate changing it.';
 
-/** Minimal shape `isStatePinned` needs off a node's data — matches the relevant slice of
- *  `NetworkNodeData` without importing it (that type lives in `view-types.ts`, the rendering-only
- *  side of the split this module's own docs describe; this helper is about evidence/policy data,
- *  not rendering). */
+/** Minimal shape `isStatePinned` needs off a node's data. */
 interface PinnableNodeData {
 	evidenceState?: string;
 	policyState?: string;
 }
 
 /**
- * Chance nodes are always editable — clicking a state sets/clears hard evidence on it. Decision
- * nodes are editable only in `decisionMode: 'manual'`; in `'solver'` mode they display a solved
- * policy's choice read-only instead (see `NetworkPolicy`). Objective and deterministic nodes are
- * never editable: an objective has no state space of its own, and a deterministic node's value
- * follows from its parents rather than being observed or chosen.
+ * Chance nodes are always editable. Decision nodes are editable only in `decisionMode: 'manual'`;
+ * in `'solver'` mode they show a solved policy read-only. Objective and deterministic nodes are
+ * never editable.
  */
 export function isNodeEditable(kind: NetworkNodeKind, decisionMode: DecisionMode): boolean {
 	return kind === 'chance' || (kind === 'decision' && decisionMode === 'manual');
 }
 
 /**
- * Restricts `evidence` to chance-node ids only, per `model.nodes`' own `kind`. The real
- * `/graphical/whatif` endpoint (`desdeo/api/routers/graphical.py`) hard-rejects (400) any evidence
- * key that isn't one of the compiled `DiscreteNetwork`'s chance nodes — a decision node picked
- * while exploring `decisionMode: 'manual'` is a real, clickable state per `isNodeEditable` above,
- * but posting it to `/whatif` would 400 the whole request. This is also exactly the constraint the
- * plan's own phase E entry names ("what-if inside method UIs is then restricted to chance nodes ...
- * 'if A happens' is a question about the world, not about what we choose") — enforced here at the
- * wire boundary (`NetworkPanel`'s calls into `fetchWhatIf`) rather than by disallowing the click
- * itself, so a decision pick still shows locally (evidence pin, `isStatePinned`) without ever being
- * sent to the backend as if it were an observation.
+ * Restricts `evidence` to chance-node ids, since `/graphical/whatif` rejects other keys. Decision
+ * picks still show locally but go through `filterDecisionEvidence` instead.
  */
 export function filterChanceEvidence(
 	model: Pick<NetworkModel, 'nodes'>,
@@ -57,6 +43,79 @@ export function filterChanceEvidence(
 ): NetworkEvidence {
 	const chanceIds = new Set(model.nodes.filter((n) => n.kind === 'chance').map((n) => n.id));
 	return Object.fromEntries(Object.entries(evidence).filter(([id]) => chanceIds.has(id)));
+}
+
+/**
+ * Restricts `evidence` to decision-node ids, for `WhatIfRequest.decision_evidence`.
+ */
+export function filterDecisionEvidence(
+	model: Pick<NetworkModel, 'nodes'>,
+	evidence: NetworkEvidence
+): NetworkEvidence {
+	const decisionIds = new Set(model.nodes.filter((n) => n.kind === 'decision').map((n) => n.id));
+	return Object.fromEntries(Object.entries(evidence).filter(([id]) => decisionIds.has(id)));
+}
+
+/**
+ * Decision ids that must still be pinned before `/graphical/whatif` can compute utilities: with
+ * more than one objective and no solution to follow, the backend needs every decision pinned (it
+ * returns 501 otherwise). Empty when the request can be served.
+ */
+export function decisionsBlockingUtilities(
+	model: Pick<NetworkModel, 'nodes'>,
+	decisionEvidence: NetworkEvidence,
+	hasSolution: boolean
+): string[] {
+	if (hasSolution) return [];
+	if (model.nodes.filter((n) => n.kind === 'objective').length <= 1) return [];
+	return model.nodes
+		.filter((n) => n.kind === 'decision' && !(n.id in decisionEvidence))
+		.map((n) => n.id);
+}
+
+/** One decision's state and where it comes from, as listed by `describeDecisions`. */
+export interface DecisionStatus {
+	id: string;
+	label: string;
+	state?: string;
+	source: 'pinned' | 'solution' | 'off-policy' | 'unresolved';
+	/** Unresolved only: labels of the decision's parents that are neither in the evidence nor the
+	 *  policy. */
+	dependsOn: string[];
+}
+
+/**
+ * Each decision's state: pinned in `evidence`, moved off the followed solution's path
+ * (`offPolicy`, see `WhatIfResult.offPolicyDecisions`), chosen by `policy` (the followed
+ * solution's choice, which also repeats the pins), or unresolved.
+ */
+export function describeDecisions(
+	model: Pick<NetworkModel, 'nodes' | 'edges'>,
+	evidence: NetworkEvidence,
+	policy: NetworkPolicy | undefined,
+	offPolicy: string[] = []
+): DecisionStatus[] {
+	const labels = new Map(model.nodes.map((n) => [n.id, n.label]));
+	return model.nodes
+		.filter((n) => n.kind === 'decision')
+		.map((n) => {
+			if (n.id in evidence) {
+				return { id: n.id, label: n.label, state: evidence[n.id], source: 'pinned', dependsOn: [] };
+			}
+			if (offPolicy.includes(n.id)) {
+				return { id: n.id, label: n.label, source: 'off-policy', dependsOn: [] };
+			}
+			const chosen = policy?.[n.id];
+			if (chosen !== undefined) {
+				return { id: n.id, label: n.label, state: chosen, source: 'solution', dependsOn: [] };
+			}
+			const dependsOn = model.edges
+				.filter(
+					(e) => e.target === n.id && !(e.source in evidence) && !(e.source in (policy ?? {}))
+				)
+				.map((e) => labels.get(e.source) ?? e.source);
+			return { id: n.id, label: n.label, source: 'unresolved', dependsOn };
+		});
 }
 
 /**
@@ -86,12 +145,22 @@ export function isStatePinned(nodeData: PinnableNodeData, state: string): boolea
 }
 
 /**
- * Union of an internally computed highlight set (the hover/select ancestor closure `NetworkView`
- * already maintains) and an externally supplied one (the `highlight` prop, for cross-highlighting
- * driven by other UI — see phase C). Either side may be absent or empty; `null` means "no
- * highlighting active at all", as distinct from an empty-but-active set — `external` being an
- * empty (but present, i.e. not `null`/`undefined`) iterable is a caller actively saying "highlight
- * nothing", which must dim every node, not read as "no highlight prop was given".
+ * How strongly a followed solution's policy picks state `index` of a decision, given its
+ * `solutionPosterior`: `'certain'` at probability 1, `'possible'` above 0, else `null`.
+ */
+export function solutionStateTier(
+	solutionPosterior: number[] | undefined,
+	index: number
+): 'certain' | 'possible' | null {
+	const p = solutionPosterior?.[index] ?? 0;
+	if (p >= 1 - 1e-9) return 'certain';
+	if (p > 1e-9) return 'possible';
+	return null;
+}
+
+/**
+ * Union of the internal hover/select highlight set and the external `highlight` prop. `null` means
+ * no highlighting; an empty external set means "highlight nothing" and dims every node.
  */
 export function mergeHighlightSets(
 	internal: Set<string> | null,

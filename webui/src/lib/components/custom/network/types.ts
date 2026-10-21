@@ -68,8 +68,8 @@ export type NetworkPosteriors = Record<string, number[]>;
 /** Decision node id -> the state a solved policy chose for it. */
 export type NetworkPolicy = Record<string, string>;
 
-/** Objective node id -> expected utility under the current evidence. Not rendered on the graph;
- *  passed to the host via `NetworkPanel`'s `onWhatIfResult`. */
+/** Objective node id -> expected utility under the current evidence. Shown on objective nodes,
+ *  and passed to the host via `NetworkPanel`'s `onWhatIfResult`. */
 export type NetworkUtilities = Record<string, number>;
 
 /** Objective node id -> standard deviation of the utility under the current evidence. Same
@@ -86,6 +86,12 @@ export interface WhatIfResult {
 	 *  `commit: true` requests. */
 	ideal?: Record<string, number> | null;
 	nadir?: Record<string, number> | null;
+	/** Decision ids the pins/evidence moved off the followed solution's path. Utilities are empty
+	 *  when this is non-empty. */
+	offPolicyDecisions?: string[];
+	/** With a followed solution: decision id -> per-state probability under its policy, in the
+	 *  decision's own `states` order. Only for followed decisions that aren't off-policy. */
+	decisionPosteriors?: NetworkPosteriors;
 }
 
 /**
@@ -96,6 +102,13 @@ export interface WhatIfResult {
 export type NetworkPolicySource =
 	| { variableValues: Record<string, number[] | number> }
 	| { solutionId: number };
+
+/** A solved solution stored in a method state, e.g. a CUMULUS `SolutionReferenceResponseLite`.
+ *  Sent to `POST /graphical/whatif` as `solution`, so unpinned decisions follow its policy. */
+export interface NetworkSolutionRef {
+	stateId: number;
+	solutionIndex: number;
+}
 
 /** A named evidence set saved server-side, usable as a comparison baseline (see `NetworkPanel`'s
  *  `loadEvidenceSetAsBaseline`) and shareable by `id`. */

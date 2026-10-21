@@ -1,16 +1,7 @@
-"""Bidirectional conversion between `DiscreteNetwork` and pyAgrum's `BayesNet`.
+"""Conversion between `DiscreteNetwork` and pyAgrum's `BayesNet`/`InfluenceDiagram`.
 
-Also the import/export/learning entry points that go through pyAgrum: `load_network` and
-`save_network` (pyAgrum's own readers/writers -- BIF, XDSL, `.net`, XMLBIF, ...) and
-`learn_network` (a thin wrapper around `pyagrum.BNLearner`); and `to_pyagrum_influence_diagram`,
-which additionally folds in a `DecisionAnnotation` to build a full `gum.InfluenceDiagram` --
-decision nodes plus one utility node per `ObjectiveNode` -- for Phase 7's `/graphical/whatif`
-inference (and, before that, `tests/test_graphical_compile.py`'s own pyAgrum oracle).
-
-This is the only module in `desdeo/problem/graphical/` allowed to import pyAgrum -- see the
-dependency rule in the plan's cross-cutting section. pyAgrum is an ordinary hard dependency
-(like gurobipy/pyomo/cvxpy already are), not an optional extra -- see the design decisions
-table in `.claude/desdeo-graphical-models-plan.md`.
+Also pyAgrum-backed I/O and learning: `load_network`, `save_network`, `learn_network`. This is the
+only module in `desdeo/problem/graphical/` that imports pyAgrum.
 """
 
 from collections.abc import Callable
@@ -31,18 +22,7 @@ from desdeo.problem.graphical.schema import DecisionAnnotation
 
 @dataclass(frozen=True)
 class _VariableKindAdapter:
-    """Everything needed to convert one `DiscreteVariableKind` to/from a pyAgrum variable.
-
-    One registry entry per kind (`_VARIABLE_KIND_ADAPTERS` below) replaces what used to be three
-    independent kind-dispatch points here (a `gum.VarType_*` lookup dict plus two separate
-    `match` statements) -- adding a kind now means adding one entry instead of remembering to
-    update three, and a kind missing from the registry now fails with an explicit `KeyError`/
-    `ValueError` at the lookup site instead of a `match` silently falling through. (This can't
-    also absorb `DiscreteVariable._check_kind_fields`'s validation in `network.py` -- that module
-    is the one that must *not* import pyAgrum, per this package's dependency rule -- so this
-    registry only covers pyAgrum-specific conversion, one of the two things kind-dispatch is
-    used for in this package.)
-    """
+    """Everything needed to convert one `DiscreteVariableKind` to/from a pyAgrum variable."""
 
     pyagrum_type: int
     """The `gum.VarType_*` constant this kind mirrors."""
@@ -114,13 +94,7 @@ _KIND_FROM_PYAGRUM = {adapter.pyagrum_type: kind for kind, adapter in _VARIABLE_
 
 
 def _variable_from_pyagrum(variable: gum.DiscreteVariable) -> DiscreteVariable:
-    """Convert one pyAgrum discrete variable to a `DiscreteVariable`, dispatching on `varType()`.
-
-    `asRangeVar`/`asIntegerVar`/`asDiscretizedVar`/`asNumericalDiscreteVar` (called from within
-    `_VARIABLE_KIND_ADAPTERS`'s `from_pyagrum` entries) downcast a base-typed `DiscreteVariable`
-    reference (what `BayesNet.variable()` returns) to the concrete subclass so its kind-specific
-    accessors become available.
-    """
+    """Convert one pyAgrum discrete variable to a `DiscreteVariable`, dispatching on `varType()`."""
     kind = _KIND_FROM_PYAGRUM.get(variable.varType())
     if kind is None:
         msg = f"Unsupported pyAgrum variable type {variable.varType()} for variable '{variable.name()}'."
@@ -148,9 +122,7 @@ def _variable_to_pyagrum(variable: DiscreteVariable) -> gum.DiscreteVariable:
 def _potential_from_pyagrum(tensor: gum.Tensor) -> Potential:
     """Convert one pyAgrum CPT to a `Potential`.
 
-    `Tensor.toarray()`'s axis order is the reverse of `variablesSequence()`; transposing (which
-    reverses all axes for an N-D array) brings it back in line with `variablesSequence()`'s
-    node-then-parents order, which is the convention `Potential.variables` uses.
+    `Tensor.toarray()`'s axes are reversed relative to `variablesSequence()`, so transpose them.
     """
     variables = [v.name() for v in tensor.variablesSequence()]
     values = np.transpose(tensor.toarray())
@@ -160,9 +132,7 @@ def _potential_from_pyagrum(tensor: gum.Tensor) -> Potential:
 def _fill_cpt(tensor: gum.Tensor, potential: Potential) -> None:
     """Fill a freshly-created pyAgrum CPT from a `Potential`.
 
-    Positional, not name-aware: relies on `tensor.variablesSequence()` already matching
-    `potential.variables`, which `to_pyagrum` guarantees by adding each node's arcs in its own
-    `Potential`'s parent order before filling any CPTs.
+    Positional: relies on `tensor.variablesSequence()` already matching `potential.variables`.
     """
     actual = [v.name() for v in tensor.variablesSequence()]
     if actual != potential.variables:
@@ -173,38 +143,77 @@ def _fill_cpt(tensor: gum.Tensor, potential: Potential) -> None:
         raise ValueError(msg)
 
     values = np.array(potential.values, dtype=float)
-    # fillWith requires a C-contiguous array; transpose alone only produces a reversed-stride
-    # view, so it must be copied back into contiguous memory before handing it to pyAgrum.
+    # fillWith requires a C-contiguous array; transpose only gives a strided view.
     tensor.fillWith(np.ascontiguousarray(np.transpose(values)))
 
 
-def to_pyagrum(network: DiscreteNetwork) -> gum.BayesNet:
-    """Convert a `DiscreteNetwork` to a pyAgrum `BayesNet`."""
+def to_pyagrum(network: DiscreteNetwork, decision_pins: dict[str, int] | None = None) -> gum.BayesNet:
+    """Convert a `DiscreteNetwork` to a pyAgrum `BayesNet`.
+
+    Args:
+        network: the Bayesian network (chance nodes + CPTs).
+        decision_pins: decision symbol -> 0-based state index. Any potential with a pinned decision
+            parent is sliced at that index, since a `BayesNet` can't hold decisions.
+    """
     bn = gum.BayesNet(network.name)
     bn.setProperty("name", network.name)
 
     for variable in network.variables:
         bn.add(_variable_to_pyagrum(variable))
 
-    # Add each node's arcs in its own Potential's parent order, not `network.arcs`'s list
-    # order: pyAgrum records a node's parent order by arc-addition chronology, and `_fill_cpt`
-    # below is positional, so this is what keeps CPT values landing on the right parent axis.
-    for node_name, potential in network.potentials.items():
+    pinned_potentials = {
+        node_name: _pin_potential(potential, decision_pins) for node_name, potential in network.potentials.items()
+    }
+
+    chance_names = {variable.name for variable in network.variables}
+    for node_name, potential in pinned_potentials.items():
+        for parent in potential.variables[1:]:
+            if parent not in chance_names:
+                msg = (
+                    f"Node '{node_name}'s potential depends on decision '{parent}', which was not "
+                    "resolved via decision_pins; pass decision_pins or use "
+                    "to_pyagrum_influence_diagram instead."
+                )
+                raise ValueError(msg)
+
+    # pyAgrum orders a node's parents by arc insertion, and `_fill_cpt` is positional, so add arcs
+    # in each Potential's parent order.
+    for node_name, potential in pinned_potentials.items():
         for parent_name in potential.variables[1:]:
             bn.addArc(parent_name, node_name)
 
-    for node_name, potential in network.potentials.items():
+    for node_name, potential in pinned_potentials.items():
         _fill_cpt(bn.cpt(node_name), potential)
 
     return bn
 
 
+def _pin_potential(potential: Potential, decision_pins: dict[str, int] | None) -> Potential:
+    """Slice out any `decision_pins` axis from `potential`'s parents, leaving it decision-free."""
+    if not decision_pins:
+        return potential
+
+    variables = list(potential.variables)
+    values = np.array(potential.values, dtype=float)
+    for symbol, state in decision_pins.items():
+        if symbol not in variables[1:]:
+            continue
+        axis = variables.index(symbol, 1)
+        size = values.shape[axis]
+        if not (0 <= state < size):
+            msg = f"decision_pins['{symbol}'] = {state} is out of range for '{symbol}' with {size} states."
+            raise ValueError(msg)
+        values = values.take(state, axis=axis)
+        variables.pop(axis)
+
+    return Potential(variables=variables, shape=list(values.shape), values=values.tolist())
+
+
 def from_pyagrum(bn: gum.BayesNet) -> DiscreteNetwork:
     """Convert a pyAgrum `BayesNet` to a `DiscreteNetwork`.
 
-    Nodes are listed in topological order. Each node's arcs are read off its own CPT's
-    `variablesSequence()` rather than `BayesNet.arcs()` (an unordered set), so that a node's
-    parent order -- and therefore `Potential.variables` order -- survives `to_pyagrum(from_pyagrum(bn))`.
+    Nodes are listed in topological order. Arcs are read from each CPT's `variablesSequence()`
+    rather than the unordered `BayesNet.arcs()`, so parent order survives a round trip.
     """
     order = list(bn.topologicalOrder())
     variables = [_variable_from_pyagrum(bn.variable(node_id)) for node_id in order]
@@ -226,11 +235,7 @@ def from_pyagrum(bn: gum.BayesNet) -> DiscreteNetwork:
 
 
 def load_network(path: str | Path, **kwargs) -> DiscreteNetwork:
-    """Import a network from disk via pyAgrum's own readers.
-
-    No hand-written parsers: `gum.loadBN` dispatches on the file extension. See
-    `gum.availableBNExts()` for the supported suffixes (BIF, XDSL, `.net`, XMLBIF, and others).
-    """
+    """Import a network from disk via `gum.loadBN`, which dispatches on the file extension."""
     return from_pyagrum(gum.loadBN(str(path), **kwargs))
 
 
@@ -247,12 +252,8 @@ def learn_network(
 ) -> DiscreteNetwork:
     """Learn a `DiscreteNetwork` from data via pyAgrum's `BNLearner`.
 
-    If `structure` is given, only CPT parameters are relearned against that fixed DAG
-    (`BNLearner.learnParameters`) -- this is the entry point the "decision structure lives in a
-    separate overlay" design decision relies on: relearning CPTs from new data must not require
-    redoing decision modelling, so passing the previous network back in as `structure` keeps the
-    DAG (and therefore anything a `DecisionAnnotation` references on it) untouched. Otherwise
-    both structure and parameters are learned from scratch, via pyAgrum's default search
+    If `structure` is given, only the CPTs are relearned on its fixed DAG, so a
+    `DecisionAnnotation` on it stays valid. Otherwise structure and parameters are both learned
     (greedy hill-climbing + BIC).
 
     Args:
@@ -279,27 +280,13 @@ def learn_network(
 def to_pyagrum_influence_diagram(network: DiscreteNetwork, annotation: DecisionAnnotation) -> gum.InfluenceDiagram:
     """Build a pyAgrum `InfluenceDiagram` from a `(DiscreteNetwork, DecisionAnnotation)` pair.
 
-    Lifted from `tests/test_graphical_compile.py`'s own `_to_pyagrum_influence_diagram` (Phase 4's
-    pyAgrum oracle -- see that module's docstring), now public so Phase 7's `/graphical/whatif`
-    can build the same diagram pyAgrum's own inference engines (`ShaferShenoyLIMIDInference`) need,
-    not just the test suite. Chance nodes and their CPTs come straight from `to_pyagrum`-style
-    conversion (inlined here rather than delegated, since a `gum.BayesNet` can't be upgraded to a
-    `gum.InfluenceDiagram` in place); decision nodes get one arc per `information_set` member
-    (the *declared* one -- `no_forgetting` expansion is an inference-engine concern, applied via
-    `ShaferShenoyLIMIDInference.addNoForgettingAssumption`, not a structural change to the diagram
-    itself); and each `ObjectiveNode` gets its own utility node (`util_<symbol>`), arcs from its
-    `parents`, and its own utility table -- deliberately *not* summed into one utility node, per
-    the Phase 2 finding that pyAgrum's own multi-utility-node convention does that summing itself
-    (`ShaferShenoyLIMIDInference.MEU()`), which is not the semantics `ObjectiveNode` wants. Each
-    utility table is written in *pyAgrum's* maximize-only sign convention, negated from
-    `objective.utility`'s own values whenever `objective.maximize` is `False` -- see the inline
-    comment at the utility-table loop below for why, and for what a caller must do to read a
-    utility-node-derived scalar back out in `objective`'s own units.
+    Decisions get arcs from their declared `information_set` (no-forgetting is left to the
+    inference engine). Each `ObjectiveNode` gets its own utility node `util_<symbol>`, negated when
+    minimized since pyAgrum always maximizes.
 
     Args:
         network: the Bayesian network (chance nodes + CPTs).
-        annotation: the decision/objective overlay. Not validated against `network` here --
-            callers needing that should call `annotation.validate_against(network)` themselves.
+        annotation: the decision/objective overlay. Not validated against `network` here.
 
     Returns:
         gum.InfluenceDiagram: the equivalent pyAgrum diagram.
@@ -308,14 +295,16 @@ def to_pyagrum_influence_diagram(network: DiscreteNetwork, annotation: DecisionA
 
     for variable in network.variables:
         diagram.addChanceNode(_variable_to_pyagrum(variable))
+    # Decisions first, since chance-node CPTs may name them as parents.
+    for decision in annotation.decisions:
+        diagram.addDecisionNode(gum.LabelizedVariable(decision.symbol, decision.symbol, decision.states))
+
     for node_name, potential in network.potentials.items():
         for parent in potential.variables[1:]:
             diagram.addArc(parent, node_name)
     for node_name, potential in network.potentials.items():
         _fill_cpt(diagram.cpt(node_name), potential)
 
-    for decision in annotation.decisions:
-        diagram.addDecisionNode(gum.LabelizedVariable(decision.symbol, decision.symbol, decision.states))
     for decision in annotation.decisions:
         for parent in decision.information_set:
             diagram.addArc(parent, decision.symbol)
@@ -325,17 +314,8 @@ def to_pyagrum_influence_diagram(network: DiscreteNetwork, annotation: DecisionA
         diagram.addUtilityNode(gum.LabelizedVariable(util_name, util_name, 1))
         for parent in objective.parents:
             diagram.addArc(parent, util_name)
-        # pyAgrum's own ID-solving semantics (`ShaferShenoyLIMIDInference`'s policy optimisation,
-        # MEU()) always *maximize* the utility node(s). `ObjectiveNode.maximize` can be `False`
-        # (a cost -- it's the field's own default), so a minimizing objective's utility values are
-        # negated here before being written into pyAgrum's own utility table -- the same
-        # `sign = 1.0 if objective.maximize else -1.0` convention `compile.py`'s `_build_objective`
-        # already uses for the compiled MILP's `Objective`, applied here so pyAgrum's policy search
-        # optimises in the right direction for a minimizing objective too. A caller reading a
-        # utility-node-derived scalar back out of this diagram (`MEU()["mean"]`,
-        # `posteriorUtility`, ...) must negate again by the same sign to recover the value in
-        # `objective`'s own units -- the diagram's own decision/chance-node posteriors need no such
-        # correction, since a *choice* has no sign.
+        # pyAgrum maximizes, so minimized objectives are negated. Utility-derived values read back
+        # (`MEU()`, `posteriorUtility`) must be negated again.
         sign = 1.0 if objective.maximize else -1.0
         fake_potential = Potential(
             variables=[util_name, *objective.parents],

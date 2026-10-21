@@ -3,22 +3,16 @@
 - `build_irrigation_demo`: a single-objective diagram (weather -> soil moisture -> crop yield,
   irrigation decision, profit objective). Backend counterpart to the webui's
   `sampleIrrigationNetwork` fixture (`webui/.../network/sample-network.ts`).
-- `build_cabin_energy_demo`: a two-objective diagram with a decision, used as a realistic
-  multi-objective CUMULUS problem.
+- `build_oil_wildcatter_demo`: the classic Raiffa "Oil Wildcatter" case (seismic test, drill
+  decision), with three objectives and two sequential decisions.
 
-The irrigation diagram is not a literal copy of `sample-network.ts`, because the schema can't
-express everything the frontend fixture does:
+The irrigation diagram differs from `sample-network.ts`:
 
-- A chance node's CPT can't be conditioned on a decision, so `crop_yield` is split into one
-  counterfactual node per irrigation choice (`crop_yield_none`/`_light`/`_heavy`), each
-  conditioned on `soil_moisture` only. `profit`'s utility table selects the node matching
-  `irrigate`'s state. Since the three are conditionally independent given `soil_moisture`, this
-  gives the same joint distribution as a decision-conditioned CPT would.
-- There is no `"deterministic"` node kind, so `water_usage` is folded into `profit`'s utility
-  table as a function of `irrigate`.
-- The second objective, `water_cost`, is dropped: with more than one objective and a decision,
-  `_compute_utilities` in `desdeo/api/routers/graphical.py` raises 501, and `/whatif` calls it on
-  every request. `profit` already nets out water cost.
+- `crop_yield` is split into one counterfactual node per irrigation choice, each conditioned on
+  `soil_moisture` only; `profit`'s utility table selects the one matching `irrigate`.
+- `water_usage` is folded into `profit`'s utility table as a function of `irrigate`.
+- There is no `water_cost` objective (so `/whatif` works without pinning `irrigate`); `profit`
+  already nets out water cost.
 """
 
 import numpy as np
@@ -153,93 +147,152 @@ def build_irrigation_demo() -> tuple[DiscreteNetwork, DecisionAnnotation]:
     return network, annotation
 
 
-CABIN_WEATHER_STATES = ["sunny", "cloudy"]
-SOLAR_STATES = ["low", "high"]
-GRID_STATES = ["stable", "outage"]
-POWER_SOURCE_STATES = ["grid", "battery"]
+STRUCTURE_STATES = ["dry", "wet", "soaking"]
+TEST_RESULT_STATES = ["NS", "OS", "CS", "no_info"]
+OIL_PRICE_STATES = ["low", "baseline", "high"]
+TEST_STATES = ["yes", "no"]
+DRILL_STATES = ["yes", "no"]
+
+STRUCTURE_PRIOR = [0.5, 0.3, 0.2]
+# Asymmetric on purpose: E[price] = 97, not the $100 baseline, so `oil_price` affects expected profit.
+OIL_PRICE_PRIOR = [0.3, 0.5, 0.2]
+
+# P(test_result | structure, test=yes): the case's own NS/OS/CS joint-probability table, divided
+# by its own structure marginals. `no_info` is impossible once the test is actually run.
+_TEST_RESULT_GIVEN_STRUCTURE_WHEN_TESTED = {
+    "dry": [0.6, 0.3, 0.1, 0.0],
+    "wet": [0.3, 0.4, 0.3, 0.0],
+    "soaking": [0.1, 0.4, 0.5, 0.0],
+}
+
+_BARRELS_BY_STRUCTURE = {"dry": 0.0, "wet": 1200.0, "soaking": 2700.0}
+_PRICE_PER_BARREL_BY_OIL_PRICE = {"low": 70.0, "baseline": 100.0, "high": 130.0}
+_TEST_COST = 10_000.0
+_DRILL_COST = 70_000.0
 
 
-def build_cabin_energy_network() -> DiscreteNetwork:
-    """The chance-node half of the demo diagram: `weather -> solar_output`, plus independent `grid_outage`.
+def build_oil_wildcatter_network() -> DiscreteNetwork:
+    """The chance-node half of the demo diagram: `structure`, `test_result`, `oil_price`.
 
-    `grid_outage` is an exogenous risk independent of the weather, so it has no parents.
+    `structure` is the usual dry/wet/soaking state of nature. `test_result` is conditioned on
+    `structure` is the dry/wet/soaking state of nature. `test_result` depends on `structure` and
+    the `test` decision: one of NS/OS/CS if tested, else `no_info` with certainty. `oil_price` is
+    an independent exogenous risk.
     """
-    # P(solar_output | weather), rows = solar_output, columns = weather, each column sums to 1.
-    solar_given_weather = [
-        [0.2, 0.8],  # low
-        [0.8, 0.2],  # high
-    ]
+    # P(test_result | structure, test), axes [test_result, structure, test].
+    test_result_values = np.zeros((len(TEST_RESULT_STATES), len(STRUCTURE_STATES), len(TEST_STATES)))
+    for s, structure in enumerate(STRUCTURE_STATES):
+        for t, test in enumerate(TEST_STATES):
+            probs = (
+                _TEST_RESULT_GIVEN_STRUCTURE_WHEN_TESTED[structure]
+                if test == "yes"
+                else [0.0, 0.0, 0.0, 1.0]  # no_info certain when the test isn't run
+            )
+            for r in range(len(TEST_RESULT_STATES)):
+                test_result_values[r, s, t] = probs[r]
 
     variables = [
-        DiscreteVariable(name="weather", labels=CABIN_WEATHER_STATES, description="Today's weather outlook."),
         DiscreteVariable(
-            name="solar_output", labels=SOLAR_STATES, description="Solar panel output, driven by weather."
+            name="structure", labels=STRUCTURE_STATES, description="True geological state of the drilling site."
         ),
         DiscreteVariable(
-            name="grid_outage",
-            labels=GRID_STATES,
-            description="Grid reliability -- an independent exogenous risk, not caused by weather.",
+            name="test_result",
+            labels=TEST_RESULT_STATES,
+            description="Seismic test reading: no-structure/open-structure/closed-structure, or no "
+            "information if the test wasn't run.",
+        ),
+        DiscreteVariable(
+            name="oil_price",
+            labels=OIL_PRICE_STATES,
+            description="Price-per-barrel regime at the time of drilling, relative to the $100 baseline.",
         ),
     ]
-    arcs = [("weather", "solar_output")]
+    arcs = [("structure", "test_result")]
     potentials = {
-        "weather": Potential(variables=["weather"], shape=[2], values=[0.6, 0.4]),
-        "solar_output": Potential(variables=["solar_output", "weather"], shape=[2, 2], values=solar_given_weather),
-        "grid_outage": Potential(variables=["grid_outage"], shape=[2], values=[0.9, 0.1]),
+        "structure": Potential(variables=["structure"], shape=[3], values=STRUCTURE_PRIOR),
+        "test_result": Potential(
+            variables=["test_result", "structure", "test"],
+            shape=[len(TEST_RESULT_STATES), len(STRUCTURE_STATES), len(TEST_STATES)],
+            values=test_result_values.tolist(),
+        ),
+        "oil_price": Potential(variables=["oil_price"], shape=[3], values=OIL_PRICE_PRIOR),
     }
 
-    return DiscreteNetwork(name="cabin_energy_demo", variables=variables, arcs=arcs, potentials=potentials)
+    return DiscreteNetwork(name="oil_wildcatter_demo", variables=variables, arcs=arcs, potentials=potentials)
 
 
-def build_cabin_energy_annotation() -> DecisionAnnotation:
-    """The decision/objective overlay for `build_cabin_energy_network`.
+def build_oil_wildcatter_annotation() -> DecisionAnnotation:
+    """The decision/objective overlay for `build_oil_wildcatter_network`.
 
-    `power_source` picks `grid` or `battery` with no prior observation. There are two objectives,
-    `expected_cost` and `expected_unmet_demand`, which depend on `power_source`, `solar_output`
-    and `grid_outage`.
+    `test` (run the $10,000 seismic test or not) is taken first with no prior observation; `drill`
+    observes `test_result` and is taken second -- `decision_order=["test", "drill"]` with
+    `no_forgetting=True`, so `drill` also effectively observes `test`. There are three objectives,
+    all parented on `[test, drill, structure, oil_price]`:
 
-    Known limitation: `_compute_utilities` (`desdeo/api/routers/graphical.py`) raises 501 for
-    diagrams with more than one objective and a decision, so every `/whatif` call against this
-    problem fails. In the webui's network dialog this means no priors are shown, and pinning
-    evidence shows an error. CUMULUS itself does not use `/whatif` and is unaffected.
+    - `investment` (minimize): the $10,000 test cost (if run) plus the $70,000 drilling cost (if
+      drilled).
+    - `oil_produced` (maximize, barrels): 0 if not drilled, else the structure's barrel count
+      (dry/wet/soaking -> 0/1200/2700, backed out of the case's net payoffs at $100/barrel).
+    - `profit` (maximize): `oil_produced * price_per_barrel[oil_price] - investment` -- the real
+      trade-off objective, balancing the test's information value against drilling cost and price
+      risk.
+
+    `/graphical/whatif` raises 501 for this diagram unless both decisions are pinned or a solution
+    is given.
     """
-    objective_shape = [len(POWER_SOURCE_STATES), len(SOLAR_STATES), len(GRID_STATES)]
-    parents = ["power_source", "solar_output", "grid_outage"]
+    parents = ["test", "drill", "structure", "oil_price"]
+    objective_shape = [len(TEST_STATES), len(DRILL_STATES), len(STRUCTURE_STATES), len(OIL_PRICE_STATES)]
 
-    # Indexed [power_source][solar_output][grid_outage].
-    cost_values = [
-        [[5.0, 50.0], [5.0, 50.0]],  # grid: low/high solar x stable/outage
-        [[20.0, 20.0], [0.0, 0.0]],  # battery: low/high solar x stable/outage
-    ]
-    unmet_demand_values = [
-        [[0.0, 3.0], [0.0, 3.0]],  # grid
-        [[1.0, 1.0], [0.0, 0.0]],  # battery
-    ]
+    investment_values = np.zeros(objective_shape)
+    oil_produced_values = np.zeros(objective_shape)
+    profit_values = np.zeros(objective_shape)
+    for t, test in enumerate(TEST_STATES):
+        for d, drill in enumerate(DRILL_STATES):
+            investment = (_TEST_COST if test == "yes" else 0.0) + (_DRILL_COST if drill == "yes" else 0.0)
+            for s, structure in enumerate(STRUCTURE_STATES):
+                oil_produced = 0.0 if drill == "no" else _BARRELS_BY_STRUCTURE[structure]
+                for p, oil_price in enumerate(OIL_PRICE_STATES):
+                    profit = oil_produced * _PRICE_PER_BARREL_BY_OIL_PRICE[oil_price] - investment
+                    investment_values[t, d, s, p] = investment
+                    oil_produced_values[t, d, s, p] = oil_produced
+                    profit_values[t, d, s, p] = profit
 
     return DecisionAnnotation(
-        decisions=[DecisionNode(symbol="power_source", name="Power source", states=POWER_SOURCE_STATES)],
+        decisions=[
+            DecisionNode(symbol="test", name="Run seismic test", states=TEST_STATES),
+            DecisionNode(symbol="drill", name="Drill", states=DRILL_STATES, information_set=["test_result"]),
+        ],
         objectives=[
             ObjectiveNode(
-                symbol="expected_cost",
-                name="Expected electricity cost",
+                symbol="investment",
+                name="Investment cost",
                 parents=parents,
-                utility=Potential(variables=parents, shape=objective_shape, values=cost_values),
+                utility=Potential(variables=parents, shape=objective_shape, values=investment_values.tolist()),
                 maximize=False,
             ),
             ObjectiveNode(
-                symbol="expected_unmet_demand",
-                name="Expected unmet demand",
+                symbol="oil_produced",
+                name="Oil produced",
                 parents=parents,
-                utility=Potential(variables=parents, shape=objective_shape, values=unmet_demand_values),
-                maximize=False,
+                utility=Potential(variables=parents, shape=objective_shape, values=oil_produced_values.tolist()),
+                maximize=True,
+            ),
+            ObjectiveNode(
+                symbol="profit",
+                name="Profit",
+                parents=parents,
+                utility=Potential(variables=parents, shape=objective_shape, values=profit_values.tolist()),
+                maximize=True,
             ),
         ],
+        decision_order=["test", "drill"],
+        no_forgetting=True,
     )
 
 
-def build_cabin_energy_demo() -> tuple[DiscreteNetwork, DecisionAnnotation]:
-    """`(network, annotation)` for a two-objective cabin-energy CUMULUS problem. See `build_cabin_energy_annotation`."""
-    network = build_cabin_energy_network()
-    annotation = build_cabin_energy_annotation()
+def build_oil_wildcatter_demo() -> tuple[DiscreteNetwork, DecisionAnnotation]:
+    """`(network, annotation)` for the Oil Wildcatter CUMULUS problem. See `build_oil_wildcatter_annotation`."""
+    network = build_oil_wildcatter_network()
+    annotation = build_oil_wildcatter_annotation()
     annotation.validate_against(network)
     return network, annotation

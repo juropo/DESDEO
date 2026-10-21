@@ -14,7 +14,11 @@
 	import { untrack, type Snippet } from 'svelte';
 	import NetworkView from './NetworkView.svelte';
 	import { createWhatIfRunner, fetchCommitBounds, EVIDENCE_DEBOUNCE_MS } from './whatif';
-	import { filterChanceEvidence } from './interaction';
+	import {
+		decisionsBlockingUtilities,
+		filterChanceEvidence,
+		filterDecisionEvidence
+	} from './interaction';
 	import { defaultFetchPolicy } from './policy';
 	import { defaultFetchEvidenceSets, defaultSaveEvidenceSet } from './evidence-sets';
 	import type {
@@ -25,6 +29,7 @@
 		NetworkPolicy,
 		NetworkPolicySource,
 		NetworkPosteriors,
+		NetworkSolutionRef,
 		NetworkUtilities,
 		NetworkUtilityStdDevs,
 		WhatIfResult
@@ -43,22 +48,41 @@
 	 * `utilities`/`utility_std_devs` by objective symbol, while objective node ids are
 	 * `util_<symbol>`, so the prefix is added here. `ideal`/`nadir` stay keyed by symbol.
 	 *
-	 * `evidence` must already be filtered to chance nodes (`filterChanceEvidence`); the endpoint
-	 * rejects anything else. `commit` opts into the backend's ideal/nadir ratchet.
+	 * `evidence` must already be filtered to chance nodes (`filterChanceEvidence`), and
+	 * `decisionEvidence` to decision nodes (`filterDecisionEvidence`); the endpoint rejects
+	 * anything else in either field. `commit` opts into the backend's ideal/nadir ratchet.
+	 * `solution`: a solved solution that unpinned decisions follow.
 	 */
 	async function defaultFetchWhatIf(
 		modelId: string | number,
 		evidence: NetworkEvidence,
 		signal?: AbortSignal,
-		commit = false
+		commit = false,
+		decisionEvidence: NetworkEvidence = {},
+		solution: NetworkSolutionRef | null = null
 	): Promise<WhatIfResult> {
 		const res = await fetch(`/api/graphical/whatif`, {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ problem_id: modelId, evidence, commit }),
+			body: JSON.stringify({
+				problem_id: modelId,
+				evidence,
+				decision_evidence: decisionEvidence,
+				solution: solution
+					? { state_id: solution.stateId, solution_index: solution.solutionIndex }
+					: null,
+				commit
+			}),
 			signal
 		});
-		if (!res.ok) throw new Error(`Failed to fetch what-if result (status ${res.status})`);
+		if (!res.ok) {
+			const detail: unknown = await res.json().then(
+				(body: { detail?: unknown }) => body?.detail,
+				() => undefined
+			);
+			const suffix = typeof detail === 'string' ? `: ${detail}` : '';
+			throw new Error(`Failed to fetch what-if result (status ${res.status})${suffix}`);
+		}
 		const result = (await res.json()) as {
 			posteriors: NetworkPosteriors;
 			policy?: NetworkPolicy;
@@ -66,6 +90,8 @@
 			utility_std_devs?: NetworkUtilityStdDevs;
 			ideal?: Record<string, number> | null;
 			nadir?: Record<string, number> | null;
+			off_policy_decisions?: string[];
+			decision_posteriors?: NetworkPosteriors;
 		};
 		const withUtilPrefix = <T extends Record<string, number>>(map: T | undefined): T | undefined =>
 			map
@@ -79,7 +105,9 @@
 			utilities: withUtilPrefix(result.utilities),
 			utilityStdDevs: withUtilPrefix(result.utility_std_devs),
 			ideal: result.ideal,
-			nadir: result.nadir
+			nadir: result.nadir,
+			offPolicyDecisions: result.off_policy_decisions,
+			decisionPosteriors: result.decision_posteriors
 		};
 	}
 
@@ -92,8 +120,19 @@
 			evidence: NetworkEvidence,
 			signal?: AbortSignal,
 			/** Opt into the backend's ideal/nadir ratchet. */
-			commit?: boolean
+			commit?: boolean,
+			/** Pinned decision states (`decisionMode: 'manual'` only), filtered via
+			 *  `filterDecisionEvidence`. */
+			decisionEvidence?: NetworkEvidence,
+			/** `policySolution` (`decisionMode: 'manual'` only). */
+			solution?: NetworkSolutionRef | null
 		) => Promise<WhatIfResult>;
+		/** In `decisionMode: 'manual'`, a solved solution whose policy every unpinned decision
+		 *  follows in what-if requests. Refetches when it changes. */
+		policySolution?: NetworkSolutionRef | null;
+		/** Current evidence, including pinned decisions in `decisionMode: 'manual'`. Bindable, e.g.
+		 *  so the host can list the pins. */
+		evidence?: NetworkEvidence;
 		/** A solved solution to decode the policy from (via `POST /graphical/{id}/policy`) on every
 		 *  evidence change, overriding the live-inference policy from `fetchWhatIf`. */
 		policySource?: NetworkPolicySource | null;
@@ -118,8 +157,9 @@
 		class?: string;
 		onNodeSelect?: (id: string | null) => void;
 		onNodeHover?: (id: string | null) => void;
-		/** Fired with every what-if response, e.g. so the host can display `utilities`, which
-		 *  aren't rendered on the graph. */
+		/** Fired with every what-if response (including the initial prior), e.g. so the host can
+		 *  list `utilities`. Fired with an empty result when `decisionsBlockingUtilities` skips
+		 *  the request. */
 		onWhatIfResult?: (result: WhatIfResult) => void;
 		/** Fired when the DM commits evidence, or selects a saved evidence set as the baseline.
 		 *
@@ -144,6 +184,8 @@
 		modelId,
 		fetchStructure = defaultFetchStructure,
 		fetchWhatIf = defaultFetchWhatIf,
+		policySolution = null,
+		evidence = $bindable({}),
 		policySource = null,
 		fetchPolicy = defaultFetchPolicy,
 		fetchEvidenceSets = defaultFetchEvidenceSets,
@@ -162,9 +204,14 @@
 	}: Props = $props();
 
 	let model = $state<NetworkModel | null>(null);
-	let evidence = $state<NetworkEvidence>({});
 	let posteriors = $state<NetworkPosteriors | undefined>(undefined);
 	let policy = $state<NetworkPolicy | undefined>(undefined);
+	let utilities = $state<NetworkUtilities | undefined>(undefined);
+	let utilityStdDevs = $state<NetworkUtilityStdDevs | undefined>(undefined);
+	let decisionPosteriors = $state<NetworkPosteriors | undefined>(undefined);
+	let offPolicyDecisions = $state<string[] | undefined>(undefined);
+	// The solution sent with what-if requests: only followed in 'manual' mode.
+	let requestSolution = $derived(decisionMode === 'manual' ? policySolution : null);
 	let loading = $state(true);
 	// Fatal: replaces the whole pane.
 	let structureError = $state<string | null>(null);
@@ -192,9 +239,15 @@
 
 	// Bumped on every `loadStructure` call, so responses for a superseded model are discarded.
 	let structureRequestId = 0;
+	// Discards out-of-order responses in `seedPrior`.
+	let priorRequestId = 0;
 
 	// Whether `policySource` was set the last time the effect below ran. Reset by `loadStructure`.
 	let hadPolicySource = false;
+
+	// `decisionMode` the last time the effect below ran, so a refetch does NOT fire on mount or an
+	// unrelated re-render -- only on an actual later change to `decisionMode`.
+	let previousDecisionMode = untrack(() => decisionMode);
 
 	const whatIfRunner = createWhatIfRunner<WhatIfResult>(
 		EVIDENCE_DEBOUNCE_MS,
@@ -202,11 +255,23 @@
 			posteriors = result.posteriors;
 			// Also when `undefined`, so a stale policy is cleared.
 			policy = result.policy;
+			utilities = result.utilities;
+			utilityStdDevs = result.utilityStdDevs;
+			decisionPosteriors = result.decisionPosteriors;
+			offPolicyDecisions = result.offPolicyDecisions;
 			whatIfError = null;
 			onWhatIfResult?.(result);
 		},
 		(e) => {
+			// Aborted requests never get here. Clear the previous result, same as a skipped request.
 			whatIfError = e instanceof Error ? e.message : 'Failed to fetch what-if result';
+			posteriors = undefined;
+			policy = undefined;
+			utilities = undefined;
+			utilityStdDevs = undefined;
+			decisionPosteriors = undefined;
+			offPolicyDecisions = undefined;
+			onWhatIfResult?.({ posteriors: {} });
 		},
 		(next) => {
 			stale = next;
@@ -221,11 +286,7 @@
 	async function loadStructure(
 		id: string | number,
 		structureFetcher: (modelId: string | number) => Promise<NetworkModel>,
-		priorFetcher: (
-			modelId: string | number,
-			evidence: NetworkEvidence,
-			signal?: AbortSignal
-		) => Promise<WhatIfResult>
+		priorFetcher: (evidence: NetworkEvidence) => Promise<WhatIfResult>
 	) {
 		const requestId = ++structureRequestId;
 		// Cancel what-if requests for the previous model.
@@ -238,6 +299,10 @@
 		evidence = {};
 		posteriors = undefined;
 		policy = undefined;
+		utilities = undefined;
+		utilityStdDevs = undefined;
+		decisionPosteriors = undefined;
+		offPolicyDecisions = undefined;
 		priorPosteriors = undefined;
 		committedEvidence = {};
 		committedPosteriors = undefined;
@@ -270,19 +335,43 @@
 				}
 			}
 		})();
-		// Seed the ghost baseline with the prior. `priorFetcher` is `policySource`-aware, so this
-		// also shows the solved policy before the DM sets any evidence.
+		await seedPrior(requestId, priorFetcher);
+	}
+
+	/**
+	 * Seeds the ghost baseline with the prior. `priorFetcher` is `policySource`/`policySolution`-
+	 * aware, so this also shows the solved policy before the DM sets any evidence. Skipped when the
+	 * request is known to fail (see `decisionsBlockingUtilities`).
+	 */
+	async function seedPrior(
+		requestId: number,
+		priorFetcher: (evidence: NetworkEvidence) => Promise<WhatIfResult>
+	) {
+		const ownRequestId = ++priorRequestId;
+		if (!model || decisionsBlockingUtilities(model, {}, !!requestSolution).length > 0) {
+			priorPosteriors = undefined;
+			return;
+		}
 		try {
-			const prior = await priorFetcher(id, {});
-			if (requestId !== structureRequestId) return;
+			const prior = await priorFetcher({});
+			if (requestId !== structureRequestId || ownRequestId !== priorRequestId) return;
 			priorPosteriors = prior.posteriors;
-			// Also seed the live posteriors and policy, unless the DM has set evidence meanwhile.
+			// Also seed the live state, unless the DM has set evidence meanwhile.
 			if (Object.keys(evidence).length === 0) {
 				posteriors = prior.posteriors;
 				policy = prior.policy;
+				utilities = prior.utilities;
+				utilityStdDevs = prior.utilityStdDevs;
+				decisionPosteriors = prior.decisionPosteriors;
+				offPolicyDecisions = prior.offPolicyDecisions;
+				onWhatIfResult?.(prior);
 			}
-		} catch {
-			// Non-fatal: the panel just has no ghost baseline.
+		} catch (e) {
+			// Non-fatal: the panel just has no ghost baseline. Shown unless the DM has moved on.
+			if (requestId !== structureRequestId || ownRequestId !== priorRequestId) return;
+			if (Object.keys(evidence).length === 0) {
+				whatIfError = e instanceof Error ? e.message : 'Failed to fetch what-if result';
+			}
 		}
 	}
 
@@ -291,10 +380,29 @@
 		// Only `modelId` is tracked: the fetcher props are read in `untrack`, so a parent passing a
 		// new inline closure on re-render doesn't reload (and reset) the panel.
 		untrack(() => {
-			void loadStructure(id, fetchStructure, (_id, evidenceForRequest, signal) =>
-				fetchWhatIfWithPolicy(evidenceForRequest, signal)
+			void loadStructure(id, fetchStructure, (evidenceForRequest) =>
+				fetchWhatIfWithPolicy(evidenceForRequest)
 			);
 		});
+	});
+
+	// Refetch, including the prior, when the followed solution changes. Compared by value, since a
+	// host may pass a fresh object for the same solution on re-render.
+	const solutionKey = (solution: NetworkSolutionRef | null | undefined) =>
+		solution ? `${solution.stateId}:${solution.solutionIndex}` : '';
+	let previousSolutionKey = untrack(() => solutionKey(requestSolution));
+	$effect(() => {
+		const key = solutionKey(requestSolution);
+		const currentModel = model;
+		if (key !== previousSolutionKey && currentModel) {
+			untrack(() => {
+				handleEvidenceChange(evidence);
+				void seedPrior(structureRequestId, (evidenceForRequest) =>
+					fetchWhatIfWithPolicy(evidenceForRequest)
+				);
+			});
+		}
+		previousSolutionKey = key;
 	});
 
 	// Refetch when `policySource` becomes set after the initial load (e.g. a solve finishing after
@@ -310,17 +418,41 @@
 		hadPolicySource = hasSource;
 	});
 
+	// Refetch on a `decisionMode` switch, so stale pinned-mode utilities/posteriors don't linger
+	// after switching to 'solver' (and vice versa): `handleEvidenceChange` sends an empty
+	// `decision_evidence` in 'solver' mode, the current pins in 'manual' mode.
+	$effect(() => {
+		const mode = decisionMode;
+		const currentModel = model;
+		if (mode !== previousDecisionMode && currentModel) {
+			untrack(() => {
+				handleEvidenceChange(evidence);
+			});
+		}
+		previousDecisionMode = mode;
+	});
+
 	/**
 	 * `fetchWhatIf`, with `policy` replaced by the decoded solved policy when `policySource` is
 	 * set. Both requests run together so they share one debounce/abort cycle.
 	 */
 	async function fetchWhatIfWithPolicy(
 		evidenceForRequest: NetworkEvidence,
-		signal?: AbortSignal
+		signal?: AbortSignal,
+		decisionEvidenceForRequest: NetworkEvidence = {}
 	): Promise<WhatIfResult> {
-		if (!policySource) return fetchWhatIf(modelId, evidenceForRequest, signal);
+		const request = () =>
+			fetchWhatIf(
+				modelId,
+				evidenceForRequest,
+				signal,
+				false,
+				decisionEvidenceForRequest,
+				requestSolution
+			);
+		if (!policySource) return request();
 		const [result, solvedPolicy] = await Promise.all([
-			fetchWhatIf(modelId, evidenceForRequest, signal),
+			request(),
 			fetchPolicy(modelId, policySource, evidenceForRequest, signal)
 		]);
 		return { ...result, policy: solvedPolicy };
@@ -330,9 +462,26 @@
 		// `evidence` is already updated via `bind:evidence`.
 		if (!model) return;
 		whatIfError = null;
-		// Decision-node picks (in 'manual' mode) stay local; only chance evidence is sent.
+		// Only chance evidence is sent as `evidence`; decision-node picks (in 'manual' mode) go
+		// through `decision_evidence` instead, so they're pinned rather than treated as observed.
 		const chanceEvidence = filterChanceEvidence(model, next);
-		whatIfRunner.request((signal) => fetchWhatIfWithPolicy(chanceEvidence, signal));
+		const decisionEvidence = decisionMode === 'manual' ? filterDecisionEvidence(model, next) : {};
+		if (decisionsBlockingUtilities(model, decisionEvidence, !!requestSolution).length > 0) {
+			// Known to fail (501) until every decision is pinned, so skip it and clear the results.
+			whatIfRunner.cancel();
+			stale = false;
+			posteriors = undefined;
+			policy = undefined;
+			utilities = undefined;
+			utilityStdDevs = undefined;
+			decisionPosteriors = undefined;
+			offPolicyDecisions = undefined;
+			onWhatIfResult?.({ posteriors: {} });
+			return;
+		}
+		whatIfRunner.request((signal) =>
+			fetchWhatIfWithPolicy(chanceEvidence, signal, decisionEvidence)
+		);
 	}
 
 	function handleCommitEvidence(committed: NetworkEvidence) {
@@ -342,14 +491,29 @@
 		// The baseline is no longer a saved set.
 		selectedBaselineId = '';
 		// Re-run the evidence with `commit: true` to trigger the backend's ideal/nadir ratchet, then
-		// call `onCommitEvidence` with the resulting bounds. Only chance evidence is sent.
+		// call `onCommitEvidence` with the resulting bounds. Chance evidence and pinned decisions
+		// (in 'manual' mode) go through separate fields, same split as `handleEvidenceChange`.
 		const chanceEvidence = model ? filterChanceEvidence(model, committed) : committed;
+		const decisionEvidence =
+			model && decisionMode === 'manual' ? filterDecisionEvidence(model, committed) : {};
 		// Captured now, since `modelId` may change before the request resolves.
 		const commitModelId = modelId;
+		const commitSolution = requestSolution;
 		// Guard against a newer commit or a model change.
 		const requestId = structureRequestId;
 		const ownRequestId = ++commitRequestId;
-		void fetchCommitBounds(fetchWhatIf, commitModelId, chanceEvidence).then(({ bounds, error }) => {
+		if (model && decisionsBlockingUtilities(model, decisionEvidence, !!commitSolution).length > 0) {
+			// No utilities to ratchet the bounds with (the request would 501).
+			onCommitEvidence?.(committed, undefined, commitModelId);
+			return;
+		}
+		void fetchCommitBounds(
+			fetchWhatIf,
+			commitModelId,
+			chanceEvidence,
+			decisionEvidence,
+			commitSolution
+		).then(({ bounds, error }) => {
 			if (requestId !== structureRequestId || ownRequestId !== commitRequestId) return;
 			if (error) {
 				whatIfError = error;
@@ -390,8 +554,19 @@
 		const loadModelId = modelId;
 		evidenceSetsError = null;
 		const chanceEvidence = filterChanceEvidence(model, set.evidence);
+		// Saved sets only ever hold chance evidence (the backend rejects anything else on save);
+		// any decision pinned live (in 'manual' mode) still applies on top of the loaded baseline.
+		const decisionEvidence =
+			decisionMode === 'manual' ? filterDecisionEvidence(model, evidence) : {};
 		try {
-			const result = await fetchWhatIf(loadModelId, chanceEvidence);
+			const result = await fetchWhatIf(
+				loadModelId,
+				chanceEvidence,
+				undefined,
+				false,
+				decisionEvidence,
+				requestSolution
+			);
 			if (requestId !== structureRequestId || ownRequestId !== baselineRequestId) return;
 			committedEvidence = chanceEvidence;
 			committedPosteriors = result.posteriors;
@@ -479,6 +654,10 @@
 					{ghostPosteriors}
 					{committedEvidence}
 					{policy}
+					{utilities}
+					{utilityStdDevs}
+					{decisionPosteriors}
+					{offPolicyDecisions}
 					{stale}
 					{decisionMode}
 					{highlight}

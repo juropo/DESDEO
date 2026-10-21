@@ -1,7 +1,5 @@
-/** Public surface of the network visualisation package. No imports from any method store —
- *  that constraint is what keeps this reusable across method UIs (see the plan, frontend
- *  phase B). Everything downstream should import from here rather than reaching into
- *  individual files. */
+/** Public surface of the network visualisation package. No imports from any method store, so it
+ *  stays reusable across method UIs. */
 
 export { default as NetworkView } from './NetworkView.svelte';
 export { default as NetworkTable } from './NetworkTable.svelte';
@@ -21,6 +19,7 @@ export type {
 	NetworkPosteriors,
 	NetworkPolicy,
 	NetworkPolicySource,
+	NetworkSolutionRef,
 	NetworkUtilities,
 	NetworkUtilityStdDevs,
 	WhatIfResult
@@ -58,8 +57,13 @@ export {
 	isNodeEditable,
 	toggleEvidenceState,
 	mergeHighlightSets,
+	filterDecisionEvidence,
+	decisionsBlockingUtilities,
+	describeDecisions,
+	solutionStateTier,
 	EVIDENCE_MODE_NOTE
 } from './interaction';
+export type { DecisionStatus } from './interaction';
 
 export { createNetworkHighlightStore } from './highlight-store';
 export type { NetworkHighlightStore } from './highlight-store';
@@ -70,6 +74,7 @@ export {
 	computeDelta,
 	dominantDeltaIndex,
 	hasEvidenceDiverged,
+	formatUtility,
 	EVIDENCE_DEBOUNCE_MS,
 	BAR_TRANSITION_MS,
 	DELTA_DISPLAY_THRESHOLD

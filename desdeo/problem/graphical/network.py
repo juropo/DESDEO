@@ -1,14 +1,8 @@
-"""`DiscreteNetwork`: a near-isomorphic pydantic mirror of pyAgrum's Bayesian network model.
+"""`DiscreteNetwork`: a pydantic mirror of pyAgrum's Bayesian network model.
 
-Phase 1 of `.claude/desdeo-graphical-models-plan.md`. Mirrors pyAgrum's own node categories
-(`LabelizedVariable`, `RangeVariable`, `IntegerVariable`, `DiscretizedVariable`,
-`NumericalDiscreteVariable`), potential (CPT) indexing order, and label conventions, so that
-`adapters/pyagrum.to_pyagrum`/`from_pyagrum` round-trip losslessly. A plain pydantic model is
-used rather than pyAgrum's own (SWIG-wrapped) objects because SWIG objects can't be pydantic
-fields, DB rows, or JSON for the frontend.
-
-This module does not import pyAgrum — see the package-level dependency rule in the plan's
-cross-cutting section.
+Mirrors pyAgrum's variable kinds, CPT indexing and label conventions so that
+`adapters/pyagrum.to_pyagrum`/`from_pyagrum` round-trip losslessly, while staying serialisable
+for the DB and frontend. Does not import pyAgrum.
 """
 
 import heapq
@@ -24,12 +18,6 @@ def kahn_topological_order(
     nodes: list[str], predecessors: dict[str, set[str]], priority: dict[str, int] | None = None
 ) -> list[str]:
     """Kahn's algorithm: as much of a topological order over `nodes` as `predecessors` allows.
-
-    Shared by `DiscreteNetwork._has_cycle` (this module, Phase 1 -- just wants a yes/no cycle
-    check) and `rooted_junction_tree._topological_order` (Phase 3 -- wants the actual order plus
-    a detailed error naming the cyclic nodes), so the two don't independently reimplement the
-    same graph walk and risk diverging on edge-case handling (e.g. self-loops, disconnected
-    nodes).
 
     Args:
         nodes: every node to order; `predecessors` may omit nodes with no predecessors.
@@ -83,11 +71,8 @@ class DiscreteVariableKind(StrEnum):
 class DiscreteVariable(BaseModel):
     """A discrete chance node's domain, mirroring one pyAgrum `DiscreteVariable` subclass.
 
-    `labels` always holds the domain in state-index order (what pyAgrum's own `.labels()`
-    returns for any of its variable subclasses, regardless of kind) and is what CPT/`Potential`
-    indexing refers to. The kind-specific fields below carry exactly what's needed to
-    reconstruct the same pyAgrum subclass rather than always falling back to a generic
-    labelized variable.
+    `labels` holds the domain in state-index order; the kind-specific fields allow reconstructing
+    the same pyAgrum subclass.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -156,11 +141,8 @@ class DiscreteVariable(BaseModel):
 class Potential(BaseModel):
     """A conditional probability table over one or more `DiscreteVariable`s.
 
-    `variables` follows pyAgrum's own per-CPT ordering: the node itself first, then its parents
-    in the order pyAgrum lists them (arc-insertion order). `values`'s axes match `variables`
-    1:1 in that same order -- note this is the *reverse* of pyAgrum's own `Tensor.toarray()`,
-    whose axis order is reversed relative to its `variablesSequence()`; the adapter transposes
-    between the two conventions so this schema's axis order stays intuitive to read.
+    `variables` is the node itself first, then its parents in arc-insertion order. `values`'s axes
+    match `variables` (the reverse of pyAgrum's `Tensor.toarray()`).
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -178,6 +160,10 @@ class Potential(BaseModel):
             msg = f"Potential over {self.variables}: shape {self.shape} has the wrong number of axes."
             raise ValueError(msg)
 
+        if len(set(self.variables)) != len(self.variables):
+            msg = f"Potential's variables must be unique, got {self.variables}."
+            raise ValueError(msg)
+
         actual_shape = np.array(self.values, dtype=float).shape
         if actual_shape != tuple(self.shape):
             msg = f"Potential over {self.variables}: values has shape {actual_shape}, expected {tuple(self.shape)}."
@@ -189,9 +175,7 @@ class Potential(BaseModel):
 class DiscreteNetwork(BaseModel):
     """A discrete Bayesian network: chance nodes, arcs between them, and one CPT per node.
 
-    Near-isomorphic to pyAgrum's `BayesNet` -- see `adapters/pyagrum.py` for the conversion.
-    Nodes are addressed by name throughout, mirroring how the rest of DESDEO addresses `Problem`
-    elements by `symbol` rather than by a separate integer id.
+    Near-isomorphic to pyAgrum's `BayesNet`; see `adapters/pyagrum.py`. Nodes are addressed by name.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -244,17 +228,28 @@ class DiscreteNetwork(BaseModel):
                     f"Potential for '{node}' must list '{node}' as its own (first) variable, got {potential.variables}."
                 )
                 raise ValueError(msg)
-            if set(potential.variables[1:]) != parents_of[node]:
+
+            # Names outside this network (e.g. decision symbols) are checked by
+            # `DecisionAnnotation.validate_against`.
+            known_names = [var_name for var_name in potential.variables if var_name in name_set]
+            known_parents = set(known_names[1:])
+            if known_parents != parents_of[node]:
                 msg = (
-                    f"Potential for '{node}' covers parents {set(potential.variables[1:])}, "
+                    f"Potential for '{node}' covers known chance parents {known_parents}, "
                     f"but the network's arcs give it parents {parents_of[node]}."
                 )
                 raise ValueError(msg)
-            expected_shape = [cardinalities[var_name] for var_name in potential.variables]
-            if potential.shape != expected_shape:
+
+            known_shape = [
+                shape
+                for var_name, shape in zip(potential.variables, potential.shape, strict=True)
+                if var_name in name_set
+            ]
+            expected_known_shape = [cardinalities[var_name] for var_name in known_names]
+            if known_shape != expected_known_shape:
                 msg = (
-                    f"Potential for '{node}' has shape {potential.shape}, "
-                    f"expected {expected_shape} from variable domains."
+                    f"Potential for '{node}' has shape {potential.shape} over {potential.variables}, but axes for "
+                    f"this network's own variables {known_names} expected {expected_known_shape}."
                 )
                 raise ValueError(msg)
 
