@@ -1,6 +1,7 @@
 """Defines end-points to access functionalities related to the CUMULUS method."""
 
 import logging
+from math import isfinite
 from typing import Annotated, Any
 
 import polars as pl
@@ -341,6 +342,48 @@ def initialize(
 
     solver = check_solver(problem_db=problem_db)
     problem = Problem.from_problemdb(problem_db)
+
+    # Tracked per field, so the fallback below never overwrites a value that is already set.
+    missing_ideal = {symbol for symbol, value in problem.get_ideal_point().items() if value is None}
+    missing_nadir = {symbol for symbol, value in problem.get_nadir_point().items() if value is None}
+    if missing_ideal or missing_nadir:
+        # Some problems (e.g. ones compiled from a graphical model) have no ideal/nadir, which
+        # `generate_starting_point` requires. Estimate them with a payoff table and persist the
+        # result, as `_build_combined_problem_and_initialize` does. The estimate depends only on
+        # the problem, so it is persisted regardless of who owns the problem.
+        try:
+            estimated_ideal, estimated_nadir = payoff_table_method(problem, solver)
+        except Exception:  # noqa: S110
+            pass  # proceed without ideal/nadir -- generate_starting_point raises its own clean error
+        else:
+            # Only fill in missing values, and skip non-finite estimates: a NaN would never be
+            # retried, since it isn't None. Skipped symbols stay None for a later attempt.
+            new_ideal = {
+                symbol: value
+                for symbol, value in estimated_ideal.items()
+                if symbol in missing_ideal and isfinite(value)
+            }
+            new_nadir = {
+                symbol: value
+                for symbol, value in estimated_nadir.items()
+                if symbol in missing_nadir and isfinite(value)
+            }
+            problem = problem.update_ideal_and_nadir(new_ideal, new_nadir)
+
+            any_changed = False
+            for obj_db in problem_db.objectives:
+                changed = False
+                if obj_db.symbol in new_ideal:
+                    obj_db.ideal = new_ideal[obj_db.symbol]
+                    changed = True
+                if obj_db.symbol in new_nadir:
+                    obj_db.nadir = new_nadir[obj_db.symbol]
+                    changed = True
+                if changed:
+                    db_session.add(obj_db)
+                    any_changed = True
+            if any_changed:
+                db_session.commit()
 
     if isinstance(ref_point := request.starting_point, ReferencePoint):
         starting_point = ref_point.aspiration_levels
@@ -1071,11 +1114,9 @@ def _current_solution_satisfies(
     Only the added ones are checked, for the same reason the background probe only considers
     them: everything else was already satisfied before this modification.
 
-    They are evaluated against the values the solver reported for the solution, and only failing
-    that against the problem re-evaluated at its stored decision vector.  That order is the
-    point: re-evaluating first reported *every* bound on a combined scenario problem as
-    satisfied, however far outside it the solution sat, because the evaluator cannot build a
-    frame for such a problem at all and the failure read as "nothing to invalidate".
+    They are evaluated against the values the solver reported for the solution, falling back to
+    re-evaluating the problem at its stored decision vector. The evaluator cannot handle combined
+    scenario problems, so re-evaluating first would wrongly report every bound as satisfied.
 
     A missing or unusable parent solution is still reported as satisfied: there is nothing to
     invalidate. Note that this also skips the background feasibility probe, which is gated on

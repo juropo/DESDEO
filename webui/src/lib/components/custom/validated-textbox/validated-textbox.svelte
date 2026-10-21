@@ -24,7 +24,7 @@
 	function validate(val: string) {
 		const result = schema(min, max).safeParse(val);
 		if (!result.success) {
-			error = result.error.errors[0].message;
+			error = result.error.issues[0].message;
 		} else {
 			error = null;
 			onChange(val);

@@ -70,7 +70,10 @@ def numpy_array_to_objective_dict(problem: Problem, numpy_array: np.ndarray) -> 
         dict[str, float]: a dict with keys being objective function symbols and value being
             objective function values.
     """
-    return {objective.symbol: np.squeeze(numpy_array).tolist()[i] for i, objective in enumerate(problem.objectives)}
+    # atleast_1d keeps a single-objective result as a length-1 list rather than a bare float,
+    # which squeeze alone would produce and tolist() would then return unsubscriptable.
+    values = np.atleast_1d(np.squeeze(numpy_array)).tolist()
+    return {objective.symbol: values[i] for i, objective in enumerate(problem.objectives)}
 
 
 def unflatten_variable_array(problem: Problem, var_array: np.ndarray) -> dict[str, float | list]:
@@ -373,12 +376,9 @@ def add_soft_constraint(
             symbol=symbol,
             func=violation_func,
             maximize=False,
-            # The slack variables are non-negative, so zero violation is attainable by
-            # definition and is the ideal.  The nadir has no natural value: the largest
-            # violation depends on how far the soft constraints reach outside the
-            # feasible region, and computing it would need a solve of its own.  One is a
-            # placeholder, meant to be raised once an actual violation is observed, as
-            # `desdeo.mcdm.cumulus` does after minimizing the total violation.
+            # Slacks are non-negative, so zero is the ideal. The nadir has no natural value;
+            # 1.0 is a placeholder to be raised once a real violation is observed (as
+            # `desdeo.mcdm.cumulus` does).
             ideal=0.0,
             nadir=1.0,
         )
@@ -561,24 +561,15 @@ def _with_properties(item, properties: dict[str, tuple[bool, bool, bool]]):
 def determine_problem_properties(problem: Problem) -> Problem:
     """Analyze a problem's functions and set their linearity, convexity, and differentiability flags.
 
-    For every analytical function defined in the problem (objectives, constraints, extra
-    functions, and scalarization functions), determines whether its expression is linear,
-    convex, and twice differentiable, and returns a copy of the problem with the
-    corresponding `is_linear`, `is_convex`, and `is_twice_differentiable` fields set
-    accordingly. Functions without a `func` expression (data-based, simulator, or
-    surrogate functions) are left untouched, as there is no expression to analyze.
+    Applies to every function with a `func` expression (objectives, constraints, extra
+    functions, scalarization functions); data-based, simulator, and surrogate functions are
+    left untouched.
 
-    Linearity is checked first, since an affine (linear) function is always both convex
-    and twice differentiable, regardless of what the other two checks find. Convexity is
-    otherwise determined with cvxpy's DCP curvature rules, applied to the function's
-    expression after resolving any other problem functions and constants it references.
-    Proving convexity in general is undecidable, and cvxpy's DCP rules only recognize
-    convexity that follows from a known composition of convex/concave building blocks, so
-    this check can miss functions that are convex. It is deliberately conservative: it may
-    report a convex function as not (provably) convex, but should not report a non-convex
-    function as convex. Twice differentiability is determined by scanning the function's
-    expression, and transitively any function it references, for the `Abs`, `Max`, `Min`,
-    `Ceil`, and `Floor` operators, none of which are twice differentiable everywhere.
+    An affine function is always convex and twice differentiable. Otherwise, convexity is
+    determined with cvxpy's DCP rules, which are conservative: a convex function may be
+    reported as not convex, but never the other way around. Twice differentiability is
+    determined by scanning the expression, and transitively any function it references, for
+    `Abs`, `Max`, `Min`, `Ceil`, and `Floor`.
 
     Args:
         problem (Problem): the problem whose functions are to be analyzed.
@@ -608,15 +599,9 @@ def determine_problem_properties(problem: Problem) -> Problem:
 def determine_function_properties(problem: Problem, symbol: str) -> Problem:
     """Analyze a single function of a problem and set its linearity, convexity, and differentiability flags.
 
-    Behaves exactly like `determine_problem_properties`, but only applies the result to
-    the one function identified by `symbol` (an objective, constraint, extra function, or
-    scalarization function), leaving every other function's flags untouched.
-
-    This matters because the convexity and twice-differentiability checks are
-    conservative and can produce false negatives (see `determine_problem_properties`):
-    re-running them over the whole problem would silently overwrite flags that may have
-    been deliberately set elsewhere from outside knowledge the checks here cannot derive
-    on their own. Targeting a single, newly added or changed function avoids that.
+    Like `determine_problem_properties`, but only updates the function identified by
+    `symbol`. Since the checks can produce false negatives, this avoids overwriting flags
+    on other functions that may have been set deliberately.
 
     Args:
         problem (Problem): the problem the function belongs to.

@@ -156,3 +156,11 @@ def get_json(client: TestClient, endpoint: str, access_token: str):
         endpoint,
         headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
     )
+
+
+def delete_json(client: TestClient, endpoint: str, access_token: str):
+    """Makes a delete request and returns the response."""
+    return client.delete(
+        endpoint,
+        headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+    )

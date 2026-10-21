@@ -1,5 +1,6 @@
 """Tests various utils found in the desdeo.problem package."""
 
+import numpy as np
 import numpy.testing as npt
 import polars as pl
 import pytest
@@ -220,6 +221,19 @@ def test_objective_dict_to_numpy_array_and_back():
     assert all(
         objective_dict[objective.symbol] == objective_dict_again[objective.symbol] for objective in problem.objectives
     )
+
+
+@pytest.mark.utils
+def test_numpy_array_to_objective_dict_single_objective(simple_problem):
+    """A single-objective problem's squeezed array collapses to a 0-d array.
+
+    `.tolist()` on a 0-d array returns a bare float rather than a list.
+    """
+    objective_array = np.array([42.0])
+
+    objective_dict = numpy_array_to_objective_dict(simple_problem, objective_array)
+
+    assert objective_dict == {"f1": 42.0}
 
 
 @pytest.mark.utils

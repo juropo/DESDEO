@@ -1,9 +1,10 @@
 import type { PageLoad } from './$types';
 import { getProblemsProblemAllGet } from '$lib/gen/endpoints/DESDEOFastAPI';
 import type { ProblemInfoSmall } from '$lib/gen/endpoints/DESDEOFastAPI';
+import { withFetch } from '$lib/api/ssr-fetch';
 
-export const load: PageLoad = async ({url}) => {
-	const res = await getProblemsProblemAllGet();
+export const load: PageLoad = async ({ url, fetch }) => {
+	const res = await getProblemsProblemAllGet(withFetch(fetch));
 	if (res.status !== 200) throw new Error('Failed to fetch problems');
 
 	// Check if we have a group ID parameter, for selecting a method for GDM

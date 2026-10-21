@@ -32,7 +32,8 @@ const {
 	set_objective_constraints,
 	poll_modification_status,
 	check_scenario_availability,
-	apply_scenario_measures
+	apply_scenario_measures,
+	apply_network_bounds
 } = await import('./handlers');
 const { errorMessage } = await import('../../../stores/uiState');
 
@@ -375,5 +376,81 @@ describe('apply_scenario_measures', () => {
 
 		expect(result).toBeNull();
 		expect(get(errorMessage)).toContain('422');
+	});
+});
+
+describe('apply_network_bounds', () => {
+	/** A problem stub carrying only what this pure fold actually reads/writes. */
+	function make_bounded_problem(): ProblemInfo {
+		return {
+			id: 7,
+			objectives: [
+				{ symbol: 'f_1', ideal: 0, nadir: 10 },
+				{ symbol: 'f_2', ideal: -5, nadir: 5 }
+			]
+		} as unknown as ProblemInfo;
+	}
+
+	it('widens ideal/nadir for an objective the bounds mention', () => {
+		const result = apply_network_bounds(make_bounded_problem(), {
+			ideal: { f_1: -2 },
+			nadir: { f_1: 12 }
+		});
+
+		expect(result.objectives.find((o) => o.symbol === 'f_1')).toMatchObject({
+			ideal: -2,
+			nadir: 12
+		});
+	});
+
+	it('leaves an objective the bounds do not mention untouched', () => {
+		const original = make_bounded_problem();
+		const result = apply_network_bounds(original, { ideal: { f_1: -2 } });
+
+		expect(result.objectives.find((o) => o.symbol === 'f_2')).toEqual(
+			original.objectives.find((o) => o.symbol === 'f_2')
+		);
+	});
+
+	it('only overwrites the direction the bounds actually mention for a touched objective', () => {
+		const result = apply_network_bounds(make_bounded_problem(), { ideal: { f_1: -2 } });
+
+		expect(result.objectives.find((o) => o.symbol === 'f_1')).toMatchObject({
+			ideal: -2,
+			nadir: 10 // unchanged -- bounds carried no `nadir.f_1` entry
+		});
+	});
+
+	it('does not mutate the input problem', () => {
+		const original = make_bounded_problem();
+		const snapshot = structuredClone(original);
+		apply_network_bounds(original, { ideal: { f_1: -2 } });
+
+		expect(original).toEqual(snapshot);
+	});
+
+	it('returns the identical problem reference when bounds carry nothing new', () => {
+		const original = make_bounded_problem();
+		const result = apply_network_bounds(original, {
+			ideal: { f_1: 0, f_2: -5 },
+			nadir: { f_1: 10, f_2: 5 }
+		});
+
+		expect(result).toBe(original);
+	});
+
+	it('returns the identical problem reference for an empty bounds object', () => {
+		const original = make_bounded_problem();
+		expect(apply_network_bounds(original, {})).toBe(original);
+	});
+
+	it('returns a new problem reference, but reuses untouched objective references, when something actually moves', () => {
+		const original = make_bounded_problem();
+		const result = apply_network_bounds(original, { ideal: { f_1: -2 } });
+
+		expect(result).not.toBe(original);
+		expect(result.objectives.find((o) => o.symbol === 'f_2')).toBe(
+			original.objectives.find((o) => o.symbol === 'f_2')
+		);
 	});
 });

@@ -2,6 +2,7 @@
 	// Layout and core components
 	import { BaseLayout } from '$lib/components/custom/method_layout/index.js';
 	import { methodSelection } from '../../../stores/methodSelection';
+	import { auth } from '../../../stores/auth';
 	import { errorMessage, isLoading } from '../../../stores/uiState';
 	import { onMount } from 'svelte';
 	import LoadingSpinner from '$lib/components/custom/notifications/loading-spinner.svelte';
@@ -27,6 +28,32 @@
 	import UtopiaMap from '$lib/components/custom/nimbus/utopia-map.svelte';
 	import SolutionDescriptionPanel from '$lib/components/custom/nimbus/solution-description-panel.svelte';
 	import { PREFERENCE_TYPES } from '$lib/constants';
+
+	import {
+		NetworkPanel,
+		createNetworkHighlightStore,
+		ancestralSet,
+		descendants,
+		buildAdjacency,
+		decisionsBlockingUtilities,
+		describeDecisions,
+		solutionStateTier,
+		filterDecisionEvidence,
+		formatUtility
+	} from '$lib/components/custom/network';
+	import type {
+		DecisionMode,
+		NetworkEvidence,
+		NetworkModel,
+		NetworkPolicySource,
+		NetworkSolutionRef,
+		WhatIfResult
+	} from '$lib/components/custom/network';
+	import IconFlag from '@lucide/svelte/icons/flag';
+	import IconArrowUp from '@lucide/svelte/icons/arrow-up';
+	import IconArrowDown from '@lucide/svelte/icons/arrow-down';
+	import { toggleSet } from '$lib/helpers';
+	import { dev } from '$app/environment';
 
 	// Utility functions (reused from NIMBUS — logic is identical)
 	import {
@@ -182,11 +209,289 @@
 	const AVAILABLE_MEASURES: { value: MeasureType; label: string }[] = [
 		{ value: 'expected_value', label: 'Expected value (E_)' },
 		{ value: 'worst_case_robust', label: 'Worst-case robust (robust_)' },
-		{ value: 'conditional_value_at_risk', label: 'Conditional Value at Risk (CVaR, α = 95%)' },
+		{ value: 'conditional_value_at_risk', label: 'Conditional Value at Risk (CVaR, α = 95%)' }
 	];
 	let selected_measures: MeasureType[] = $state(['expected_value']);
 	let cvar_alpha = $state(0.95);
 	let combined_problem_name = $state('');
+
+	// Network structure demo dialog (dev only), backed by the irrigation demo diagram compiled on
+	// the backend. `<NetworkPanel>` owns the network state; this page handles compiling/solving the
+	// demo, the decision-mode toggle, node flags, and cross-highlighting.
+	// Plain `string`, not `DecisionMode`, for the SegmentedControl binding.
+	let show_network_dialog = $state(false);
+	let network_decision_mode_str = $state<string>('manual');
+	let network_decision_mode = $derived(network_decision_mode_str as DecisionMode);
+	let network_flagged: Set<string> = $state(new Set());
+
+	// Network dialog for the current problem, available when it was compiled from a graphical model
+	// (it has `graphical_model_metadata`).
+	// `$derived.by` because the inline `$derived(...)` form makes svelte-check misreport `problem`
+	// as `never` here.
+	let network_real_available = $derived.by(
+		() => !!problem?.problem_metadata?.graphical_model_metadata?.length
+	);
+	let show_network_dialog_real = $state(false);
+
+	// The real dialog's side panel: per-objective utilities and each decision's state.
+	let network_real_model = $state<NetworkModel | null>(null);
+	let network_real_evidence = $state<NetworkEvidence>({});
+	let network_real_result = $state<WhatIfResult | null>(null);
+	function handle_network_real_structure_load(model: NetworkModel) {
+		network_real_model = model;
+		network_real_result = null;
+	}
+	function handle_network_real_whatif_result(result: WhatIfResult) {
+		network_real_result = result;
+	}
+	// Unpinned decisions follow the solution selected in the main UI, else the first current one.
+	let network_real_solution = $derived.by(() => {
+		const selected = mode === 'iterate' ? chosen_solutions[selected_iteration_index[0]] : undefined;
+		return selected ?? current_state.current_solutions?.[0] ?? null;
+	});
+	let network_real_solution_ref = $derived.by((): NetworkSolutionRef | null =>
+		network_real_solution
+			? {
+					stateId: network_real_solution.state_id,
+					solutionIndex: network_real_solution.solution_index ?? 0
+				}
+			: null
+	);
+	// Labels of the decisions to pin before any utilities can be shown.
+	let network_real_unpinned = $derived.by(() => {
+		const model = network_real_model;
+		if (!model) return [];
+		const pins = filterDecisionEvidence(model, network_real_evidence);
+		const blocking = new Set(decisionsBlockingUtilities(model, pins, !!network_real_solution_ref));
+		return model.nodes.filter((n) => blocking.has(n.id)).map((n) => n.label);
+	});
+	let network_real_off_policy = $derived(network_real_result?.offPolicyDecisions ?? []);
+	// Without a solution, `policy` only repeats the pins, so it isn't read as "from solution".
+	// The solution's policy plus any decision its posterior makes certain, matching the canvas.
+	let network_real_followed_policy = $derived.by(() => {
+		if (!network_real_solution_ref) return undefined;
+		const certain = Object.fromEntries(
+			(network_real_model?.nodes ?? []).flatMap((n) => {
+				const probs = network_real_result?.decisionPosteriors?.[n.id];
+				const state = n.states?.find((_, i) => solutionStateTier(probs, i) === 'certain');
+				return state === undefined ? [] : [[n.id, state]];
+			})
+		) as Record<string, string>;
+		return { ...certain, ...network_real_result?.policy };
+	});
+	let network_real_decisions = $derived(
+		network_real_model
+			? describeDecisions(
+					network_real_model,
+					network_real_evidence,
+					network_real_followed_policy,
+					network_real_off_policy
+				)
+			: []
+	);
+	// Decision id -> the states the followed solution may still choose, e.g. "yes / no".
+	let network_real_possible_states = $derived(
+		Object.fromEntries(
+			(network_real_model?.nodes ?? []).flatMap((n) => {
+				const probs = network_real_result?.decisionPosteriors?.[n.id];
+				if (!probs || !n.states) return [];
+				const possible = n.states.filter((_, i) => solutionStateTier(probs, i) !== null);
+				return [[n.id, possible.join(' / ')]];
+			})
+		) as Record<string, string>
+	);
+	let network_real_off_policy_labels = $derived(
+		network_real_decisions.filter((d) => d.source === 'off-policy').map((d) => d.label)
+	);
+	let network_real_objectives = $derived(
+		(network_real_model?.nodes.filter((n) => n.kind === 'objective') ?? []).map((node) => ({
+			node,
+			maximize: problem?.objectives.find((o) => `util_${o.symbol}` === node.id)?.maximize
+		}))
+	);
+
+	function toggle_network_flag(id: string) {
+		network_flagged = toggleSet(network_flagged, id);
+	}
+
+	// The demo problem is compiled and solved the first time the dialog opens, and its id is cached
+	// in `sessionStorage` per user. A stale cached id is handled by `handle_network_structure_error`.
+	const NETWORK_DEMO_PROBLEM_ID_KEY = 'cumulus-network-demo-problem-id';
+	function network_demo_cache_key(): string {
+		return `${NETWORK_DEMO_PROBLEM_ID_KEY}:${$auth.user?.id ?? 'anon'}`;
+	}
+	// The demo diagram's only objective.
+	const NETWORK_DEMO_OBJECTIVE_SYMBOL = 'profit';
+
+	let network_problem_id: number | null = $state(null);
+	let network_compiling = $state(false);
+	let network_compile_error: string | null = $state(null);
+	let network_policy_source: NetworkPolicySource | null = $state(null);
+	let network_solving = $state(false);
+	let network_solve_error: string | null = $state(null);
+
+	/** `force`: bypass the cache and the backend's reuse of an existing demo problem. */
+	async function ensure_network_demo_compiled(force = false) {
+		if (!force && (network_problem_id !== null || network_compiling)) return;
+		if (!force) {
+			const cached = sessionStorage.getItem(network_demo_cache_key());
+			if (cached) {
+				network_problem_id = Number(cached);
+				return;
+			}
+		}
+		network_compiling = true;
+		network_compile_error = null;
+		try {
+			const res = await fetch('/api/graphical/demo/irrigation', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ force })
+			});
+			if (!res.ok) throw new Error(`Failed to compile network demo (status ${res.status})`);
+			const data: { problem_id: number } = await res.json();
+			network_problem_id = data.problem_id;
+			sessionStorage.setItem(network_demo_cache_key(), String(data.problem_id));
+		} catch (e) {
+			network_compile_error = e instanceof Error ? e.message : 'Failed to compile network demo';
+		} finally {
+			network_compiling = false;
+		}
+	}
+
+	// Solve the demo problem and pass the solution to `<NetworkPanel>` as `policySource`.
+	// Non-fatal: without it, the panel uses the live-inference policy.
+	async function ensure_network_demo_solved() {
+		if (network_problem_id === null || network_policy_source || network_solving) return;
+		network_solving = true;
+		network_solve_error = null;
+		try {
+			const res = await fetch(`/api/graphical/${network_problem_id}/solve`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ objective_symbol: NETWORK_DEMO_OBJECTIVE_SYMBOL })
+			});
+			if (!res.ok) throw new Error(`Failed to solve network demo (status ${res.status})`);
+			const data: { variable_values: Record<string, number[] | number> } = await res.json();
+			network_policy_source = { variableValues: data.variable_values };
+		} catch (e) {
+			network_solve_error = e instanceof Error ? e.message : 'Failed to solve network demo';
+		} finally {
+			network_solving = false;
+		}
+	}
+
+	// Forget the cached demo problem and compile (or fetch) it again. `force` is passed to
+	// `ensure_network_demo_compiled`.
+	function reset_network_demo(force = false) {
+		sessionStorage.removeItem(network_demo_cache_key());
+		network_problem_id = null;
+		network_policy_source = null;
+		network_compile_error = null;
+		network_solve_error = null;
+		network_model = null;
+		void ensure_network_demo_compiled(force);
+	}
+
+	// A failed structure fetch means the cached demo id is stale (e.g. after a DB reset), so
+	// recompile automatically, at most once per dialog open.
+	let network_structure_retry_attempted = false;
+	function handle_network_structure_error() {
+		if (network_structure_retry_attempted) return;
+		network_structure_retry_attempted = true;
+		reset_network_demo();
+	}
+
+	// Apply the ideal/nadir the backend ratcheted on commit, unless `problem` has changed since the
+	// request was made (e.g. replaced by a combined scenario problem).
+	function handle_network_real_commit_evidence(
+		_evidence: NetworkEvidence,
+		bounds?: { ideal?: Record<string, number>; nadir?: Record<string, number> },
+		modelId?: string | number
+	) {
+		if (!bounds || !problem || problem.id !== modelId) return;
+		problem = apply_network_bounds(problem, bounds);
+	}
+
+	// Close the dialog if the problem is replaced by one without a graphical model.
+	$effect(() => {
+		if (!network_real_available) show_network_dialog_real = false;
+	});
+
+	$effect(() => {
+		if (show_network_dialog) void ensure_network_demo_compiled();
+	});
+	$effect(() => {
+		if (network_problem_id !== null) void ensure_network_demo_solved();
+	});
+
+	// Cross-highlighting between the canvas and a "(demo) Reference point" panel listing the
+	// objectives. The model comes from `onStructureLoad`.
+	const network_highlight = createNetworkHighlightStore();
+	let network_model = $state<NetworkModel | null>(null);
+	function handle_network_structure_load(model: NetworkModel) {
+		network_model = model;
+	}
+	let network_reference_point_objectives = $derived(
+		network_model?.nodes.filter((n) => n.kind === 'objective') ?? []
+	);
+	let network_objective_ids = $derived(
+		new Set(network_reference_point_objectives.map((n) => n.id))
+	);
+	// Built once per model rather than on every hover.
+	let network_adjacency = $derived(network_model ? buildAdjacency(network_model) : null);
+	// Reverse direction: hovering (or selecting) a node on the canvas highlights the objectives
+	// it can influence in the reference-point panel.
+	let network_influenced_objectives: Set<string> = $state(new Set());
+
+	// Panel -> canvas: seed's ancestor closure (inclusive of the seed itself).
+	function handle_reference_point_row_hover(id: string | null) {
+		if (!network_model || !network_adjacency) return;
+		network_highlight.set(id ? ancestralSet(network_model, [id], network_adjacency) : null);
+	}
+
+	// Canvas -> panel: focus is `hovered ?? selected`, like `NetworkView`, so hovering out falls
+	// back to the selection.
+	let network_hovered_id: string | null = $state(null);
+	let network_selected_id: string | null = $state(null);
+	let network_focus_id = $derived(network_hovered_id ?? network_selected_id);
+
+	function handle_network_hover(id: string | null) {
+		network_hovered_id = id;
+	}
+
+	function handle_network_select(id: string | null) {
+		network_selected_id = id;
+	}
+
+	// Highlight the focused node's descendant closure (including itself), in the same store the
+	// panel -> canvas direction uses.
+	$effect(() => {
+		const id = network_focus_id;
+		if (id === null || !network_model || !network_adjacency) {
+			network_influenced_objectives = new Set();
+			network_highlight.set(null);
+			return;
+		}
+		const forward = new Set([id, ...descendants(network_model, id, network_adjacency)]);
+		network_influenced_objectives = new Set(
+			[...forward].filter((nodeId) => network_objective_ids.has(nodeId))
+		);
+		network_highlight.set(forward);
+	});
+
+	// Reset highlight state when the dialog closes (closing may not fire `mouseleave`).
+	// `<NetworkPanel>` is unmounted on close, so its own state resets by itself.
+	$effect(() => {
+		if (!show_network_dialog) {
+			network_hovered_id = null;
+			network_selected_id = null;
+			network_highlight.set(null);
+			network_influenced_objectives = new Set();
+			network_model = null;
+			network_structure_retry_attempted = false;
+		}
+	});
 
 	// Whether the current problem (or the base problem it was combined from) has scenarios at
 	// all — gates whether "Add uncertainty measures" is enabled in the hamburger menu.
@@ -206,7 +511,9 @@
 		pending_objective_symbols = scenario_availability.objective_symbols ?? [];
 		const applied = scenario_availability.applied_measures ?? [];
 		selected_measures =
-			applied.length > 0 ? [...(applied as MeasureType[])] : ['expected_value', 'worst_case_robust'];
+			applied.length > 0
+				? [...(applied as MeasureType[])]
+				: ['expected_value', 'worst_case_robust'];
 		cvar_alpha = 0.95;
 		combined_problem_name = `${problem.name} (combined)`;
 		scenario_setup_mode = 'reopen';
@@ -364,7 +671,11 @@
 			console.error('No previous preference values found for finishing.');
 			return;
 		}
-		const response = await handleFinishRequest(problem, final_solution, current_state.previous_preference);
+		const response = await handleFinishRequest(
+			problem,
+			final_solution,
+			current_state.previous_preference
+		);
 		if (response) {
 			selected_iteration_index = [index];
 			mode = 'final';
@@ -384,6 +695,7 @@
 		check_scenario_availability as checkScenarioAvailabilityRequest,
 		apply_scenario_measures as applyScenarioMeasuresRequest,
 		set_objective_constraints as setObjectiveConstraintsRequest,
+		apply_network_bounds,
 		type MeasureType,
 		type MeasureOptions
 	} from './handlers';
@@ -522,7 +834,9 @@
 
 			if (current_state.current_solutions.length === 0) {
 				current_state = { ...current_state, current_solutions: prev_current_solutions };
-				const base = result.warnings?.length ? result.warnings.join('\n') : 'No feasible solutions were found.';
+				const base = result.warnings?.length
+					? result.warnings.join('\n')
+					: 'No feasible solutions were found.';
 				warning_message = base + '\nPrevious solutions are still shown.';
 			} else {
 				warning_message = result.warnings?.length ? result.warnings.join('\n') : null;
@@ -608,7 +922,11 @@
 		const selectedSolution = chosen_solutions[selected_iteration_index[0]];
 		selected_iteration_objectives = selectedSolution.objective_values || {};
 
-		if (hasUtopiaMetadata && selected_iteration_index[0] >= 0 && mapStates[selected_iteration_index[0]]) {
+		if (
+			hasUtopiaMetadata &&
+			selected_iteration_index[0] >= 0 &&
+			mapStates[selected_iteration_index[0]]
+		) {
 			mapState = { ...mapStates[selected_iteration_index[0]] };
 		}
 
@@ -683,8 +1001,13 @@
 
 	async function apply_initialization_result(result: Response) {
 		// If the backend built a combined scenario problem, switch to it so all subsequent
-		// requests (solve, save, finalize…) target the right problem and its objectives.
-		if (result.problem_id && problem && result.problem_id !== problem.id) {
+		// requests (solve, save, finalize…) target the right problem and its objectives. Also
+		// refetch if the held problem is missing ideal/nadir, since `/initialize` may have just
+		// estimated and persisted them.
+		const problem_changed = result.problem_id && problem && result.problem_id !== problem.id;
+		const bounds_incomplete =
+			problem?.objectives.some((o) => o.ideal == null || o.nadir == null) ?? false;
+		if (result.problem_id && problem && (problem_changed || bounds_incomplete)) {
 			const resp = await getProblemProblemProblemIdGet(result.problem_id);
 			if (resp.status === 200 && resp.data) {
 				problem = resp.data as typeof problem;
@@ -742,7 +1065,10 @@
 
 <svelte:head>
 	<title>CUMULUS | DESDEO</title>
-	<meta name="description" content="This page implements the CUMULUS interactive multiobjective optimization method in DESDEO" />
+	<meta
+		name="description"
+		content="This page implements the CUMULUS interactive multiobjective optimization method in DESDEO"
+	/>
 </svelte:head>
 
 {#if $isLoading}
@@ -750,18 +1076,14 @@
 {/if}
 
 {#if $errorMessage}
-	<Alert
-		title="Error"
-		message={$errorMessage}
-		variant='destructive'
-	/>
+	<Alert title="Error" message={$errorMessage} variant="destructive" />
 {/if}
 
 {#if warning_message}
 	<Alert
 		title="Warning"
 		message={warning_message}
-		variant='default'
+		variant="default"
 		onClose={() => (warning_message = null)}
 	/>
 {/if}
@@ -816,7 +1138,10 @@
 		{/snippet}
 		{#snippet numericalValues()}
 			{#if problem && chosen_solutions.length > 0 && selected_iteration_index.length > 0}
-				<EndStateView {problem} tableData={[chosen_solutions[selected_iteration_index[0]] as any]} />
+				<EndStateView
+					{problem}
+					tableData={[chosen_solutions[selected_iteration_index[0]] as any]}
+				/>
 			{/if}
 		{/snippet}
 	</BaseLayout>
@@ -828,18 +1153,10 @@
 	>
 		{#snippet leftSidebar()}
 			{#snippet footerButtons()}
-				<Button
-					variant="outline"
-					size="sm"
-					onclick={() => (show_objectives_dialog = true)}
-				>
+				<Button variant="outline" size="sm" onclick={() => (show_objectives_dialog = true)}>
 					Choose Objectives
 				</Button>
-				<Button
-					variant="outline"
-					size="sm"
-					onclick={() => (show_scalarizations_dialog = true)}
-				>
+				<Button variant="outline" size="sm" onclick={() => (show_scalarizations_dialog = true)}>
 					Scalarizations: {selected_scalarizations.length}
 				</Button>
 			{/snippet}
@@ -911,7 +1228,17 @@
 				<DropdownMenu.Trigger>
 					{#snippet child({ props })}
 						<Button {...props} variant="outline" class="ml-2 px-2">
-							<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+							<svg
+								xmlns="http://www.w3.org/2000/svg"
+								width="16"
+								height="16"
+								viewBox="0 0 24 24"
+								fill="none"
+								stroke="currentColor"
+								stroke-width="2"
+								stroke-linecap="round"
+								stroke-linejoin="round"
+							>
 								<line x1="4" y1="6" x2="20" y2="6" />
 								<line x1="4" y1="12" x2="20" y2="12" />
 								<line x1="4" y1="18" x2="20" y2="18" />
@@ -920,7 +1247,9 @@
 					{/snippet}
 				</DropdownMenu.Trigger>
 				<DropdownMenu.Content align="end">
-					<DropdownMenu.Item onclick={() => (show_constraint_dialog = true)}>Add objective constraint</DropdownMenu.Item>
+					<DropdownMenu.Item onclick={() => (show_constraint_dialog = true)}
+						>Add objective constraint</DropdownMenu.Item
+					>
 					<DropdownMenu.Item
 						disabled={!scenario_availability?.available}
 						onclick={open_add_uncertainty_measures}
@@ -928,6 +1257,18 @@
 						Add uncertainty measures
 					</DropdownMenu.Item>
 					<DropdownMenu.Item>Modify problem</DropdownMenu.Item>
+					{#if network_real_available}
+						<!-- Shown when the current problem was compiled from a graphical model. -->
+						<DropdownMenu.Item onclick={() => (show_network_dialog_real = true)}>
+							View network structure
+						</DropdownMenu.Item>
+					{/if}
+					{#if dev}
+						<!-- Dev-only network demo, hidden in production builds. -->
+						<DropdownMenu.Item onclick={() => (show_network_dialog = true)}>
+							View network structure (demo)
+						</DropdownMenu.Item>
+					{/if}
 				</DropdownMenu.Content>
 			</DropdownMenu.Root>
 		{/snippet}
@@ -943,7 +1284,10 @@
 								currentPreferenceValues={filtered_preference}
 								previousPreferenceType={type_preferences}
 								currentPreferenceType={type_preferences}
-								solutionsObjectiveValues={mapSolutionsToObjectiveValues(chosen_solutions, filtered_problem)}
+								solutionsObjectiveValues={mapSolutionsToObjectiveValues(
+									chosen_solutions,
+									filtered_problem
+								)}
 								previousObjectiveValues={selected_type_solutions === 'current'
 									? processPreviousObjectiveValues(current_state, filtered_problem)
 									: []}
@@ -1038,7 +1382,10 @@
 									active_objective_symbols = next;
 								}}
 							/>
-							<label for={checkboxId} class="cursor-pointer text-sm {isLast ? 'text-gray-400' : ''}">
+							<label
+								for={checkboxId}
+								class="cursor-pointer text-sm {isLast ? 'text-gray-400' : ''}"
+							>
 								{objective.name}
 								<span class="text-gray-500">({objective.maximize ? 'max' : 'min'})</span>
 							</label>
@@ -1062,7 +1409,9 @@
 		<Dialog.Content class="max-w-sm">
 			<Dialog.Header>
 				<Dialog.Title>
-					{scenario_setup_mode === 'initial' ? 'Scenario-based Problem Detected' : 'Add Uncertainty Measures'}
+					{scenario_setup_mode === 'initial'
+						? 'Scenario-based Problem Detected'
+						: 'Add Uncertainty Measures'}
 				</Dialog.Title>
 				<Dialog.Description>
 					{scenario_setup_mode === 'initial'
@@ -1098,7 +1447,9 @@
 				{/each}
 				{#if selected_measures.includes('conditional_value_at_risk')}
 					<div class="flex items-center gap-3 pl-7">
-						<label for="cvar-alpha-input" class="text-sm text-muted-foreground">CVaR confidence level (α)</label>
+						<label for="cvar-alpha-input" class="text-muted-foreground text-sm"
+							>CVaR confidence level (α)</label
+						>
 						<input
 							id="cvar-alpha-input"
 							type="number"
@@ -1116,7 +1467,9 @@
 					{scenario_setup_mode === 'initial' ? 'Use problem as-is' : 'Cancel'}
 				</Button>
 				<Button variant="default" onclick={confirm_scenario_setup}>
-					{scenario_setup_mode === 'initial' ? 'Build combined problem' : 'Rebuild combined problem'}
+					{scenario_setup_mode === 'initial'
+						? 'Build combined problem'
+						: 'Rebuild combined problem'}
 				</Button>
 			</Dialog.Footer>
 		</Dialog.Content>
@@ -1128,16 +1481,18 @@
 	<Dialog.Root bind:open={show_constraint_dialog}>
 		<Dialog.Portal>
 			<Dialog.Overlay />
-			<Dialog.Content class="flex max-h-[85vh] w-[95vw] max-w-[95vw] sm:max-w-[95vw] flex-col gap-0 p-0">
+			<Dialog.Content
+				class="flex max-h-[85vh] w-[95vw] max-w-[95vw] flex-col gap-0 p-0 sm:max-w-[95vw]"
+			>
 				<Dialog.Header class="shrink-0 border-b px-6 py-4">
 					<Dialog.Title>Add Objective Constraints</Dialog.Title>
 					<Dialog.Description>
-						Define constraints on the objective functions. Changes take effect only when you press Apply.
-						Soft constraints are penalised when violated and leave the problem as it is. Hard constraints
-						(<span class="font-mono">&lt;=0</span> and <span class="font-mono">=0</span>) shrink the
-						feasible region, so applying one rebuilds the problem and restarts the method against it —
-						this takes a moment, and is rejected if no solution satisfies the bounds. The problem you are
-						on now stays available either way.
+						Define constraints on the objective functions. Changes take effect only when you press
+						Apply. Soft constraints are penalised when violated and leave the problem as it is. Hard
+						constraints (<span class="font-mono">&lt;=0</span> and
+						<span class="font-mono">=0</span>) shrink the feasible region, so applying one rebuilds
+						the problem and restarts the method against it — this takes a moment, and is rejected if
+						no solution satisfies the bounds. The problem you are on now stays available either way.
 					</Dialog.Description>
 				</Dialog.Header>
 
@@ -1145,7 +1500,7 @@
 					<!-- Left: objectives list -->
 					<div class="flex flex-col overflow-hidden">
 						<div class="flex shrink-0 items-center justify-between border-b px-4 py-2">
-							<p class="text-sm font-medium text-muted-foreground">Objectives</p>
+							<p class="text-muted-foreground text-sm font-medium">Objectives</p>
 							<SegmentedControl
 								bind:value={constraint_obj_filter}
 								options={[
@@ -1157,21 +1512,21 @@
 						<div class="overflow-y-auto p-4">
 							<table class="w-full text-sm">
 								<thead>
-									<tr class="border-b text-left text-xs text-muted-foreground">
-										<th class="pb-2 pr-3 font-medium">Symbol</th>
-										<th class="pb-2 pr-3 font-medium">Name</th>
-										<th class="pb-2 pr-3 font-medium">Ideal</th>
+									<tr class="text-muted-foreground border-b text-left text-xs">
+										<th class="pr-3 pb-2 font-medium">Symbol</th>
+										<th class="pr-3 pb-2 font-medium">Name</th>
+										<th class="pr-3 pb-2 font-medium">Ideal</th>
 										<th class="pb-2 font-medium">Nadir</th>
 									</tr>
 								</thead>
 								<tbody class="divide-y">
-									{#each (constraint_obj_filter === 'active' ? problem.objectives.filter((o) => active_objective_symbols.has(o.symbol)) : problem.objectives) as obj}
+									{#each constraint_obj_filter === 'active' ? problem.objectives.filter( (o) => active_objective_symbols.has(o.symbol) ) : problem.objectives as obj}
 										<tr class="align-top">
 											<td class="py-2 pr-3 font-mono text-xs">{obj.symbol}</td>
 											<td class="py-2 pr-3">
 												<p class="font-medium">{obj.name}</p>
 												{#if obj.description}
-													<p class="mt-0.5 text-xs text-muted-foreground">{obj.description}</p>
+													<p class="text-muted-foreground mt-0.5 text-xs">{obj.description}</p>
 												{/if}
 											</td>
 											<td class="py-2 pr-3 text-xs">
@@ -1189,10 +1544,12 @@
 
 					<!-- Right: constraints list -->
 					<div class="flex flex-col overflow-hidden">
-						<p class="shrink-0 border-b px-4 py-2 text-sm font-medium text-muted-foreground">Constraints</p>
+						<p class="text-muted-foreground shrink-0 border-b px-4 py-2 text-sm font-medium">
+							Constraints
+						</p>
 						<div class="flex-1 overflow-y-auto p-4">
 							{#if pending_constraints.length === 0}
-								<p class="text-sm text-muted-foreground">No constraints added yet.</p>
+								<p class="text-muted-foreground text-sm">No constraints added yet.</p>
 							{/if}
 							<div class="flex flex-col gap-3">
 								{#each pending_constraints as constraint (constraint.id)}
@@ -1220,11 +1577,23 @@
 										<Button
 											variant="ghost"
 											size="icon"
-											class="shrink-0 text-destructive hover:text-destructive"
+											class="text-destructive hover:text-destructive shrink-0"
 											onclick={() => remove_constraint(constraint.id)}
 										>
-											<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-												<path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/>
+											<svg
+												xmlns="http://www.w3.org/2000/svg"
+												width="14"
+												height="14"
+												viewBox="0 0 24 24"
+												fill="none"
+												stroke="currentColor"
+												stroke-width="2"
+												stroke-linecap="round"
+												stroke-linejoin="round"
+											>
+												<path d="M3 6h18" /><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6" /><path
+													d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"
+												/>
 											</svg>
 										</Button>
 									</div>
@@ -1282,6 +1651,233 @@
 			<Dialog.Footer>
 				<Dialog.Close>
 					<Button variant="default">Done</Button>
+				</Dialog.Close>
+			</Dialog.Footer>
+		</Dialog.Content>
+	</Dialog.Portal>
+</Dialog.Root>
+
+<!-- Network structure dialog (demo) -->
+<Dialog.Root bind:open={show_network_dialog}>
+	<Dialog.Portal>
+		<Dialog.Overlay />
+		<Dialog.Content class="flex h-[85vh] w-[95vw] max-w-[95vw] flex-col gap-3 sm:max-w-[95vw]">
+			<Dialog.Header>
+				<Dialog.Title>Network structure (demo)</Dialog.Title>
+				<Dialog.Description>
+					Preview of the reusable graphical-model network component embedded in CUMULUS. This is a
+					real, live diagram now -- compiled server-side (`POST /graphical/demo/irrigation`, the
+					same compiler `/graphical/compile` itself uses) from a small irrigation influence diagram
+					(`desdeo/problem/graphical/demo.py`) and driven entirely by the actual `/graphical/*`
+					endpoints: structure, evidence-driven what-if inference, saved evidence sets, and (in
+					Solver mode) a policy decoded from a genuinely solved MILP (`POST /graphical/{network_problem_id}/solve`
+					+ `/policy`). What's still illustrative: this diagram is a fixed, unrelated sample -- not
+					derived from the currently selected optimization problem or its objectives, and it isn't
+					the same diagram `sample-network.ts`'s Storybook story shows (that fixture has an
+					irrigation-decision -> crop-yield arc this backend can't compile directly; see `demo.py`'s
+					own docstring for the reformulation). Try pinning "weather" to see "soil_moisture" respond
+					to a real inference call.
+				</Dialog.Description>
+			</Dialog.Header>
+			<div class="flex flex-wrap items-center gap-3 text-sm">
+				<span class="text-muted-foreground">Decision mode:</span>
+				<SegmentedControl
+					size="sm"
+					bind:value={network_decision_mode_str}
+					options={[
+						{ value: 'manual', label: 'Manual' },
+						{ value: 'solver', label: 'Solver' }
+					]}
+				/>
+				{#if network_flagged.size > 0}
+					<span class="text-muted-foreground">
+						Flagged for follow-up: {[...network_flagged].join(', ')}
+					</span>
+				{/if}
+				{#if network_solve_error}
+					<span class="text-destructive">
+						{network_solve_error} (Solver mode falls back to /whatif's own live policy.)
+					</span>
+				{/if}
+				<Button variant="ghost" size="sm" class="ml-auto" onclick={() => reset_network_demo(true)}>
+					Recompile demo
+				</Button>
+			</div>
+			<div class="flex min-h-0 flex-1 gap-3">
+				<div class="min-h-0 flex-1">
+					{#if network_problem_id !== null}
+						<NetworkPanel
+							modelId={network_problem_id}
+							policySource={network_decision_mode === 'solver' ? network_policy_source : null}
+							decisionMode={network_decision_mode}
+							highlight={$network_highlight}
+							onNodeHover={handle_network_hover}
+							onNodeSelect={handle_network_select}
+							onStructureLoad={handle_network_structure_load}
+							onStructureError={handle_network_structure_error}
+						>
+							{#snippet nodeChrome({ id })}
+								<button
+									type="button"
+									class="bg-background flex size-4 items-center justify-center rounded-full border shadow-sm"
+									title={network_flagged.has(id) ? 'Unflag' : 'Flag for follow-up'}
+									onclick={(e) => {
+										e.stopPropagation();
+										toggle_network_flag(id);
+									}}
+								>
+									<IconFlag
+										class="size-2.5 {network_flagged.has(id)
+											? 'text-primary'
+											: 'text-muted-foreground'}"
+									/>
+								</button>
+							{/snippet}
+						</NetworkPanel>
+					{:else if network_compile_error}
+						<div class="text-destructive flex h-full items-center justify-center text-sm">
+							{network_compile_error}
+							<Button variant="outline" size="sm" class="ml-2" onclick={() => reset_network_demo()}>
+								Retry
+							</Button>
+						</div>
+					{:else}
+						<div class="text-muted-foreground flex h-full items-center justify-center text-sm">
+							Compiling demo diagram…
+						</div>
+					{/if}
+				</div>
+				<div class="w-48 shrink-0 space-y-2 overflow-auto">
+					<p class="text-muted-foreground text-xs">
+						(demo) Reference point -- stand-in for a real reference-point widget. Hover an objective
+						to highlight its ancestor subgraph on the canvas; hover a canvas node to see which
+						objectives it can influence.
+					</p>
+					{#each network_reference_point_objectives as node (node.id)}
+						<button
+							type="button"
+							class="block w-full rounded-md border px-2 py-1 text-left text-sm {network_influenced_objectives.has(
+								node.id
+							)
+								? 'border-primary bg-primary/10'
+								: ''}"
+							onmouseenter={() => handle_reference_point_row_hover(node.id)}
+							onmouseleave={() => handle_reference_point_row_hover(null)}
+							onfocus={() => handle_reference_point_row_hover(node.id)}
+							onblur={() => handle_reference_point_row_hover(null)}
+						>
+							{node.label}
+						</button>
+					{/each}
+				</div>
+			</div>
+			<Dialog.Footer>
+				<Dialog.Close>
+					<Button variant="outline">Close</Button>
+				</Dialog.Close>
+			</Dialog.Footer>
+		</Dialog.Content>
+	</Dialog.Portal>
+</Dialog.Root>
+
+<!-- Network structure dialog (current problem). Separate from the demo dialog, which has
+     demo-specific compile/solve controls. -->
+<Dialog.Root bind:open={show_network_dialog_real}>
+	<Dialog.Portal>
+		<Dialog.Overlay />
+		<Dialog.Content class="flex h-[85vh] w-[95vw] max-w-[95vw] flex-col gap-3 sm:max-w-[95vw]">
+			<Dialog.Header>
+				<Dialog.Title>Network structure</Dialog.Title>
+				<Dialog.Description>
+					The graphical model (Bayesian network / influence diagram) this problem was compiled from,
+					read live via the same `/graphical/*` endpoints the demo above uses -- structure,
+					evidence-driven what-if inference, and saved evidence sets, against the problem currently
+					loaded in this session rather than a fixed sample diagram. Committing evidence here can
+					widen this problem's own ideal/nadir bounds (never narrow them) when a what-if result
+					beats what was previously known achievable.
+				</Dialog.Description>
+			</Dialog.Header>
+			<div class="flex min-h-0 flex-1 gap-3">
+				<div class="min-h-0 flex-1">
+					{#if problem}
+						<NetworkPanel
+							modelId={problem.id}
+							decisionMode="manual"
+							policySolution={network_real_solution_ref}
+							bind:evidence={network_real_evidence}
+							onWhatIfResult={handle_network_real_whatif_result}
+							onStructureLoad={handle_network_real_structure_load}
+							onCommitEvidence={handle_network_real_commit_evidence}
+						/>
+					{/if}
+				</div>
+				<div class="w-48 shrink-0 space-y-3 overflow-auto text-sm">
+					<div class="space-y-1">
+						<p class="text-muted-foreground text-xs font-medium">Expected utilities</p>
+						{#if network_real_unpinned.length > 0}
+							<p class="text-muted-foreground text-xs">
+								Pin every decision to see utilities; unpinned: {network_real_unpinned.join(', ')}.
+							</p>
+						{:else if network_real_off_policy_labels.length > 0}
+							<p class="text-muted-foreground text-xs">
+								Your pins moved {network_real_off_policy_labels.join(', ')} off the solution's path; pin
+								{network_real_off_policy_labels.join(', ')} too to see utilities.
+							</p>
+						{:else}
+							{#each network_real_objectives as { node, maximize } (node.id)}
+								{@const mean = network_real_result?.utilities?.[node.id]}
+								<div class="rounded-md border px-2 py-1">
+									<div class="flex items-center gap-1">
+										{#if maximize === true}
+											<IconArrowUp class="size-3 shrink-0" />
+										{:else if maximize === false}
+											<IconArrowDown class="size-3 shrink-0" />
+										{/if}
+										<span class="truncate" title={node.label}>{node.label}</span>
+									</div>
+									<div class="text-muted-foreground text-xs tabular-nums">
+										{mean != null
+											? formatUtility(mean, network_real_result?.utilityStdDevs?.[node.id])
+											: '–'}
+									</div>
+								</div>
+							{/each}
+						{/if}
+					</div>
+					{#if network_real_decisions.length > 0}
+						<div class="space-y-1">
+							<p class="text-muted-foreground text-xs font-medium">Decisions</p>
+							{#each network_real_decisions as decision (decision.id)}
+								<div class="rounded-md border px-2 py-1">
+									<div class="truncate" title={decision.label}>
+										{decision.label}{decision.state
+											? `: ${decision.state}`
+											: network_real_possible_states[decision.id]
+												? `: ${network_real_possible_states[decision.id]}`
+												: ''}
+									</div>
+									<div class="text-muted-foreground text-xs">
+										{#if decision.source === 'pinned'}
+											pinned
+										{:else if decision.source === 'off-policy'}
+											off the solution's path — pin it
+										{:else if decision.source === 'solution'}
+											from solution {network_real_solution?.name ?? ''}
+										{:else if decision.dependsOn.length > 0}
+											unresolved — depends on {decision.dependsOn.join(', ')}
+										{:else}
+											unresolved
+										{/if}
+									</div>
+								</div>
+							{/each}
+						</div>
+					{/if}
+				</div>
+			</div>
+			<Dialog.Footer>
+				<Dialog.Close>
+					<Button variant="outline">Close</Button>
 				</Dialog.Close>
 			</Dialog.Footer>
 		</Dialog.Content>
