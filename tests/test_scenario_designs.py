@@ -374,6 +374,70 @@ def test_evaluate_design_ranges(conflict_model, solver, design, ranges, expected
         assert outcome.objectives == pytest.approx({"f1": expected, "f2": expected}, abs=1e-4)
 
 
+@pytest.mark.parametrize("solver", SOLVERS)
+def test_evaluate_design_leaf_reference_points(conflict_model, solver):
+    """A leaf with its own reference point uses it; the other leaves use the common one."""
+    # s2: max(y / 10, (10 - y) / 10) is minimised at y = 5.
+    outcomes = evaluate_design(
+        conflict_model,
+        {"x": 0.5},
+        solver,
+        {"f1": 2.0, "f2": 6.0},
+        leaf_reference_points={"s2": {"f1": 0.0, "f2": 10.0}},
+    )
+
+    assert outcomes["s1"].variables["y"] == pytest.approx(4.0, abs=1e-4)
+    assert outcomes["s2"].variables["y"] == pytest.approx(5.0, abs=1e-4)
+
+
+@pytest.mark.parametrize("solver", SOLVERS)
+def test_evaluate_design_leaf_ranges(conflict_model, solver):
+    """A leaf with its own ranges uses them; the other leaves use the common ranges."""
+    # s2 with r2 = 30: 3 * (y - 2) = 6 - y gives y = 3.
+    outcomes = evaluate_design(
+        conflict_model, {"x": 0.5}, solver, {"f1": 2.0, "f2": 6.0}, leaf_ranges={"s2": {"f2": (40.0, 10.0)}}
+    )
+
+    assert outcomes["s1"].variables["y"] == pytest.approx(4.0, abs=1e-4)
+    assert outcomes["s2"].variables["y"] == pytest.approx(3.0, abs=1e-4)
+
+
+@pytest.mark.parametrize("solver", SOLVERS)
+def test_evaluate_design_leaf_reference_points_coupled(tree_model, solver):
+    """Per-leaf reference points and ranges act inside a group coupled by the unfixed shared u."""
+    base = tree_model.base_problem.model_copy(
+        update={
+            "objectives": [
+                _objective("f1", "u + 0*x", ideal=0.0, nadir=1.0),
+                _objective("f2", "u + 0*x", maximize=True, ideal=1.0, nadir=0.0),
+            ]
+        }
+    )
+    model = tree_model.with_base_problem(base)
+    a1_rp, a2_rp = {"f1": 0.1, "f2": 0.5}, {"f1": 0.5, "f2": 0.9}
+    group_ranges = {
+        "a1": {"f1": (0.0, 0.5), "f2": (0.5, 0.0)},
+        "a2": {"f1": (0.0, 0.25), "f2": (1.0, 0.0)},
+    }
+
+    def shared_u(leaf_rps):
+        outcomes = evaluate_design(
+            model, {"x": 0.5}, solver, {"f1": 0.8, "f2": 0.8}, leaf_reference_points=leaf_rps, leaf_ranges=group_ranges
+        )
+        assert outcomes["a1"].variables["u"] == pytest.approx(outcomes["a2"].variables["u"], abs=1e-6)
+        # b1 is solved alone at the common reference point and unit ranges: max(u - 0.8, 0.8 - u).
+        assert outcomes["b1"].variables["u"] == pytest.approx(0.8, abs=1e-4)
+        return outcomes["a1"].variables["u"]
+
+    # The a1 term max(2 (u - 0.1), 2 (0.5 - u)) has its kink at 0.3 with slopes -2, 2; the a2 term
+    # max(4 (u - 0.5), 0.9 - u) has its kink at 0.58 with slopes -1, 4.  Their sum is minimised at 0.3.
+    assert shared_u({"a1": a1_rp, "a2": a2_rp}) == pytest.approx(0.3, abs=1e-4)
+    # a1's point in both leaves: kinks at 0.3 and 0.18 (slopes -1, 4), minimised at 0.18.
+    assert shared_u({"a1": a1_rp, "a2": a1_rp}) == pytest.approx(0.18, abs=1e-4)
+    # a2's point in both leaves: kinks at 0.7 (slopes -2, 2) and 0.58, minimised at 0.58.
+    assert shared_u({"a1": a2_rp, "a2": a2_rp}) == pytest.approx(0.58, abs=1e-4)
+
+
 @pytest.mark.gurobipy
 def test_evaluate_design_unit_weights_warning(conflict_model):
     """An objective without a usable range gives unit weights for all objectives and a warning."""

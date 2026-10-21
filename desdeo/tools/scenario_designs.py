@@ -8,6 +8,7 @@ function over the objectives present in that leaf.
 
 import warnings
 from collections.abc import Iterable, Sequence
+from typing import Any
 
 import numpy as np
 from pydantic import BaseModel, Field
@@ -371,7 +372,7 @@ def _group_model(model: ScenarioModel, group: list[str]) -> ScenarioModel:
     )
 
 
-def _solve(problem: Problem, target: str, solver: type[BaseSolver], solver_options: dict | None):
+def _solve(problem: Problem, target: str, solver: type[BaseSolver], solver_options: Any):
     """Solve the problem; return the results, or None and a message if solving raised.
 
     Errors raised while constructing the solver propagate.
@@ -391,7 +392,9 @@ def evaluate_design(
     *,
     ranges: dict[str, tuple[float, float]] | None = None,
     leaves: list[str] | None = None,
-    solver_options: dict | None = None,
+    solver_options: Any = None,
+    leaf_reference_points: dict[str, dict[str, float]] | None = None,
+    leaf_ranges: dict[str, dict[str, tuple[float, float]]] | None = None,
 ) -> dict[str, LeafOutcome]:
     """Evaluate a design in the leaf scenarios of a scenario model.
 
@@ -414,6 +417,10 @@ def evaluate_design(
         leaves: the leaves to evaluate. Defaults to all leaves.  Leaves coupled with these
             are solved together with them but not returned.
         solver_options: options passed to the solver.
+        leaf_reference_points: optional reference points by leaf; a leaf found here uses its own
+            reference point instead of ``reference_point``, other leaves use ``reference_point``.
+        leaf_ranges: optional ranges by leaf and original objective symbol; they override ``ranges``
+            for the objectives they cover in that leaf.
 
     Returns:
         The outcome of each evaluated leaf.
@@ -427,6 +434,8 @@ def evaluate_design(
     unknown = sorted(set(leaves) - set(model.leaf_scenarios))
     if unknown:
         raise ValueError(f"Not leaves of the model: {unknown}.")
+    leaf_reference_points = leaf_reference_points or {}
+    leaf_ranges = leaf_ranges or {}
     target = "_design_asf"
     outcomes: dict[str, LeafOutcome] = {}
 
@@ -437,7 +446,12 @@ def evaluate_design(
         if absent:
             raise ValueError(f"Design variables {absent} are not variables of leaf '{leaf}'.")
     leaf_terms = {
-        leaf: _asf_terms(leaf_problem, reference_point, ranges) for leaf, leaf_problem in leaf_problems.items()
+        leaf: _asf_terms(
+            leaf_problem,
+            leaf_reference_points.get(leaf, reference_point),
+            {**(ranges or {}), **leaf_ranges.get(leaf, {})},
+        )
+        for leaf, leaf_problem in leaf_problems.items()
     }
     empty = [leaf for leaf, (rp, _) in leaf_terms.items() if not rp]
     if empty:
