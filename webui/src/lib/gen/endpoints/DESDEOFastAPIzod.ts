@@ -62,7 +62,7 @@ Args:
     cookie_max_age (int): the lifetime of the cookie storing the refresh token.
  * @summary Login
  */
-export const loginLoginPostQueryCookieMaxAgeDefault = 30;
+export const loginLoginPostQueryCookieMaxAgeDefault = 480;
 
 export const LoginLoginPostQueryParams = zod.object({
 	cookie_max_age: zod.number().default(loginLoginPostQueryCookieMaxAgeDefault)
@@ -313,7 +313,11 @@ export const GetProblemsProblemAllGetResponseItem = zod
 				})
 				.describe('Response model for ProblemMetaData.'),
 			zod.null()
-		])
+		]),
+		scenario_model_ids: zod
+			.array(zod.number())
+			.optional()
+			.describe("Ids of the problem's scenario models.")
 	})
 	.describe('Problem info request return data, but smaller.');
 export const GetProblemsProblemAllGetResponse = zod.array(GetProblemsProblemAllGetResponseItem);
@@ -990,7 +994,11 @@ export const GetProblemsInfoProblemAllInfoGetResponseItem = zod
 				})
 				.describe('Response model for ProblemMetaData.'),
 			zod.null()
-		])
+		]),
+		scenario_model_ids: zod
+			.array(zod.number())
+			.optional()
+			.describe("Ids of the problem's scenario models.")
 	})
 	.describe('Problem info request return data.');
 export const GetProblemsInfoProblemAllInfoGetResponse = zod.array(
@@ -1680,7 +1688,11 @@ export const GetProblemProblemProblemIdGetResponse = zod
 				})
 				.describe('Response model for ProblemMetaData.'),
 			zod.null()
-		])
+		]),
+		scenario_model_ids: zod
+			.array(zod.number())
+			.optional()
+			.describe("Ids of the problem's scenario models.")
 	})
 	.describe('Problem info request return data.');
 
@@ -1724,6 +1736,7 @@ export const AddProblemProblemAddPostQueryParams = zod.object({
 });
 
 export const addProblemProblemAddPostBodyOnePreferencePreferenceTypeDefault = `reference_point`;
+export const addProblemProblemAddPostBodyOneIncludePerturbedDefault = true;
 
 export const AddProblemProblemAddPostBody = zod.union([
 	zod
@@ -1752,7 +1765,13 @@ export const AddProblemProblemAddPostBody = zod.union([
 					aspiration_levels: zod.record(zod.string(), zod.number())
 				})
 				.optional()
-				.describe('Model for representing a reference point type of preference.')
+				.describe('Model for representing a reference point type of preference.'),
+			include_perturbed: zod
+				.boolean()
+				.default(addProblemProblemAddPostBodyOneIncludePerturbedDefault)
+				.describe(
+					'Whether to also return the k solutions found with perturbed reference points. If false, a single solution is returned.'
+				)
 		})
 		.describe('Model of the request to the reference point method.'),
 	zod
@@ -1809,6 +1828,13 @@ export const AddProblemProblemAddPostBody = zod.union([
 				.describe('The number of steps remaining in the navigation process.')
 		})
 		.describe('Request to perform NAUTILUS Navigator navigation steps.'),
+	zod
+		.object({
+			problem_id: zod.number(),
+			session_id: zod.union([zod.number(), zod.null()]).optional(),
+			parent_state_id: zod.union([zod.number(), zod.null()]).optional()
+		})
+		.describe('Request with the problem, interactive session and parent state of a JINA step.'),
 	zod.null()
 ]);
 
@@ -2465,7 +2491,11 @@ export const AddProblemProblemAddPostResponse = zod
 				})
 				.describe('Response model for ProblemMetaData.'),
 			zod.null()
-		])
+		]),
+		scenario_model_ids: zod
+			.array(zod.number())
+			.optional()
+			.describe("Ids of the problem's scenario models.")
 	})
 	.describe('Problem info request return data.');
 
@@ -2492,6 +2522,7 @@ export const AddProblemJsonProblemAddJsonPostQueryParams = zod.object({
 });
 
 export const addProblemJsonProblemAddJsonPostBodyRequestOnePreferencePreferenceTypeDefault = `reference_point`;
+export const addProblemJsonProblemAddJsonPostBodyRequestOneIncludePerturbedDefault = true;
 
 export const AddProblemJsonProblemAddJsonPostBody = zod.object({
 	json_file: zod.instanceof(File),
@@ -2525,7 +2556,13 @@ export const AddProblemJsonProblemAddJsonPostBody = zod.object({
 							aspiration_levels: zod.record(zod.string(), zod.number())
 						})
 						.optional()
-						.describe('Model for representing a reference point type of preference.')
+						.describe('Model for representing a reference point type of preference.'),
+					include_perturbed: zod
+						.boolean()
+						.default(addProblemJsonProblemAddJsonPostBodyRequestOneIncludePerturbedDefault)
+						.describe(
+							'Whether to also return the k solutions found with perturbed reference points. If false, a single solution is returned.'
+						)
 				})
 				.describe('Model of the request to the reference point method.'),
 			zod
@@ -2582,6 +2619,13 @@ export const AddProblemJsonProblemAddJsonPostBody = zod.object({
 						.describe('The number of steps remaining in the navigation process.')
 				})
 				.describe('Request to perform NAUTILUS Navigator navigation steps.'),
+			zod
+				.object({
+					problem_id: zod.number(),
+					session_id: zod.union([zod.number(), zod.null()]).optional(),
+					parent_state_id: zod.union([zod.number(), zod.null()]).optional()
+				})
+				.describe('Request with the problem, interactive session and parent state of a JINA step.'),
 			zod.null()
 		])
 		.optional()
@@ -3248,7 +3292,11 @@ export const AddProblemJsonProblemAddJsonPostResponse = zod
 				})
 				.describe('Response model for ProblemMetaData.'),
 			zod.null()
-		])
+		]),
+		scenario_model_ids: zod
+			.array(zod.number())
+			.optional()
+			.describe("Ids of the problem's scenario models.")
 	})
 	.describe('Problem info request return data.');
 
@@ -3642,6 +3690,7 @@ export const SolveSolutionsMethodRpmSolvePostQueryParams = zod.object({
 });
 
 export const solveSolutionsMethodRpmSolvePostBodyPreferencePreferenceTypeDefault = `reference_point`;
+export const solveSolutionsMethodRpmSolvePostBodyIncludePerturbedDefault = true;
 
 export const SolveSolutionsMethodRpmSolvePostBody = zod
 	.object({
@@ -3669,7 +3718,13 @@ export const SolveSolutionsMethodRpmSolvePostBody = zod
 				aspiration_levels: zod.record(zod.string(), zod.number())
 			})
 			.optional()
-			.describe('Model for representing a reference point type of preference.')
+			.describe('Model for representing a reference point type of preference.'),
+		include_perturbed: zod
+			.boolean()
+			.default(solveSolutionsMethodRpmSolvePostBodyIncludePerturbedDefault)
+			.describe(
+				'Whether to also return the k solutions found with perturbed reference points. If false, a single solution is returned.'
+			)
 	})
 	.describe('Model of the request to the reference point method.');
 
@@ -6385,7 +6440,6 @@ export const SolveSolutionsMethodCumulusSolvePostBody = zod
 					.default(solveSolutionsMethodCumulusSolvePostBodyPreferencePreferenceTypeDefault),
 				aspiration_levels: zod.record(zod.string(), zod.number())
 			})
-			.optional()
 			.describe('Model for representing a reference point type of preference.'),
 		current_objectives: zod
 			.record(zod.string(), zod.number())
@@ -6406,6 +6460,12 @@ export const SolveSolutionsMethodCumulusSolvePostResponse = zod
 			.literal('cumulus.classification')
 			.default(solveSolutionsMethodCumulusSolvePostResponseResponseTypeDefault),
 		state_id: zod.union([zod.number(), zod.null()]).describe('The newly created state id.'),
+		scenario_model_id: zod
+			.union([zod.number(), zod.null()])
+			.optional()
+			.describe(
+				'DB id of the ScenarioModelDB used for augmentation, if the problem has scenarios.'
+			),
 		previous_preference: zod
 			.object({
 				preference_type: zod
@@ -7049,6 +7109,12 @@ export const GetOrInitializeMethodCumulusGetOrInitializePostResponse = zod.union
 				.literal('cumulus.classification')
 				.default(getOrInitializeMethodCumulusGetOrInitializePostResponseTwoResponseTypeDefault),
 			state_id: zod.union([zod.number(), zod.null()]).describe('The newly created state id.'),
+			scenario_model_id: zod
+				.union([zod.number(), zod.null()])
+				.optional()
+				.describe(
+					'DB id of the ScenarioModelDB used for augmentation, if the problem has scenarios.'
+				),
 			previous_preference: zod
 				.object({
 					preference_type: zod
@@ -7731,7 +7797,7 @@ export const ModifyProblemMethodCumulusModifyProblemPostBody = zod
 									constraint_symbol: zod
 										.string()
 										.describe(
-											'Symbol of the constraint to soften. Must exist in the problem after standard modifications.'
+											"Symbol of the constraint to add as soft. Must be defined either in this request's 'constraints' list or already present in the problem."
 										),
 									violation_symbol: zod
 										.string()
@@ -7749,7 +7815,7 @@ export const ModifyProblemMethodCumulusModifyProblemPostBody = zod
 										.describe('Custom symbol for the GTE slack variable (EQ constraints only).')
 								})
 								.describe(
-									'Specification for converting a regular constraint into a soft penalty-based one.\n\nAfter standard element modifications are applied, any constraint listed here is passed\nto ``add_soft_constraint``, which introduces non-negative slack variables that absorb\nviolations and accumulates them into a minimisation objective.'
+									"Specification for adding a constraint as a soft, penalty-based one.\n\nA constraint referenced here is never added as a hard constraint, even if it is also\ndefined in this request's ``constraints`` list. Instead it is passed to\n``add_soft_constraint``, which introduces non-negative slack variables that absorb\nviolations and accumulates them into a minimisation objective."
 								)
 						),
 						zod.null()
@@ -7818,6 +7884,10 @@ export const ModifyProblemMethodCumulusModifyProblemPostResponse = zod
 		original_problem_id: zod
 			.union([zod.number(), zod.null()])
 			.describe('The ID of the original problem.'),
+		scenario_model_id: zod
+			.union([zod.number(), zod.null()])
+			.optional()
+			.describe('DB id of the ScenarioModelDB associated with the original problem, if any.'),
 		is_ready: zod
 			.boolean()
 			.default(modifyProblemMethodCumulusModifyProblemPostResponseIsReadyDefault)
@@ -7854,6 +7924,10 @@ export const ModifyProblemStatusMethodCumulusModifyProblemStatusStateIdGetRespon
 		original_problem_id: zod
 			.union([zod.number(), zod.null()])
 			.describe('The ID of the original problem.'),
+		scenario_model_id: zod
+			.union([zod.number(), zod.null()])
+			.optional()
+			.describe('DB id of the ScenarioModelDB associated with the original problem, if any.'),
 		is_ready: zod
 			.boolean()
 			.default(modifyProblemStatusMethodCumulusModifyProblemStatusStateIdGetResponseIsReadyDefault)
@@ -7866,6 +7940,1998 @@ export const ModifyProblemStatusMethodCumulusModifyProblemStatusStateIdGetRespon
 			.describe('Set if the background feasibility check failed.')
 	})
 	.describe('Response from the CUMULUS modify-problem endpoint.');
+
+/**
+ * List the scenario models of a problem; models that fail to load are left out.
+ * @summary Get Scenario Models
+ */
+export const GetScenarioModelsMethodJinaScenarioModelsGetQueryParams = zod.object({
+	problem_id: zod.union([zod.number(), zod.null()]).optional(),
+	session_id: zod.union([zod.number(), zod.null()]).optional()
+});
+
+export const GetScenarioModelsMethodJinaScenarioModelsGetResponseItem = zod
+	.object({
+		id: zod.number(),
+		leaves: zod.array(zod.string()),
+		n_leaves: zod.number(),
+		has_probabilities: zod.boolean(),
+		root_variables: zod
+			.array(zod.string())
+			.describe('Variables shared by all scenarios, the candidate design variables.'),
+		default_design_variables: zod
+			.array(zod.string())
+			.describe('The design variables a setup defaults to.'),
+		objectives: zod.array(zod.string()).describe('Symbols of the objectives of the scenario model.')
+	})
+	.describe('A scenario model of a problem.');
+export const GetScenarioModelsMethodJinaScenarioModelsGetResponse = zod.array(
+	GetScenarioModelsMethodJinaScenarioModelsGetResponseItem
+);
+
+/**
+ * Return the latest JINA setup of the session, or None, and all later JINA states of that setup.
+ * @summary Get Or Initialize
+ */
+export const GetOrInitializeMethodJinaGetOrInitializePostQueryParams = zod.object({
+	problem_id: zod.union([zod.number(), zod.null()]).optional()
+});
+
+export const GetOrInitializeMethodJinaGetOrInitializePostBody = zod
+	.object({
+		problem_id: zod.number(),
+		session_id: zod.union([zod.number(), zod.null()]).optional(),
+		parent_state_id: zod.union([zod.number(), zod.null()]).optional()
+	})
+	.describe('Request with the problem, interactive session and parent state of a JINA step.');
+
+export const getOrInitializeMethodJinaGetOrInitializePostResponseSetupOneResultThreeOutcomesObjectivesDefault =
+	{};
+export const getOrInitializeMethodJinaGetOrInitializePostResponseSetupOneResultThreeOutcomesVariablesDefault =
+	{};
+export const getOrInitializeMethodJinaGetOrInitializePostResponseStatesItemResultThreeOutcomesObjectivesDefault =
+	{};
+export const getOrInitializeMethodJinaGetOrInitializePostResponseStatesItemResultThreeOutcomesVariablesDefault =
+	{};
+
+export const GetOrInitializeMethodJinaGetOrInitializePostResponse = zod
+	.object({
+		setup: zod.union([
+			zod
+				.object({
+					state_id: zod.number(),
+					kind: zod
+						.enum([
+							'reference_point_method.solve_candidates',
+							'nimbus.solve_candidates',
+							'nimbus.save_solutions',
+							'nimbus.initialize',
+							'nimbus.final',
+							'gnimbus.optimize',
+							'gnimbus.vote',
+							'gnimbus.end',
+							'emo.run',
+							'emo.save_solutions',
+							'emo.fetch_solutions',
+							'emo.score_bands',
+							'generic.solve_intermediate',
+							'e-nautilus.stepping',
+							'e-nautilus.final',
+							'nautilus.navigate',
+							'nautilus.initialize',
+							'xnimbus.solve_candidates',
+							'xnimbus.save_solutions',
+							'xnimbus.initialize',
+							'xnimbus.final',
+							'cumulus.solve_candidates',
+							'cumulus.save_solutions',
+							'cumulus.initialize',
+							'cumulus.final',
+							'cumulus.modify',
+							'cumulus.objective_constraint',
+							'jina.setup',
+							'jina.iterate',
+							'jina.evaluate',
+							'jina.select'
+						])
+						.describe(
+							'Stores the normalized kinds `{method}.{phase}` of supported states.\n\nNote:\n    Update this when adding new states. Be sure to update `KIND_TO_STATE`\n    in this file as well.'
+						),
+					is_ready: zod.boolean(),
+					error: zod.union([zod.string(), zod.null()]).optional(),
+					result: zod.union([
+						zod
+							.object({
+								kind: zod.literal('jina.setup'),
+								scenario_model_id: zod.number(),
+								design_variables: zod.array(zod.string()),
+								measure: zod.enum(['worst_case', 'expected_value', 'cvar']),
+								cvar_alpha: zod.number(),
+								baseline_leaf: zod.union([zod.string(), zod.null()]),
+								design_rtol: zod.number(),
+								targets: zod.union([
+									zod.record(
+										zod.string(),
+										zod.array(
+											zod
+												.object({
+													symbol: zod
+														.string()
+														.describe('Objective symbol of the target in the built problem.'),
+													objective: zod.string().describe('The original objective symbol.'),
+													leaf: zod
+														.union([zod.string(), zod.null()])
+														.describe(
+															'The leaf of a per-leaf target; None for a target over all leaves.'
+														),
+													leaves: zod
+														.array(zod.string())
+														.describe('The leaves whose values the target depends on.'),
+													maximize: zod.boolean().describe('Whether the target is maximised.')
+												})
+												.describe('One scalarised quantity of a JINA problem.')
+										)
+									),
+									zod.null()
+								]),
+								ranges: zod.union([
+									zod.record(
+										zod.string(),
+										zod.record(zod.string(), zod.tuple([zod.number(), zod.number()]))
+									),
+									zod.null()
+								])
+							})
+							.describe('Contents of a JINA setup state.'),
+						zod
+							.object({
+								kind: zod.literal('jina.iterate'),
+								setup_state_id: zod.number(),
+								mode: zod.enum(['solve', 'pool', 'import']),
+								view: zod.union([zod.enum(['aggregated', 'per_scenario']), zod.null()]),
+								reference_point: zod.record(zod.string(), zod.number()),
+								results: zod.array(
+									zod
+										.object({
+											name: zod.string().describe("Variant name, pool scorer name or 'row_<i>'."),
+											success: zod.boolean(),
+											message: zod.string(),
+											effective_reference_point: zod.record(zod.string(), zod.number()).optional(),
+											target_values: zod.record(zod.string(), zod.number()).optional(),
+											alpha: zod.union([zod.number(), zod.null()]).optional(),
+											binding: zod.array(zod.string()).optional(),
+											design_id: zod
+												.union([zod.number(), zod.null()])
+												.optional()
+												.describe('Registry id of the resulting design.')
+										})
+										.describe(
+											'Result of one variant, pool scorer or imported row of an iterate state.'
+										)
+								),
+								new_design_ids: zod.array(zod.number()),
+								designs: zod.array(
+									zod
+										.object({
+											id: zod.number().describe('Id of the design, unique within the registry.'),
+											values: zod
+												.record(
+													zod.string(),
+													zod.union([
+														zod.number(),
+														zod.array(zod.number()),
+														zod.array(zod.array(zod.number()))
+													])
+												)
+												.describe('Design variable values.'),
+											effective_reference_point: zod
+												.union([zod.record(zod.string(), zod.number()), zod.null()])
+												.optional()
+												.describe(
+													'The target-keyed reference point a solved design was found at; None for imports.'
+												),
+											import_reference_point: zod
+												.union([zod.record(zod.string(), zod.number()), zod.null()])
+												.optional()
+												.describe(
+													'The objective-keyed reference point an imported design was evaluated at.'
+												),
+											view: zod
+												.union([zod.enum(['aggregated', 'per_scenario']), zod.null()])
+												.optional()
+												.describe('View the design was solved in; None for imports.'),
+											source: zod.enum(['solve', 'import']),
+											leaf_objectives: zod
+												.record(zod.string(), zod.record(zod.string(), zod.number()))
+												.optional()
+												.describe('Objective values by leaf and objective symbol.')
+										})
+										.describe('A design in the design registry of a JINA setup.')
+								)
+							})
+							.describe('Contents of a JINA iterate state.'),
+						zod
+							.object({
+								kind: zod.literal('jina.evaluate'),
+								setup_state_id: zod.number(),
+								scenario_model_id: zod.number(),
+								design_ids: zod.array(zod.number()),
+								reference_point: zod.union([zod.record(zod.string(), zod.number()), zod.null()]),
+								outcomes: zod.record(
+									zod.string(),
+									zod.record(
+										zod.string(),
+										zod
+											.object({
+												status: zod
+													.boolean()
+													.describe('Whether the recourse problem was solved successfully.'),
+												message: zod.string().describe('Solver message.'),
+												objectives: zod
+													.record(zod.string(), zod.number())
+													.default(
+														getOrInitializeMethodJinaGetOrInitializePostResponseSetupOneResultThreeOutcomesObjectivesDefault
+													)
+													.describe('Objective values in the leaf, in their original direction.'),
+												variables: zod
+													.record(zod.string(), zod.union([zod.number(), zod.array(zod.unknown())]))
+													.default(
+														getOrInitializeMethodJinaGetOrInitializePostResponseSetupOneResultThreeOutcomesVariablesDefault
+													)
+													.describe('Variable values in the leaf.')
+											})
+											.describe('Result of evaluating a design in one leaf scenario.')
+									)
+								)
+							})
+							.describe('Contents of a JINA evaluate state.'),
+						zod
+							.object({
+								kind: zod.literal('jina.select'),
+								setup_state_id: zod.number(),
+								wishlist: zod.array(zod.number()),
+								final_design_id: zod.union([zod.number(), zod.null()])
+							})
+							.describe('Contents of a JINA select state.')
+					])
+				})
+				.describe('A JINA state and whether its background job has finished.'),
+			zod.null()
+		]),
+		states: zod.array(
+			zod
+				.object({
+					state_id: zod.number(),
+					kind: zod
+						.enum([
+							'reference_point_method.solve_candidates',
+							'nimbus.solve_candidates',
+							'nimbus.save_solutions',
+							'nimbus.initialize',
+							'nimbus.final',
+							'gnimbus.optimize',
+							'gnimbus.vote',
+							'gnimbus.end',
+							'emo.run',
+							'emo.save_solutions',
+							'emo.fetch_solutions',
+							'emo.score_bands',
+							'generic.solve_intermediate',
+							'e-nautilus.stepping',
+							'e-nautilus.final',
+							'nautilus.navigate',
+							'nautilus.initialize',
+							'xnimbus.solve_candidates',
+							'xnimbus.save_solutions',
+							'xnimbus.initialize',
+							'xnimbus.final',
+							'cumulus.solve_candidates',
+							'cumulus.save_solutions',
+							'cumulus.initialize',
+							'cumulus.final',
+							'cumulus.modify',
+							'cumulus.objective_constraint',
+							'jina.setup',
+							'jina.iterate',
+							'jina.evaluate',
+							'jina.select'
+						])
+						.describe(
+							'Stores the normalized kinds `{method}.{phase}` of supported states.\n\nNote:\n    Update this when adding new states. Be sure to update `KIND_TO_STATE`\n    in this file as well.'
+						),
+					is_ready: zod.boolean(),
+					error: zod.union([zod.string(), zod.null()]).optional(),
+					result: zod.union([
+						zod
+							.object({
+								kind: zod.literal('jina.setup'),
+								scenario_model_id: zod.number(),
+								design_variables: zod.array(zod.string()),
+								measure: zod.enum(['worst_case', 'expected_value', 'cvar']),
+								cvar_alpha: zod.number(),
+								baseline_leaf: zod.union([zod.string(), zod.null()]),
+								design_rtol: zod.number(),
+								targets: zod.union([
+									zod.record(
+										zod.string(),
+										zod.array(
+											zod
+												.object({
+													symbol: zod
+														.string()
+														.describe('Objective symbol of the target in the built problem.'),
+													objective: zod.string().describe('The original objective symbol.'),
+													leaf: zod
+														.union([zod.string(), zod.null()])
+														.describe(
+															'The leaf of a per-leaf target; None for a target over all leaves.'
+														),
+													leaves: zod
+														.array(zod.string())
+														.describe('The leaves whose values the target depends on.'),
+													maximize: zod.boolean().describe('Whether the target is maximised.')
+												})
+												.describe('One scalarised quantity of a JINA problem.')
+										)
+									),
+									zod.null()
+								]),
+								ranges: zod.union([
+									zod.record(
+										zod.string(),
+										zod.record(zod.string(), zod.tuple([zod.number(), zod.number()]))
+									),
+									zod.null()
+								])
+							})
+							.describe('Contents of a JINA setup state.'),
+						zod
+							.object({
+								kind: zod.literal('jina.iterate'),
+								setup_state_id: zod.number(),
+								mode: zod.enum(['solve', 'pool', 'import']),
+								view: zod.union([zod.enum(['aggregated', 'per_scenario']), zod.null()]),
+								reference_point: zod.record(zod.string(), zod.number()),
+								results: zod.array(
+									zod
+										.object({
+											name: zod.string().describe("Variant name, pool scorer name or 'row_<i>'."),
+											success: zod.boolean(),
+											message: zod.string(),
+											effective_reference_point: zod.record(zod.string(), zod.number()).optional(),
+											target_values: zod.record(zod.string(), zod.number()).optional(),
+											alpha: zod.union([zod.number(), zod.null()]).optional(),
+											binding: zod.array(zod.string()).optional(),
+											design_id: zod
+												.union([zod.number(), zod.null()])
+												.optional()
+												.describe('Registry id of the resulting design.')
+										})
+										.describe(
+											'Result of one variant, pool scorer or imported row of an iterate state.'
+										)
+								),
+								new_design_ids: zod.array(zod.number()),
+								designs: zod.array(
+									zod
+										.object({
+											id: zod.number().describe('Id of the design, unique within the registry.'),
+											values: zod
+												.record(
+													zod.string(),
+													zod.union([
+														zod.number(),
+														zod.array(zod.number()),
+														zod.array(zod.array(zod.number()))
+													])
+												)
+												.describe('Design variable values.'),
+											effective_reference_point: zod
+												.union([zod.record(zod.string(), zod.number()), zod.null()])
+												.optional()
+												.describe(
+													'The target-keyed reference point a solved design was found at; None for imports.'
+												),
+											import_reference_point: zod
+												.union([zod.record(zod.string(), zod.number()), zod.null()])
+												.optional()
+												.describe(
+													'The objective-keyed reference point an imported design was evaluated at.'
+												),
+											view: zod
+												.union([zod.enum(['aggregated', 'per_scenario']), zod.null()])
+												.optional()
+												.describe('View the design was solved in; None for imports.'),
+											source: zod.enum(['solve', 'import']),
+											leaf_objectives: zod
+												.record(zod.string(), zod.record(zod.string(), zod.number()))
+												.optional()
+												.describe('Objective values by leaf and objective symbol.')
+										})
+										.describe('A design in the design registry of a JINA setup.')
+								)
+							})
+							.describe('Contents of a JINA iterate state.'),
+						zod
+							.object({
+								kind: zod.literal('jina.evaluate'),
+								setup_state_id: zod.number(),
+								scenario_model_id: zod.number(),
+								design_ids: zod.array(zod.number()),
+								reference_point: zod.union([zod.record(zod.string(), zod.number()), zod.null()]),
+								outcomes: zod.record(
+									zod.string(),
+									zod.record(
+										zod.string(),
+										zod
+											.object({
+												status: zod
+													.boolean()
+													.describe('Whether the recourse problem was solved successfully.'),
+												message: zod.string().describe('Solver message.'),
+												objectives: zod
+													.record(zod.string(), zod.number())
+													.default(
+														getOrInitializeMethodJinaGetOrInitializePostResponseStatesItemResultThreeOutcomesObjectivesDefault
+													)
+													.describe('Objective values in the leaf, in their original direction.'),
+												variables: zod
+													.record(zod.string(), zod.union([zod.number(), zod.array(zod.unknown())]))
+													.default(
+														getOrInitializeMethodJinaGetOrInitializePostResponseStatesItemResultThreeOutcomesVariablesDefault
+													)
+													.describe('Variable values in the leaf.')
+											})
+											.describe('Result of evaluating a design in one leaf scenario.')
+									)
+								)
+							})
+							.describe('Contents of a JINA evaluate state.'),
+						zod
+							.object({
+								kind: zod.literal('jina.select'),
+								setup_state_id: zod.number(),
+								wishlist: zod.array(zod.number()),
+								final_design_id: zod.union([zod.number(), zod.null()])
+							})
+							.describe('Contents of a JINA select state.')
+					])
+				})
+				.describe('A JINA state and whether its background job has finished.')
+		)
+	})
+	.describe('The latest JINA setup of the session and its later states, oldest first.');
+
+/**
+ * Start a JINA run on a scenario model of the problem; its target ranges are computed in the background.
+ * @summary Setup
+ */
+export const SetupMethodJinaSetupPostQueryParams = zod.object({
+	problem_id: zod.union([zod.number(), zod.null()]).optional()
+});
+
+export const setupMethodJinaSetupPostBodyMeasureDefault = `worst_case`;
+export const setupMethodJinaSetupPostBodyCvarAlphaDefault = 0.9;
+export const setupMethodJinaSetupPostBodyCvarAlphaExclusiveMin = 0;
+export const setupMethodJinaSetupPostBodyCvarAlphaExclusiveMax = 1;
+
+export const setupMethodJinaSetupPostBodyDesignRtolDefault = 0.0001;
+export const setupMethodJinaSetupPostBodyDesignRtolMin = 0;
+
+export const SetupMethodJinaSetupPostBody = zod
+	.object({
+		problem_id: zod.number(),
+		session_id: zod.union([zod.number(), zod.null()]).optional(),
+		parent_state_id: zod.union([zod.number(), zod.null()]).optional(),
+		scenario_model_id: zod
+			.union([zod.number(), zod.null()])
+			.optional()
+			.describe("DB id of the ScenarioModelDB. Defaults to the problem's first scenario model."),
+		design_variables: zod
+			.union([zod.array(zod.string()), zod.null()])
+			.optional()
+			.describe('Root variables forming a design. Defaults to the scalar root variables.'),
+		measure: zod
+			.enum(['worst_case', 'expected_value', 'cvar'])
+			.default(setupMethodJinaSetupPostBodyMeasureDefault)
+			.describe('The aggregation of the aggregated view.'),
+		cvar_alpha: zod
+			.number()
+			.gt(setupMethodJinaSetupPostBodyCvarAlphaExclusiveMin)
+			.lt(setupMethodJinaSetupPostBodyCvarAlphaExclusiveMax)
+			.default(setupMethodJinaSetupPostBodyCvarAlphaDefault)
+			.describe('The CVaR confidence level.'),
+		baseline_leaf: zod
+			.union([zod.string(), zod.null()])
+			.optional()
+			.describe('Leaf the antifragility analysis compares against.'),
+		design_rtol: zod
+			.number()
+			.min(setupMethodJinaSetupPostBodyDesignRtolMin)
+			.default(setupMethodJinaSetupPostBodyDesignRtolDefault)
+			.describe('Relative tolerance for identifying equal designs.')
+	})
+	.describe('Request model for the JINA setup endpoint.');
+
+export const setupMethodJinaSetupPostResponseResultThreeOutcomesObjectivesDefault = {};
+export const setupMethodJinaSetupPostResponseResultThreeOutcomesVariablesDefault = {};
+
+export const SetupMethodJinaSetupPostResponse = zod
+	.object({
+		state_id: zod.number(),
+		kind: zod
+			.enum([
+				'reference_point_method.solve_candidates',
+				'nimbus.solve_candidates',
+				'nimbus.save_solutions',
+				'nimbus.initialize',
+				'nimbus.final',
+				'gnimbus.optimize',
+				'gnimbus.vote',
+				'gnimbus.end',
+				'emo.run',
+				'emo.save_solutions',
+				'emo.fetch_solutions',
+				'emo.score_bands',
+				'generic.solve_intermediate',
+				'e-nautilus.stepping',
+				'e-nautilus.final',
+				'nautilus.navigate',
+				'nautilus.initialize',
+				'xnimbus.solve_candidates',
+				'xnimbus.save_solutions',
+				'xnimbus.initialize',
+				'xnimbus.final',
+				'cumulus.solve_candidates',
+				'cumulus.save_solutions',
+				'cumulus.initialize',
+				'cumulus.final',
+				'cumulus.modify',
+				'cumulus.objective_constraint',
+				'jina.setup',
+				'jina.iterate',
+				'jina.evaluate',
+				'jina.select'
+			])
+			.describe(
+				'Stores the normalized kinds `{method}.{phase}` of supported states.\n\nNote:\n    Update this when adding new states. Be sure to update `KIND_TO_STATE`\n    in this file as well.'
+			),
+		is_ready: zod.boolean(),
+		error: zod.union([zod.string(), zod.null()]).optional(),
+		result: zod.union([
+			zod
+				.object({
+					kind: zod.literal('jina.setup'),
+					scenario_model_id: zod.number(),
+					design_variables: zod.array(zod.string()),
+					measure: zod.enum(['worst_case', 'expected_value', 'cvar']),
+					cvar_alpha: zod.number(),
+					baseline_leaf: zod.union([zod.string(), zod.null()]),
+					design_rtol: zod.number(),
+					targets: zod.union([
+						zod.record(
+							zod.string(),
+							zod.array(
+								zod
+									.object({
+										symbol: zod
+											.string()
+											.describe('Objective symbol of the target in the built problem.'),
+										objective: zod.string().describe('The original objective symbol.'),
+										leaf: zod
+											.union([zod.string(), zod.null()])
+											.describe(
+												'The leaf of a per-leaf target; None for a target over all leaves.'
+											),
+										leaves: zod
+											.array(zod.string())
+											.describe('The leaves whose values the target depends on.'),
+										maximize: zod.boolean().describe('Whether the target is maximised.')
+									})
+									.describe('One scalarised quantity of a JINA problem.')
+							)
+						),
+						zod.null()
+					]),
+					ranges: zod.union([
+						zod.record(
+							zod.string(),
+							zod.record(zod.string(), zod.tuple([zod.number(), zod.number()]))
+						),
+						zod.null()
+					])
+				})
+				.describe('Contents of a JINA setup state.'),
+			zod
+				.object({
+					kind: zod.literal('jina.iterate'),
+					setup_state_id: zod.number(),
+					mode: zod.enum(['solve', 'pool', 'import']),
+					view: zod.union([zod.enum(['aggregated', 'per_scenario']), zod.null()]),
+					reference_point: zod.record(zod.string(), zod.number()),
+					results: zod.array(
+						zod
+							.object({
+								name: zod.string().describe("Variant name, pool scorer name or 'row_<i>'."),
+								success: zod.boolean(),
+								message: zod.string(),
+								effective_reference_point: zod.record(zod.string(), zod.number()).optional(),
+								target_values: zod.record(zod.string(), zod.number()).optional(),
+								alpha: zod.union([zod.number(), zod.null()]).optional(),
+								binding: zod.array(zod.string()).optional(),
+								design_id: zod
+									.union([zod.number(), zod.null()])
+									.optional()
+									.describe('Registry id of the resulting design.')
+							})
+							.describe('Result of one variant, pool scorer or imported row of an iterate state.')
+					),
+					new_design_ids: zod.array(zod.number()),
+					designs: zod.array(
+						zod
+							.object({
+								id: zod.number().describe('Id of the design, unique within the registry.'),
+								values: zod
+									.record(
+										zod.string(),
+										zod.union([
+											zod.number(),
+											zod.array(zod.number()),
+											zod.array(zod.array(zod.number()))
+										])
+									)
+									.describe('Design variable values.'),
+								effective_reference_point: zod
+									.union([zod.record(zod.string(), zod.number()), zod.null()])
+									.optional()
+									.describe(
+										'The target-keyed reference point a solved design was found at; None for imports.'
+									),
+								import_reference_point: zod
+									.union([zod.record(zod.string(), zod.number()), zod.null()])
+									.optional()
+									.describe(
+										'The objective-keyed reference point an imported design was evaluated at.'
+									),
+								view: zod
+									.union([zod.enum(['aggregated', 'per_scenario']), zod.null()])
+									.optional()
+									.describe('View the design was solved in; None for imports.'),
+								source: zod.enum(['solve', 'import']),
+								leaf_objectives: zod
+									.record(zod.string(), zod.record(zod.string(), zod.number()))
+									.optional()
+									.describe('Objective values by leaf and objective symbol.')
+							})
+							.describe('A design in the design registry of a JINA setup.')
+					)
+				})
+				.describe('Contents of a JINA iterate state.'),
+			zod
+				.object({
+					kind: zod.literal('jina.evaluate'),
+					setup_state_id: zod.number(),
+					scenario_model_id: zod.number(),
+					design_ids: zod.array(zod.number()),
+					reference_point: zod.union([zod.record(zod.string(), zod.number()), zod.null()]),
+					outcomes: zod.record(
+						zod.string(),
+						zod.record(
+							zod.string(),
+							zod
+								.object({
+									status: zod
+										.boolean()
+										.describe('Whether the recourse problem was solved successfully.'),
+									message: zod.string().describe('Solver message.'),
+									objectives: zod
+										.record(zod.string(), zod.number())
+										.default(setupMethodJinaSetupPostResponseResultThreeOutcomesObjectivesDefault)
+										.describe('Objective values in the leaf, in their original direction.'),
+									variables: zod
+										.record(zod.string(), zod.union([zod.number(), zod.array(zod.unknown())]))
+										.default(setupMethodJinaSetupPostResponseResultThreeOutcomesVariablesDefault)
+										.describe('Variable values in the leaf.')
+								})
+								.describe('Result of evaluating a design in one leaf scenario.')
+						)
+					)
+				})
+				.describe('Contents of a JINA evaluate state.'),
+			zod
+				.object({
+					kind: zod.literal('jina.select'),
+					setup_state_id: zod.number(),
+					wishlist: zod.array(zod.number()),
+					final_design_id: zod.union([zod.number(), zod.null()])
+				})
+				.describe('Contents of a JINA select state.')
+		])
+	})
+	.describe('A JINA state and whether its background job has finished.');
+
+/**
+ * Solve new designs at a reference point in the background, or pick designs found earlier from the pool.
+ * @summary Iterate
+ */
+export const IterateMethodJinaIteratePostQueryParams = zod.object({
+	problem_id: zod.union([zod.number(), zod.null()]).optional()
+});
+
+export const iterateMethodJinaIteratePostBodyModeDefault = `solve`;
+export const iterateMethodJinaIteratePostBodyViewDefault = `aggregated`;
+
+export const IterateMethodJinaIteratePostBody = zod
+	.object({
+		problem_id: zod.number(),
+		session_id: zod.union([zod.number(), zod.null()]).optional(),
+		parent_state_id: zod.union([zod.number(), zod.null()]).optional(),
+		setup_state_id: zod.number(),
+		mode: zod
+			.enum(['solve', 'pool'])
+			.default(iterateMethodJinaIteratePostBodyModeDefault)
+			.describe('Solve new designs, or pick designs found earlier from the design pool.'),
+		view: zod
+			.enum(['aggregated', 'per_scenario'])
+			.default(iterateMethodJinaIteratePostBodyViewDefault),
+		reference_point: zod
+			.record(zod.string(), zod.number())
+			.describe('Aspiration levels by target symbol, original direction.')
+	})
+	.describe('Request model for the JINA iterate endpoint.');
+
+export const iterateMethodJinaIteratePostResponseResultThreeOutcomesObjectivesDefault = {};
+export const iterateMethodJinaIteratePostResponseResultThreeOutcomesVariablesDefault = {};
+
+export const IterateMethodJinaIteratePostResponse = zod
+	.object({
+		state_id: zod.number(),
+		kind: zod
+			.enum([
+				'reference_point_method.solve_candidates',
+				'nimbus.solve_candidates',
+				'nimbus.save_solutions',
+				'nimbus.initialize',
+				'nimbus.final',
+				'gnimbus.optimize',
+				'gnimbus.vote',
+				'gnimbus.end',
+				'emo.run',
+				'emo.save_solutions',
+				'emo.fetch_solutions',
+				'emo.score_bands',
+				'generic.solve_intermediate',
+				'e-nautilus.stepping',
+				'e-nautilus.final',
+				'nautilus.navigate',
+				'nautilus.initialize',
+				'xnimbus.solve_candidates',
+				'xnimbus.save_solutions',
+				'xnimbus.initialize',
+				'xnimbus.final',
+				'cumulus.solve_candidates',
+				'cumulus.save_solutions',
+				'cumulus.initialize',
+				'cumulus.final',
+				'cumulus.modify',
+				'cumulus.objective_constraint',
+				'jina.setup',
+				'jina.iterate',
+				'jina.evaluate',
+				'jina.select'
+			])
+			.describe(
+				'Stores the normalized kinds `{method}.{phase}` of supported states.\n\nNote:\n    Update this when adding new states. Be sure to update `KIND_TO_STATE`\n    in this file as well.'
+			),
+		is_ready: zod.boolean(),
+		error: zod.union([zod.string(), zod.null()]).optional(),
+		result: zod.union([
+			zod
+				.object({
+					kind: zod.literal('jina.setup'),
+					scenario_model_id: zod.number(),
+					design_variables: zod.array(zod.string()),
+					measure: zod.enum(['worst_case', 'expected_value', 'cvar']),
+					cvar_alpha: zod.number(),
+					baseline_leaf: zod.union([zod.string(), zod.null()]),
+					design_rtol: zod.number(),
+					targets: zod.union([
+						zod.record(
+							zod.string(),
+							zod.array(
+								zod
+									.object({
+										symbol: zod
+											.string()
+											.describe('Objective symbol of the target in the built problem.'),
+										objective: zod.string().describe('The original objective symbol.'),
+										leaf: zod
+											.union([zod.string(), zod.null()])
+											.describe(
+												'The leaf of a per-leaf target; None for a target over all leaves.'
+											),
+										leaves: zod
+											.array(zod.string())
+											.describe('The leaves whose values the target depends on.'),
+										maximize: zod.boolean().describe('Whether the target is maximised.')
+									})
+									.describe('One scalarised quantity of a JINA problem.')
+							)
+						),
+						zod.null()
+					]),
+					ranges: zod.union([
+						zod.record(
+							zod.string(),
+							zod.record(zod.string(), zod.tuple([zod.number(), zod.number()]))
+						),
+						zod.null()
+					])
+				})
+				.describe('Contents of a JINA setup state.'),
+			zod
+				.object({
+					kind: zod.literal('jina.iterate'),
+					setup_state_id: zod.number(),
+					mode: zod.enum(['solve', 'pool', 'import']),
+					view: zod.union([zod.enum(['aggregated', 'per_scenario']), zod.null()]),
+					reference_point: zod.record(zod.string(), zod.number()),
+					results: zod.array(
+						zod
+							.object({
+								name: zod.string().describe("Variant name, pool scorer name or 'row_<i>'."),
+								success: zod.boolean(),
+								message: zod.string(),
+								effective_reference_point: zod.record(zod.string(), zod.number()).optional(),
+								target_values: zod.record(zod.string(), zod.number()).optional(),
+								alpha: zod.union([zod.number(), zod.null()]).optional(),
+								binding: zod.array(zod.string()).optional(),
+								design_id: zod
+									.union([zod.number(), zod.null()])
+									.optional()
+									.describe('Registry id of the resulting design.')
+							})
+							.describe('Result of one variant, pool scorer or imported row of an iterate state.')
+					),
+					new_design_ids: zod.array(zod.number()),
+					designs: zod.array(
+						zod
+							.object({
+								id: zod.number().describe('Id of the design, unique within the registry.'),
+								values: zod
+									.record(
+										zod.string(),
+										zod.union([
+											zod.number(),
+											zod.array(zod.number()),
+											zod.array(zod.array(zod.number()))
+										])
+									)
+									.describe('Design variable values.'),
+								effective_reference_point: zod
+									.union([zod.record(zod.string(), zod.number()), zod.null()])
+									.optional()
+									.describe(
+										'The target-keyed reference point a solved design was found at; None for imports.'
+									),
+								import_reference_point: zod
+									.union([zod.record(zod.string(), zod.number()), zod.null()])
+									.optional()
+									.describe(
+										'The objective-keyed reference point an imported design was evaluated at.'
+									),
+								view: zod
+									.union([zod.enum(['aggregated', 'per_scenario']), zod.null()])
+									.optional()
+									.describe('View the design was solved in; None for imports.'),
+								source: zod.enum(['solve', 'import']),
+								leaf_objectives: zod
+									.record(zod.string(), zod.record(zod.string(), zod.number()))
+									.optional()
+									.describe('Objective values by leaf and objective symbol.')
+							})
+							.describe('A design in the design registry of a JINA setup.')
+					)
+				})
+				.describe('Contents of a JINA iterate state.'),
+			zod
+				.object({
+					kind: zod.literal('jina.evaluate'),
+					setup_state_id: zod.number(),
+					scenario_model_id: zod.number(),
+					design_ids: zod.array(zod.number()),
+					reference_point: zod.union([zod.record(zod.string(), zod.number()), zod.null()]),
+					outcomes: zod.record(
+						zod.string(),
+						zod.record(
+							zod.string(),
+							zod
+								.object({
+									status: zod
+										.boolean()
+										.describe('Whether the recourse problem was solved successfully.'),
+									message: zod.string().describe('Solver message.'),
+									objectives: zod
+										.record(zod.string(), zod.number())
+										.default(
+											iterateMethodJinaIteratePostResponseResultThreeOutcomesObjectivesDefault
+										)
+										.describe('Objective values in the leaf, in their original direction.'),
+									variables: zod
+										.record(zod.string(), zod.union([zod.number(), zod.array(zod.unknown())]))
+										.default(
+											iterateMethodJinaIteratePostResponseResultThreeOutcomesVariablesDefault
+										)
+										.describe('Variable values in the leaf.')
+								})
+								.describe('Result of evaluating a design in one leaf scenario.')
+						)
+					)
+				})
+				.describe('Contents of a JINA evaluate state.'),
+			zod
+				.object({
+					kind: zod.literal('jina.select'),
+					setup_state_id: zod.number(),
+					wishlist: zod.array(zod.number()),
+					final_design_id: zod.union([zod.number(), zod.null()])
+				})
+				.describe('Contents of a JINA select state.')
+		])
+	})
+	.describe('A JINA state and whether its background job has finished.');
+
+/**
+ * Import the designs of a representative solution set of the problem; they are evaluated in the background.
+ * @summary Import Designs
+ */
+export const ImportDesignsMethodJinaImportPostQueryParams = zod.object({
+	problem_id: zod.union([zod.number(), zod.null()]).optional()
+});
+
+export const ImportDesignsMethodJinaImportPostBody = zod
+	.object({
+		problem_id: zod.number(),
+		session_id: zod.union([zod.number(), zod.null()]).optional(),
+		parent_state_id: zod.union([zod.number(), zod.null()]).optional(),
+		setup_state_id: zod.number(),
+		representative_set_id: zod
+			.number()
+			.describe('Id of a RepresentativeNonDominatedSolutions of the problem.'),
+		reference_point: zod
+			.record(zod.string(), zod.number())
+			.describe(
+				'Aspiration levels by original objective symbol at which the designs are evaluated.'
+			)
+	})
+	.describe('Request model for importing designs from a representative solution set.');
+
+export const importDesignsMethodJinaImportPostResponseResultThreeOutcomesObjectivesDefault = {};
+export const importDesignsMethodJinaImportPostResponseResultThreeOutcomesVariablesDefault = {};
+
+export const ImportDesignsMethodJinaImportPostResponse = zod
+	.object({
+		state_id: zod.number(),
+		kind: zod
+			.enum([
+				'reference_point_method.solve_candidates',
+				'nimbus.solve_candidates',
+				'nimbus.save_solutions',
+				'nimbus.initialize',
+				'nimbus.final',
+				'gnimbus.optimize',
+				'gnimbus.vote',
+				'gnimbus.end',
+				'emo.run',
+				'emo.save_solutions',
+				'emo.fetch_solutions',
+				'emo.score_bands',
+				'generic.solve_intermediate',
+				'e-nautilus.stepping',
+				'e-nautilus.final',
+				'nautilus.navigate',
+				'nautilus.initialize',
+				'xnimbus.solve_candidates',
+				'xnimbus.save_solutions',
+				'xnimbus.initialize',
+				'xnimbus.final',
+				'cumulus.solve_candidates',
+				'cumulus.save_solutions',
+				'cumulus.initialize',
+				'cumulus.final',
+				'cumulus.modify',
+				'cumulus.objective_constraint',
+				'jina.setup',
+				'jina.iterate',
+				'jina.evaluate',
+				'jina.select'
+			])
+			.describe(
+				'Stores the normalized kinds `{method}.{phase}` of supported states.\n\nNote:\n    Update this when adding new states. Be sure to update `KIND_TO_STATE`\n    in this file as well.'
+			),
+		is_ready: zod.boolean(),
+		error: zod.union([zod.string(), zod.null()]).optional(),
+		result: zod.union([
+			zod
+				.object({
+					kind: zod.literal('jina.setup'),
+					scenario_model_id: zod.number(),
+					design_variables: zod.array(zod.string()),
+					measure: zod.enum(['worst_case', 'expected_value', 'cvar']),
+					cvar_alpha: zod.number(),
+					baseline_leaf: zod.union([zod.string(), zod.null()]),
+					design_rtol: zod.number(),
+					targets: zod.union([
+						zod.record(
+							zod.string(),
+							zod.array(
+								zod
+									.object({
+										symbol: zod
+											.string()
+											.describe('Objective symbol of the target in the built problem.'),
+										objective: zod.string().describe('The original objective symbol.'),
+										leaf: zod
+											.union([zod.string(), zod.null()])
+											.describe(
+												'The leaf of a per-leaf target; None for a target over all leaves.'
+											),
+										leaves: zod
+											.array(zod.string())
+											.describe('The leaves whose values the target depends on.'),
+										maximize: zod.boolean().describe('Whether the target is maximised.')
+									})
+									.describe('One scalarised quantity of a JINA problem.')
+							)
+						),
+						zod.null()
+					]),
+					ranges: zod.union([
+						zod.record(
+							zod.string(),
+							zod.record(zod.string(), zod.tuple([zod.number(), zod.number()]))
+						),
+						zod.null()
+					])
+				})
+				.describe('Contents of a JINA setup state.'),
+			zod
+				.object({
+					kind: zod.literal('jina.iterate'),
+					setup_state_id: zod.number(),
+					mode: zod.enum(['solve', 'pool', 'import']),
+					view: zod.union([zod.enum(['aggregated', 'per_scenario']), zod.null()]),
+					reference_point: zod.record(zod.string(), zod.number()),
+					results: zod.array(
+						zod
+							.object({
+								name: zod.string().describe("Variant name, pool scorer name or 'row_<i>'."),
+								success: zod.boolean(),
+								message: zod.string(),
+								effective_reference_point: zod.record(zod.string(), zod.number()).optional(),
+								target_values: zod.record(zod.string(), zod.number()).optional(),
+								alpha: zod.union([zod.number(), zod.null()]).optional(),
+								binding: zod.array(zod.string()).optional(),
+								design_id: zod
+									.union([zod.number(), zod.null()])
+									.optional()
+									.describe('Registry id of the resulting design.')
+							})
+							.describe('Result of one variant, pool scorer or imported row of an iterate state.')
+					),
+					new_design_ids: zod.array(zod.number()),
+					designs: zod.array(
+						zod
+							.object({
+								id: zod.number().describe('Id of the design, unique within the registry.'),
+								values: zod
+									.record(
+										zod.string(),
+										zod.union([
+											zod.number(),
+											zod.array(zod.number()),
+											zod.array(zod.array(zod.number()))
+										])
+									)
+									.describe('Design variable values.'),
+								effective_reference_point: zod
+									.union([zod.record(zod.string(), zod.number()), zod.null()])
+									.optional()
+									.describe(
+										'The target-keyed reference point a solved design was found at; None for imports.'
+									),
+								import_reference_point: zod
+									.union([zod.record(zod.string(), zod.number()), zod.null()])
+									.optional()
+									.describe(
+										'The objective-keyed reference point an imported design was evaluated at.'
+									),
+								view: zod
+									.union([zod.enum(['aggregated', 'per_scenario']), zod.null()])
+									.optional()
+									.describe('View the design was solved in; None for imports.'),
+								source: zod.enum(['solve', 'import']),
+								leaf_objectives: zod
+									.record(zod.string(), zod.record(zod.string(), zod.number()))
+									.optional()
+									.describe('Objective values by leaf and objective symbol.')
+							})
+							.describe('A design in the design registry of a JINA setup.')
+					)
+				})
+				.describe('Contents of a JINA iterate state.'),
+			zod
+				.object({
+					kind: zod.literal('jina.evaluate'),
+					setup_state_id: zod.number(),
+					scenario_model_id: zod.number(),
+					design_ids: zod.array(zod.number()),
+					reference_point: zod.union([zod.record(zod.string(), zod.number()), zod.null()]),
+					outcomes: zod.record(
+						zod.string(),
+						zod.record(
+							zod.string(),
+							zod
+								.object({
+									status: zod
+										.boolean()
+										.describe('Whether the recourse problem was solved successfully.'),
+									message: zod.string().describe('Solver message.'),
+									objectives: zod
+										.record(zod.string(), zod.number())
+										.default(
+											importDesignsMethodJinaImportPostResponseResultThreeOutcomesObjectivesDefault
+										)
+										.describe('Objective values in the leaf, in their original direction.'),
+									variables: zod
+										.record(zod.string(), zod.union([zod.number(), zod.array(zod.unknown())]))
+										.default(
+											importDesignsMethodJinaImportPostResponseResultThreeOutcomesVariablesDefault
+										)
+										.describe('Variable values in the leaf.')
+								})
+								.describe('Result of evaluating a design in one leaf scenario.')
+						)
+					)
+				})
+				.describe('Contents of a JINA evaluate state.'),
+			zod
+				.object({
+					kind: zod.literal('jina.select'),
+					setup_state_id: zod.number(),
+					wishlist: zod.array(zod.number()),
+					final_design_id: zod.union([zod.number(), zod.null()])
+				})
+				.describe('Contents of a JINA select state.')
+		])
+	})
+	.describe('A JINA state and whether its background job has finished.');
+
+/**
+ * Evaluate designs in the leaves of the setup's or another scenario model of the problem in the background.
+
+See `_evaluation_point` for the reference point each design is evaluated at.  Every leaf must
+get an objective from it; otherwise ``reference_point`` must supply one.
+ * @summary Evaluate
+ */
+export const EvaluateMethodJinaEvaluatePostQueryParams = zod.object({
+	problem_id: zod.union([zod.number(), zod.null()]).optional()
+});
+
+export const EvaluateMethodJinaEvaluatePostBody = zod
+	.object({
+		problem_id: zod.number(),
+		session_id: zod.union([zod.number(), zod.null()]).optional(),
+		parent_state_id: zod.union([zod.number(), zod.null()]).optional(),
+		setup_state_id: zod.number(),
+		scenario_model_id: zod
+			.union([zod.number(), zod.null()])
+			.optional()
+			.describe("Scenario model to evaluate in. Defaults to the setup's scenario model."),
+		design_ids: zod
+			.union([zod.array(zod.number()), zod.null()])
+			.optional()
+			.describe('Designs to evaluate. Defaults to all.'),
+		reference_point: zod
+			.union([zod.record(zod.string(), zod.number()), zod.null()])
+			.optional()
+			.describe(
+				"Aspiration levels by original objective symbol for leaves a design's own reference point does not cover; overrides the reference point of imported designs."
+			)
+	})
+	.describe('Request model for the JINA evaluate endpoint.');
+
+export const evaluateMethodJinaEvaluatePostResponseResultThreeOutcomesObjectivesDefault = {};
+export const evaluateMethodJinaEvaluatePostResponseResultThreeOutcomesVariablesDefault = {};
+
+export const EvaluateMethodJinaEvaluatePostResponse = zod
+	.object({
+		state_id: zod.number(),
+		kind: zod
+			.enum([
+				'reference_point_method.solve_candidates',
+				'nimbus.solve_candidates',
+				'nimbus.save_solutions',
+				'nimbus.initialize',
+				'nimbus.final',
+				'gnimbus.optimize',
+				'gnimbus.vote',
+				'gnimbus.end',
+				'emo.run',
+				'emo.save_solutions',
+				'emo.fetch_solutions',
+				'emo.score_bands',
+				'generic.solve_intermediate',
+				'e-nautilus.stepping',
+				'e-nautilus.final',
+				'nautilus.navigate',
+				'nautilus.initialize',
+				'xnimbus.solve_candidates',
+				'xnimbus.save_solutions',
+				'xnimbus.initialize',
+				'xnimbus.final',
+				'cumulus.solve_candidates',
+				'cumulus.save_solutions',
+				'cumulus.initialize',
+				'cumulus.final',
+				'cumulus.modify',
+				'cumulus.objective_constraint',
+				'jina.setup',
+				'jina.iterate',
+				'jina.evaluate',
+				'jina.select'
+			])
+			.describe(
+				'Stores the normalized kinds `{method}.{phase}` of supported states.\n\nNote:\n    Update this when adding new states. Be sure to update `KIND_TO_STATE`\n    in this file as well.'
+			),
+		is_ready: zod.boolean(),
+		error: zod.union([zod.string(), zod.null()]).optional(),
+		result: zod.union([
+			zod
+				.object({
+					kind: zod.literal('jina.setup'),
+					scenario_model_id: zod.number(),
+					design_variables: zod.array(zod.string()),
+					measure: zod.enum(['worst_case', 'expected_value', 'cvar']),
+					cvar_alpha: zod.number(),
+					baseline_leaf: zod.union([zod.string(), zod.null()]),
+					design_rtol: zod.number(),
+					targets: zod.union([
+						zod.record(
+							zod.string(),
+							zod.array(
+								zod
+									.object({
+										symbol: zod
+											.string()
+											.describe('Objective symbol of the target in the built problem.'),
+										objective: zod.string().describe('The original objective symbol.'),
+										leaf: zod
+											.union([zod.string(), zod.null()])
+											.describe(
+												'The leaf of a per-leaf target; None for a target over all leaves.'
+											),
+										leaves: zod
+											.array(zod.string())
+											.describe('The leaves whose values the target depends on.'),
+										maximize: zod.boolean().describe('Whether the target is maximised.')
+									})
+									.describe('One scalarised quantity of a JINA problem.')
+							)
+						),
+						zod.null()
+					]),
+					ranges: zod.union([
+						zod.record(
+							zod.string(),
+							zod.record(zod.string(), zod.tuple([zod.number(), zod.number()]))
+						),
+						zod.null()
+					])
+				})
+				.describe('Contents of a JINA setup state.'),
+			zod
+				.object({
+					kind: zod.literal('jina.iterate'),
+					setup_state_id: zod.number(),
+					mode: zod.enum(['solve', 'pool', 'import']),
+					view: zod.union([zod.enum(['aggregated', 'per_scenario']), zod.null()]),
+					reference_point: zod.record(zod.string(), zod.number()),
+					results: zod.array(
+						zod
+							.object({
+								name: zod.string().describe("Variant name, pool scorer name or 'row_<i>'."),
+								success: zod.boolean(),
+								message: zod.string(),
+								effective_reference_point: zod.record(zod.string(), zod.number()).optional(),
+								target_values: zod.record(zod.string(), zod.number()).optional(),
+								alpha: zod.union([zod.number(), zod.null()]).optional(),
+								binding: zod.array(zod.string()).optional(),
+								design_id: zod
+									.union([zod.number(), zod.null()])
+									.optional()
+									.describe('Registry id of the resulting design.')
+							})
+							.describe('Result of one variant, pool scorer or imported row of an iterate state.')
+					),
+					new_design_ids: zod.array(zod.number()),
+					designs: zod.array(
+						zod
+							.object({
+								id: zod.number().describe('Id of the design, unique within the registry.'),
+								values: zod
+									.record(
+										zod.string(),
+										zod.union([
+											zod.number(),
+											zod.array(zod.number()),
+											zod.array(zod.array(zod.number()))
+										])
+									)
+									.describe('Design variable values.'),
+								effective_reference_point: zod
+									.union([zod.record(zod.string(), zod.number()), zod.null()])
+									.optional()
+									.describe(
+										'The target-keyed reference point a solved design was found at; None for imports.'
+									),
+								import_reference_point: zod
+									.union([zod.record(zod.string(), zod.number()), zod.null()])
+									.optional()
+									.describe(
+										'The objective-keyed reference point an imported design was evaluated at.'
+									),
+								view: zod
+									.union([zod.enum(['aggregated', 'per_scenario']), zod.null()])
+									.optional()
+									.describe('View the design was solved in; None for imports.'),
+								source: zod.enum(['solve', 'import']),
+								leaf_objectives: zod
+									.record(zod.string(), zod.record(zod.string(), zod.number()))
+									.optional()
+									.describe('Objective values by leaf and objective symbol.')
+							})
+							.describe('A design in the design registry of a JINA setup.')
+					)
+				})
+				.describe('Contents of a JINA iterate state.'),
+			zod
+				.object({
+					kind: zod.literal('jina.evaluate'),
+					setup_state_id: zod.number(),
+					scenario_model_id: zod.number(),
+					design_ids: zod.array(zod.number()),
+					reference_point: zod.union([zod.record(zod.string(), zod.number()), zod.null()]),
+					outcomes: zod.record(
+						zod.string(),
+						zod.record(
+							zod.string(),
+							zod
+								.object({
+									status: zod
+										.boolean()
+										.describe('Whether the recourse problem was solved successfully.'),
+									message: zod.string().describe('Solver message.'),
+									objectives: zod
+										.record(zod.string(), zod.number())
+										.default(
+											evaluateMethodJinaEvaluatePostResponseResultThreeOutcomesObjectivesDefault
+										)
+										.describe('Objective values in the leaf, in their original direction.'),
+									variables: zod
+										.record(zod.string(), zod.union([zod.number(), zod.array(zod.unknown())]))
+										.default(
+											evaluateMethodJinaEvaluatePostResponseResultThreeOutcomesVariablesDefault
+										)
+										.describe('Variable values in the leaf.')
+								})
+								.describe('Result of evaluating a design in one leaf scenario.')
+						)
+					)
+				})
+				.describe('Contents of a JINA evaluate state.'),
+			zod
+				.object({
+					kind: zod.literal('jina.select'),
+					setup_state_id: zod.number(),
+					wishlist: zod.array(zod.number()),
+					final_design_id: zod.union([zod.number(), zod.null()])
+				})
+				.describe('Contents of a JINA select state.')
+		])
+	})
+	.describe('A JINA state and whether its background job has finished.');
+
+/**
+ * Return a JINA state and whether its background job has finished.
+ * @summary Get Status
+ */
+export const GetStatusMethodJinaStatusStateIdGetParams = zod.object({
+	state_id: zod.number()
+});
+
+export const getStatusMethodJinaStatusStateIdGetResponseResultThreeOutcomesObjectivesDefault = {};
+export const getStatusMethodJinaStatusStateIdGetResponseResultThreeOutcomesVariablesDefault = {};
+
+export const GetStatusMethodJinaStatusStateIdGetResponse = zod
+	.object({
+		state_id: zod.number(),
+		kind: zod
+			.enum([
+				'reference_point_method.solve_candidates',
+				'nimbus.solve_candidates',
+				'nimbus.save_solutions',
+				'nimbus.initialize',
+				'nimbus.final',
+				'gnimbus.optimize',
+				'gnimbus.vote',
+				'gnimbus.end',
+				'emo.run',
+				'emo.save_solutions',
+				'emo.fetch_solutions',
+				'emo.score_bands',
+				'generic.solve_intermediate',
+				'e-nautilus.stepping',
+				'e-nautilus.final',
+				'nautilus.navigate',
+				'nautilus.initialize',
+				'xnimbus.solve_candidates',
+				'xnimbus.save_solutions',
+				'xnimbus.initialize',
+				'xnimbus.final',
+				'cumulus.solve_candidates',
+				'cumulus.save_solutions',
+				'cumulus.initialize',
+				'cumulus.final',
+				'cumulus.modify',
+				'cumulus.objective_constraint',
+				'jina.setup',
+				'jina.iterate',
+				'jina.evaluate',
+				'jina.select'
+			])
+			.describe(
+				'Stores the normalized kinds `{method}.{phase}` of supported states.\n\nNote:\n    Update this when adding new states. Be sure to update `KIND_TO_STATE`\n    in this file as well.'
+			),
+		is_ready: zod.boolean(),
+		error: zod.union([zod.string(), zod.null()]).optional(),
+		result: zod.union([
+			zod
+				.object({
+					kind: zod.literal('jina.setup'),
+					scenario_model_id: zod.number(),
+					design_variables: zod.array(zod.string()),
+					measure: zod.enum(['worst_case', 'expected_value', 'cvar']),
+					cvar_alpha: zod.number(),
+					baseline_leaf: zod.union([zod.string(), zod.null()]),
+					design_rtol: zod.number(),
+					targets: zod.union([
+						zod.record(
+							zod.string(),
+							zod.array(
+								zod
+									.object({
+										symbol: zod
+											.string()
+											.describe('Objective symbol of the target in the built problem.'),
+										objective: zod.string().describe('The original objective symbol.'),
+										leaf: zod
+											.union([zod.string(), zod.null()])
+											.describe(
+												'The leaf of a per-leaf target; None for a target over all leaves.'
+											),
+										leaves: zod
+											.array(zod.string())
+											.describe('The leaves whose values the target depends on.'),
+										maximize: zod.boolean().describe('Whether the target is maximised.')
+									})
+									.describe('One scalarised quantity of a JINA problem.')
+							)
+						),
+						zod.null()
+					]),
+					ranges: zod.union([
+						zod.record(
+							zod.string(),
+							zod.record(zod.string(), zod.tuple([zod.number(), zod.number()]))
+						),
+						zod.null()
+					])
+				})
+				.describe('Contents of a JINA setup state.'),
+			zod
+				.object({
+					kind: zod.literal('jina.iterate'),
+					setup_state_id: zod.number(),
+					mode: zod.enum(['solve', 'pool', 'import']),
+					view: zod.union([zod.enum(['aggregated', 'per_scenario']), zod.null()]),
+					reference_point: zod.record(zod.string(), zod.number()),
+					results: zod.array(
+						zod
+							.object({
+								name: zod.string().describe("Variant name, pool scorer name or 'row_<i>'."),
+								success: zod.boolean(),
+								message: zod.string(),
+								effective_reference_point: zod.record(zod.string(), zod.number()).optional(),
+								target_values: zod.record(zod.string(), zod.number()).optional(),
+								alpha: zod.union([zod.number(), zod.null()]).optional(),
+								binding: zod.array(zod.string()).optional(),
+								design_id: zod
+									.union([zod.number(), zod.null()])
+									.optional()
+									.describe('Registry id of the resulting design.')
+							})
+							.describe('Result of one variant, pool scorer or imported row of an iterate state.')
+					),
+					new_design_ids: zod.array(zod.number()),
+					designs: zod.array(
+						zod
+							.object({
+								id: zod.number().describe('Id of the design, unique within the registry.'),
+								values: zod
+									.record(
+										zod.string(),
+										zod.union([
+											zod.number(),
+											zod.array(zod.number()),
+											zod.array(zod.array(zod.number()))
+										])
+									)
+									.describe('Design variable values.'),
+								effective_reference_point: zod
+									.union([zod.record(zod.string(), zod.number()), zod.null()])
+									.optional()
+									.describe(
+										'The target-keyed reference point a solved design was found at; None for imports.'
+									),
+								import_reference_point: zod
+									.union([zod.record(zod.string(), zod.number()), zod.null()])
+									.optional()
+									.describe(
+										'The objective-keyed reference point an imported design was evaluated at.'
+									),
+								view: zod
+									.union([zod.enum(['aggregated', 'per_scenario']), zod.null()])
+									.optional()
+									.describe('View the design was solved in; None for imports.'),
+								source: zod.enum(['solve', 'import']),
+								leaf_objectives: zod
+									.record(zod.string(), zod.record(zod.string(), zod.number()))
+									.optional()
+									.describe('Objective values by leaf and objective symbol.')
+							})
+							.describe('A design in the design registry of a JINA setup.')
+					)
+				})
+				.describe('Contents of a JINA iterate state.'),
+			zod
+				.object({
+					kind: zod.literal('jina.evaluate'),
+					setup_state_id: zod.number(),
+					scenario_model_id: zod.number(),
+					design_ids: zod.array(zod.number()),
+					reference_point: zod.union([zod.record(zod.string(), zod.number()), zod.null()]),
+					outcomes: zod.record(
+						zod.string(),
+						zod.record(
+							zod.string(),
+							zod
+								.object({
+									status: zod
+										.boolean()
+										.describe('Whether the recourse problem was solved successfully.'),
+									message: zod.string().describe('Solver message.'),
+									objectives: zod
+										.record(zod.string(), zod.number())
+										.default(
+											getStatusMethodJinaStatusStateIdGetResponseResultThreeOutcomesObjectivesDefault
+										)
+										.describe('Objective values in the leaf, in their original direction.'),
+									variables: zod
+										.record(zod.string(), zod.union([zod.number(), zod.array(zod.unknown())]))
+										.default(
+											getStatusMethodJinaStatusStateIdGetResponseResultThreeOutcomesVariablesDefault
+										)
+										.describe('Variable values in the leaf.')
+								})
+								.describe('Result of evaluating a design in one leaf scenario.')
+						)
+					)
+				})
+				.describe('Contents of a JINA evaluate state.'),
+			zod
+				.object({
+					kind: zod.literal('jina.select'),
+					setup_state_id: zod.number(),
+					wishlist: zod.array(zod.number()),
+					final_design_id: zod.union([zod.number(), zod.null()])
+				})
+				.describe('Contents of a JINA select state.')
+		])
+	})
+	.describe('A JINA state and whether its background job has finished.');
+
+/**
+ * Store the wishlist and the final design of the decision maker.
+ * @summary Select Designs
+ */
+export const SelectDesignsMethodJinaSelectPostQueryParams = zod.object({
+	problem_id: zod.union([zod.number(), zod.null()]).optional()
+});
+
+export const SelectDesignsMethodJinaSelectPostBody = zod
+	.object({
+		problem_id: zod.number(),
+		session_id: zod.union([zod.number(), zod.null()]).optional(),
+		parent_state_id: zod.union([zod.number(), zod.null()]).optional(),
+		setup_state_id: zod.number(),
+		wishlist: zod.array(zod.number()).optional(),
+		final_design_id: zod.union([zod.number(), zod.null()]).optional()
+	})
+	.describe('Request model for the JINA select endpoint.');
+
+export const selectDesignsMethodJinaSelectPostResponseResultThreeOutcomesObjectivesDefault = {};
+export const selectDesignsMethodJinaSelectPostResponseResultThreeOutcomesVariablesDefault = {};
+
+export const SelectDesignsMethodJinaSelectPostResponse = zod
+	.object({
+		state_id: zod.number(),
+		kind: zod
+			.enum([
+				'reference_point_method.solve_candidates',
+				'nimbus.solve_candidates',
+				'nimbus.save_solutions',
+				'nimbus.initialize',
+				'nimbus.final',
+				'gnimbus.optimize',
+				'gnimbus.vote',
+				'gnimbus.end',
+				'emo.run',
+				'emo.save_solutions',
+				'emo.fetch_solutions',
+				'emo.score_bands',
+				'generic.solve_intermediate',
+				'e-nautilus.stepping',
+				'e-nautilus.final',
+				'nautilus.navigate',
+				'nautilus.initialize',
+				'xnimbus.solve_candidates',
+				'xnimbus.save_solutions',
+				'xnimbus.initialize',
+				'xnimbus.final',
+				'cumulus.solve_candidates',
+				'cumulus.save_solutions',
+				'cumulus.initialize',
+				'cumulus.final',
+				'cumulus.modify',
+				'cumulus.objective_constraint',
+				'jina.setup',
+				'jina.iterate',
+				'jina.evaluate',
+				'jina.select'
+			])
+			.describe(
+				'Stores the normalized kinds `{method}.{phase}` of supported states.\n\nNote:\n    Update this when adding new states. Be sure to update `KIND_TO_STATE`\n    in this file as well.'
+			),
+		is_ready: zod.boolean(),
+		error: zod.union([zod.string(), zod.null()]).optional(),
+		result: zod.union([
+			zod
+				.object({
+					kind: zod.literal('jina.setup'),
+					scenario_model_id: zod.number(),
+					design_variables: zod.array(zod.string()),
+					measure: zod.enum(['worst_case', 'expected_value', 'cvar']),
+					cvar_alpha: zod.number(),
+					baseline_leaf: zod.union([zod.string(), zod.null()]),
+					design_rtol: zod.number(),
+					targets: zod.union([
+						zod.record(
+							zod.string(),
+							zod.array(
+								zod
+									.object({
+										symbol: zod
+											.string()
+											.describe('Objective symbol of the target in the built problem.'),
+										objective: zod.string().describe('The original objective symbol.'),
+										leaf: zod
+											.union([zod.string(), zod.null()])
+											.describe(
+												'The leaf of a per-leaf target; None for a target over all leaves.'
+											),
+										leaves: zod
+											.array(zod.string())
+											.describe('The leaves whose values the target depends on.'),
+										maximize: zod.boolean().describe('Whether the target is maximised.')
+									})
+									.describe('One scalarised quantity of a JINA problem.')
+							)
+						),
+						zod.null()
+					]),
+					ranges: zod.union([
+						zod.record(
+							zod.string(),
+							zod.record(zod.string(), zod.tuple([zod.number(), zod.number()]))
+						),
+						zod.null()
+					])
+				})
+				.describe('Contents of a JINA setup state.'),
+			zod
+				.object({
+					kind: zod.literal('jina.iterate'),
+					setup_state_id: zod.number(),
+					mode: zod.enum(['solve', 'pool', 'import']),
+					view: zod.union([zod.enum(['aggregated', 'per_scenario']), zod.null()]),
+					reference_point: zod.record(zod.string(), zod.number()),
+					results: zod.array(
+						zod
+							.object({
+								name: zod.string().describe("Variant name, pool scorer name or 'row_<i>'."),
+								success: zod.boolean(),
+								message: zod.string(),
+								effective_reference_point: zod.record(zod.string(), zod.number()).optional(),
+								target_values: zod.record(zod.string(), zod.number()).optional(),
+								alpha: zod.union([zod.number(), zod.null()]).optional(),
+								binding: zod.array(zod.string()).optional(),
+								design_id: zod
+									.union([zod.number(), zod.null()])
+									.optional()
+									.describe('Registry id of the resulting design.')
+							})
+							.describe('Result of one variant, pool scorer or imported row of an iterate state.')
+					),
+					new_design_ids: zod.array(zod.number()),
+					designs: zod.array(
+						zod
+							.object({
+								id: zod.number().describe('Id of the design, unique within the registry.'),
+								values: zod
+									.record(
+										zod.string(),
+										zod.union([
+											zod.number(),
+											zod.array(zod.number()),
+											zod.array(zod.array(zod.number()))
+										])
+									)
+									.describe('Design variable values.'),
+								effective_reference_point: zod
+									.union([zod.record(zod.string(), zod.number()), zod.null()])
+									.optional()
+									.describe(
+										'The target-keyed reference point a solved design was found at; None for imports.'
+									),
+								import_reference_point: zod
+									.union([zod.record(zod.string(), zod.number()), zod.null()])
+									.optional()
+									.describe(
+										'The objective-keyed reference point an imported design was evaluated at.'
+									),
+								view: zod
+									.union([zod.enum(['aggregated', 'per_scenario']), zod.null()])
+									.optional()
+									.describe('View the design was solved in; None for imports.'),
+								source: zod.enum(['solve', 'import']),
+								leaf_objectives: zod
+									.record(zod.string(), zod.record(zod.string(), zod.number()))
+									.optional()
+									.describe('Objective values by leaf and objective symbol.')
+							})
+							.describe('A design in the design registry of a JINA setup.')
+					)
+				})
+				.describe('Contents of a JINA iterate state.'),
+			zod
+				.object({
+					kind: zod.literal('jina.evaluate'),
+					setup_state_id: zod.number(),
+					scenario_model_id: zod.number(),
+					design_ids: zod.array(zod.number()),
+					reference_point: zod.union([zod.record(zod.string(), zod.number()), zod.null()]),
+					outcomes: zod.record(
+						zod.string(),
+						zod.record(
+							zod.string(),
+							zod
+								.object({
+									status: zod
+										.boolean()
+										.describe('Whether the recourse problem was solved successfully.'),
+									message: zod.string().describe('Solver message.'),
+									objectives: zod
+										.record(zod.string(), zod.number())
+										.default(
+											selectDesignsMethodJinaSelectPostResponseResultThreeOutcomesObjectivesDefault
+										)
+										.describe('Objective values in the leaf, in their original direction.'),
+									variables: zod
+										.record(zod.string(), zod.union([zod.number(), zod.array(zod.unknown())]))
+										.default(
+											selectDesignsMethodJinaSelectPostResponseResultThreeOutcomesVariablesDefault
+										)
+										.describe('Variable values in the leaf.')
+								})
+								.describe('Result of evaluating a design in one leaf scenario.')
+						)
+					)
+				})
+				.describe('Contents of a JINA evaluate state.'),
+			zod
+				.object({
+					kind: zod.literal('jina.select'),
+					setup_state_id: zod.number(),
+					wishlist: zod.array(zod.number()),
+					final_design_id: zod.union([zod.number(), zod.null()])
+				})
+				.describe('Contents of a JINA select state.')
+		])
+	})
+	.describe('A JINA state and whether its background job has finished.');
+
+/**
+ * Compute max regret, the domain criterion and, with a baseline leaf, antifragility of evaluated designs.
+
+The thresholds are those of the domain criterion; the absolute and loss floors set the Taleb classes of
+the antifragility.
+
+Leaves where a design failed are missing outcomes, treated by the metrics' default policy.  The
+antifragility is None when the setup has no baseline leaf or no design has an outcome in it.
+ * @summary Analysis
+ */
+export const AnalysisMethodJinaAnalysisPostQueryParams = zod.object({
+	problem_id: zod.union([zod.number(), zod.null()]).optional()
+});
+
+export const AnalysisMethodJinaAnalysisPostBody = zod
+	.object({
+		problem_id: zod.number(),
+		session_id: zod.union([zod.number(), zod.null()]).optional(),
+		parent_state_id: zod.union([zod.number(), zod.null()]).optional(),
+		setup_state_id: zod.number(),
+		evaluate_state_id: zod
+			.number()
+			.describe('The StateDB id of the evaluate state whose outcomes are analysed.'),
+		design_ids: zod
+			.union([zod.array(zod.number()), zod.null()])
+			.optional()
+			.describe('Designs to compare. Defaults to all evaluated.'),
+		thresholds: zod
+			.record(zod.string(), zod.number())
+			.optional()
+			.describe('Domain-criterion thresholds by objective, original direction.'),
+		absolute_floors: zod
+			.union([zod.record(zod.string(), zod.number()), zod.null()])
+			.optional()
+			.describe(
+				'Worst acceptable outcome by objective for the antifragility classes, original direction.'
+			),
+		loss_floors: zod
+			.union([zod.record(zod.string(), zod.number()), zod.null()])
+			.optional()
+			.describe(
+				'Largest acceptable loss relative to the baseline leaf by objective, in original units.'
+			)
+	})
+	.describe('Request model for the JINA robustness analysis endpoint.');
+
+export const AnalysisMethodJinaAnalysisPostResponse = zod
+	.object({
+		max_regret: zod.record(
+			zod.string(),
+			zod
+				.object({
+					regret: zod.record(zod.string(), zod.union([zod.number(), zod.null()])),
+					mean_regret: zod.union([zod.number(), zod.null()])
+				})
+				.describe('Per-design maximum regret summary.')
+		),
+		domain_criterion: zod.record(
+			zod.string(),
+			zod
+				.object({
+					counts: zod.record(zod.string(), zod.number()),
+					mean_count: zod.union([zod.number(), zod.null()])
+				})
+				.describe('Per-design domain-criterion counts.')
+		),
+		antifragility: zod
+			.union([
+				zod.record(
+					zod.string(),
+					zod
+						.object({
+							objectives: zod.record(
+								zod.string(),
+								zod
+									.object({
+										upside: zod.union([zod.number(), zod.null()]),
+										downside: zod.union([zod.number(), zod.null()]),
+										antifragility: zod.union([zod.number(), zod.null()]),
+										n_gain: zod.number(),
+										n_loss: zod.number(),
+										upside_raw: zod.union([zod.number(), zod.null()]),
+										downside_raw: zod.union([zod.number(), zod.null()]),
+										max_loss_raw: zod.union([zod.number(), zod.null()]),
+										best_gain_leaf: zod.union([zod.string(), zod.null()]),
+										worst_loss_leaf: zod.union([zod.string(), zod.null()]),
+										worst_outcome: zod.union([zod.number(), zod.null()]),
+										taleb_class: zod.union([
+											zod.enum(['fragile', 'robust', 'antifragile']),
+											zod.null()
+										]),
+										deviations: zod.array(
+											zod
+												.object({
+													leaf: zod.string(),
+													value: zod.number(),
+													improvement: zod.number(),
+													improvement_raw: zod.number(),
+													event_class: zod.enum(['gain', 'untouched', 'bounded_loss', 'fragile'])
+												})
+												.describe('Deviation of one design and objective in one non-baseline leaf.')
+										)
+									})
+									.describe('Antifragility summary for one objective of one design.')
+							)
+						})
+						.describe('Antifragility results for a single design.')
+				),
+				zod.null()
+			])
+			.optional()
+			.describe('None when the setup has no baseline leaf in the evaluated outcomes.'),
+		antifragile_objectives: zod.union([zod.array(zod.string()), zod.null()]).optional()
+	})
+	.describe('Robustness metrics of evaluated designs, by design id.');
+
+/**
+ * List the design registry of a setup with the target values of each design in both views.
+ * @summary Get Designs
+ */
+export const GetDesignsMethodJinaDesignsGetQueryParams = zod.object({
+	setup_state_id: zod.number(),
+	problem_id: zod.union([zod.number(), zod.null()]).optional(),
+	session_id: zod.union([zod.number(), zod.null()]).optional()
+});
+
+export const GetDesignsMethodJinaDesignsGetResponseItem = zod
+	.object({
+		id: zod.number().describe('Id of the design, unique within the registry.'),
+		values: zod
+			.record(
+				zod.string(),
+				zod.union([zod.number(), zod.array(zod.number()), zod.array(zod.array(zod.number()))])
+			)
+			.describe('Design variable values.'),
+		effective_reference_point: zod
+			.union([zod.record(zod.string(), zod.number()), zod.null()])
+			.optional()
+			.describe('The target-keyed reference point a solved design was found at; None for imports.'),
+		import_reference_point: zod
+			.union([zod.record(zod.string(), zod.number()), zod.null()])
+			.optional()
+			.describe('The objective-keyed reference point an imported design was evaluated at.'),
+		view: zod
+			.union([zod.enum(['aggregated', 'per_scenario']), zod.null()])
+			.optional()
+			.describe('View the design was solved in; None for imports.'),
+		source: zod.enum(['solve', 'import']),
+		leaf_objectives: zod
+			.record(zod.string(), zod.record(zod.string(), zod.number()))
+			.optional()
+			.describe('Objective values by leaf and objective symbol.'),
+		state_id: zod.number().describe('The StateDB id of the iterate state that added the design.'),
+		target_values: zod
+			.record(zod.string(), zod.record(zod.string(), zod.number()))
+			.describe('Target values by view and target symbol.')
+	})
+	.describe('A design of the registry with the state it was found in and its target values.');
+export const GetDesignsMethodJinaDesignsGetResponse = zod.array(
+	GetDesignsMethodJinaDesignsGetResponseItem
+);
 
 /**
  * Solve intermediate solutions between given two solutions.
@@ -10049,6 +12115,14 @@ export const GetOrInitializeGdmScoreBandsGetOrInitializePostResponse = zod
 									.describe(
 										'Optional dictionary mapping cluster IDs to hover information for display in the visualization.\nIf None, no additional hover information is displayed. Defaults to None.'
 									),
+								cluster_extremes: zod
+									.record(
+										zod.string(),
+										zod.record(zod.string(), zod.tuple([zod.number(), zod.number()]))
+									)
+									.describe(
+										'Map cluster IDs to dictionaries of objective names and their corresponding extreme values (min, max).'
+									),
 								axis_positions: zod
 									.record(zod.string(), zod.number())
 									.describe(
@@ -10525,9 +12599,10 @@ export const GetSolutionDescriptionSolutionDescriptionGetPostResponse = zod
 /**
  * Add a new solution description metadata instance for a problem.
 
-Validates that all expressions in the parts are parseable, then appends the
-new metadata to the database. The most recent entry is used when generating
-descriptions, so this effectively updates what description is produced.
+Validates that all expressions in the parts are parseable and only refer to symbols the
+problem's solutions provide, then appends the new metadata to the database. The most
+recent entry is used when generating descriptions, so this effectively updates what
+description is produced.
 
 Args:
     request: the problem id and new description metadata.

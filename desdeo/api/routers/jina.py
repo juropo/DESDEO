@@ -1,5 +1,6 @@
 """Defines end-points of the JINA method for finding designs of scenario-based problems."""
 
+import logging
 import threading
 from collections import OrderedDict
 from typing import Annotated
@@ -63,6 +64,7 @@ from desdeo.tools.scenario_designs import (
 from .utils import ContextField, SessionContext, SessionContextGuard, _may_access_state, load_scenario_model
 
 router = APIRouter(prefix="/method/jina")
+logger = logging.getLogger(__name__)
 
 VIEWS: tuple[View, ...] = ("aggregated", "per_scenario")
 
@@ -495,20 +497,29 @@ def _run_evaluate(bind: Engine, setup_id: int, evaluate_id: int, solver: type[Ba
 def get_scenario_models(
     context: Annotated[SessionContext, Depends(SessionContextGuard(require=[ContextField.PROBLEM]).get)],
 ) -> list[JinaScenarioModelInfo]:
-    """List the scenario models of a problem."""
+    """List the scenario models of a problem; models that fail to load are left out."""
     infos = []
-    for sm_db in context.problem_db.scenario_models:
-        # The leaves of `ScenarioModel.leaf_scenarios`.
-        leaves = [
-            node
-            for node, children in sm_db.scenario_tree.items()
-            if node != "ROOT" and not children and node in sm_db.scenarios
-        ]
-        infos.append(
-            JinaScenarioModelInfo(
-                id=sm_db.id, leaves=leaves, n_leaves=len(leaves), has_probabilities=bool(sm_db.scenario_probabilities)
+    for sm_db in list(context.problem_db.scenario_models):
+        try:
+            model = load_scenario_model(sm_db.id, context.db_session)
+            root = root_variables(model)
+            leaves = list(model.leaf_scenarios)
+            infos.append(
+                JinaScenarioModelInfo(
+                    id=sm_db.id,
+                    leaves=leaves,
+                    n_leaves=len(leaves),
+                    has_probabilities=bool(sm_db.scenario_probabilities),
+                    root_variables=root,
+                    default_design_variables=default_design_variables(model) if root else [],
+                    objectives=list(
+                        dict.fromkeys(obj.symbol for obj in [*model.base_problem.objectives, *model.objectives])
+                    ),
+                )
             )
-        )
+        except Exception:
+            logger.exception("Scenario model %s of problem %s failed to load.", sm_db.id, context.problem_db.id)
+            context.db_session.rollback()
     return infos
 
 
@@ -797,6 +808,9 @@ def analysis(
 ) -> JinaAnalysisResponse:
     """Compute max regret, the domain criterion and, with a baseline leaf, antifragility of evaluated designs.
 
+    The thresholds are those of the domain criterion; the absolute and loss floors set the Taleb classes of
+    the antifragility.
+
     Leaves where a design failed are missing outcomes, treated by the metrics' default policy.  The
     antifragility is None when the setup has no baseline leaf or no design has an outcome in it.
     """
@@ -822,14 +836,20 @@ def analysis(
     model = load_scenario_model(evaluated.scenario_model_id, context.db_session)
     maximize = {obj.symbol: obj.maximize for obj in [*model.objectives, *model.base_problem.objectives]}
 
+    fragility = None
     try:
         regret = max_regret(values, maximize)
         domain = domain_criterion(values, maximize, request.thresholds)
+        if setup.baseline_leaf is not None and any(setup.baseline_leaf in leaves for leaves in values.values()):
+            fragility = antifragility(
+                values,
+                maximize,
+                setup.baseline_leaf,
+                absolute_floors=request.absolute_floors,
+                loss_floors=request.loss_floors,
+            )
     except ValueError as e:
         raise _unprocessable(str(e)) from e
-    fragility = None
-    if setup.baseline_leaf is not None and any(setup.baseline_leaf in leaves for leaves in values.values()):
-        fragility = antifragility(values, maximize, setup.baseline_leaf)
     return JinaAnalysisResponse(
         max_regret=regret,
         domain_criterion=domain,

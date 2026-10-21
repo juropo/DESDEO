@@ -107,6 +107,14 @@ class JinaAnalysisRequest(JinaSessionRequest):
     thresholds: dict[str, FiniteFloat] = Field(
         default_factory=dict, description="Domain-criterion thresholds by objective, original direction."
     )
+    absolute_floors: dict[str, FiniteFloat] | None = Field(
+        default=None,
+        description="Worst acceptable outcome by objective for the antifragility classes, original direction.",
+    )
+    loss_floors: dict[str, FiniteFloat] | None = Field(
+        default=None,
+        description="Largest acceptable loss relative to the baseline leaf by objective, in original units.",
+    )
 
 
 class JinaScenarioModelInfo(BaseModel):
@@ -116,6 +124,9 @@ class JinaScenarioModelInfo(BaseModel):
     leaves: list[str]
     n_leaves: int
     has_probabilities: bool
+    root_variables: list[str] = Field(description="Variables shared by all scenarios, the candidate design variables.")
+    default_design_variables: list[str] = Field(description="The design variables a setup defaults to.")
+    objectives: list[str] = Field(description="Symbols of the objectives of the scenario model.")
 
 
 class JinaDesign(BaseModel):

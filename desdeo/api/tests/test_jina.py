@@ -128,7 +128,7 @@ def _setup(client: TestClient, token: str, problem_id: int, **kwargs) -> dict:
     return _post_ready(client, token, "setup", {"problem_id": problem_id, **kwargs})
 
 
-def test_scenario_models(client: TestClient, session_and_user: dict):
+def test_scenario_models(client: TestClient, session_and_user: dict, monkeypatch: pytest.MonkeyPatch):
     """The scenario models of a problem are listed with their leaves, and their ids are on the problem info."""
     seeded = _seed(session_and_user)
     token = login(client)
@@ -136,9 +136,38 @@ def test_scenario_models(client: TestClient, session_and_user: dict):
     response = get_json(client, f"{URL}/scenario-models?problem_id={seeded['problem_id']}", token)
     assert response.status_code == status.HTTP_200_OK
     assert response.json() == [
-        {"id": seeded["sm_id"], "leaves": ["s_1", "s_2", "s_3"], "n_leaves": 3, "has_probabilities": True},
-        {"id": seeded["stress_id"], "leaves": ["t_1", "t_2"], "n_leaves": 2, "has_probabilities": True},
+        {
+            "id": seeded["sm_id"],
+            "leaves": ["s_1", "s_2", "s_3"],
+            "n_leaves": 3,
+            "has_probabilities": True,
+            "root_variables": ["x_1"],
+            "default_design_variables": ["x_1"],
+            "objectives": ["f_3", "f_1", "f_2"],
+        },
+        {
+            "id": seeded["stress_id"],
+            "leaves": ["t_1", "t_2"],
+            "n_leaves": 2,
+            "has_probabilities": True,
+            "root_variables": ["x_1"],
+            "default_design_variables": ["x_1"],
+            "objectives": ["f_3", "f_1", "f_2"],
+        },
     ]
+
+    # A scenario model that fails to load is left out.
+    load = jina_router.load_scenario_model
+
+    def failing_load(scenario_model_id: int, db_session: Session) -> ScenarioModel | None:
+        if scenario_model_id == seeded["stress_id"]:
+            raise ValueError("broken")
+        return load(scenario_model_id, db_session)
+
+    monkeypatch.setattr(jina_router, "load_scenario_model", failing_load)
+    response = get_json(client, f"{URL}/scenario-models?problem_id={seeded['problem_id']}", token)
+    assert [info["id"] for info in response.json()] == [seeded["sm_id"]]
+    monkeypatch.undo()
 
     info = get_json(client, f"/problem/{seeded['problem_id']}", token).json()
     assert info["scenario_model_ids"] == [seeded["sm_id"], seeded["stress_id"]]
@@ -367,6 +396,48 @@ def test_analysis_with_baseline(client: TestClient, session_and_user: dict):
     assert set(analysis["antifragility"]) == set(analysis["max_regret"])
     assert set(analysis["antifragility"]["1"]["objectives"]) == {"f_1", "f_2", "f_3"}
     assert isinstance(analysis["antifragile_objectives"], list)
+    assert all(
+        summary["taleb_class"] is None
+        for result in analysis["antifragility"].values()
+        for summary in result["objectives"].values()
+    )
+
+    # Thresholds alone set no classes; all objectives are minimised, so loose absolute floors breach nothing.
+    summaries = {
+        (design_id, obj): summary
+        for design_id, result in analysis["antifragility"].items()
+        for obj, summary in result["objectives"].items()
+    }
+    loose = {
+        obj: max(s["worst_outcome"] for (_, o), s in summaries.items() if o == obj) + 1.0
+        for obj in ("f_1", "f_2", "f_3")
+    }
+    analysis_request = request | {"evaluate_state_id": evaluate_id, "thresholds": loose}
+    response = post_json(client, f"{URL}/analysis", analysis_request, token)
+    assert response.status_code == status.HTTP_200_OK, response.text
+    assert all(
+        summary["taleb_class"] is None
+        for result in response.json()["antifragility"].values()
+        for summary in result["objectives"].values()
+    )
+    analysis_request = request | {"evaluate_state_id": evaluate_id, "absolute_floors": loose}
+    response = post_json(client, f"{URL}/analysis", analysis_request, token)
+    assert response.status_code == status.HTTP_200_OK, response.text
+    floored = response.json()["antifragility"]
+    for (design_id, obj), summary in summaries.items():
+        expected = "antifragile" if summary["n_gain"] > 0 else "robust"
+        assert floored[design_id]["objectives"][obj]["taleb_class"] == expected
+
+    # A loss floor below a design's largest loss makes it fragile in that objective.
+    (design_id, obj), summary = next(((key, s) for key, s in summaries.items() if s["max_loss_raw"] > 0))
+    loss_floors = {obj: summary["max_loss_raw"] / 2}
+    response = post_json(client, f"{URL}/analysis", analysis_request | {"loss_floors": loss_floors}, token)
+    assert response.status_code == status.HTTP_200_OK, response.text
+    assert response.json()["antifragility"][design_id]["objectives"][obj]["taleb_class"] == "fragile"
+
+    for floors in ("absolute_floors", "loss_floors"):
+        response = post_json(client, f"{URL}/analysis", analysis_request | {floors: {"nope": 1.0}}, token)
+        assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
 
 
 def test_status_errors(client: TestClient, session_and_user: dict):

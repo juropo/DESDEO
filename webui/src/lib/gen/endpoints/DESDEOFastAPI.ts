@@ -6,6 +6,54 @@
  * OpenAPI spec version: 0.1.0
  */
 import { customFetch } from '../../api/new-client';
+export type DeviationEventClass = (typeof DeviationEventClass)[keyof typeof DeviationEventClass];
+
+export const DeviationEventClass = {
+	gain: 'gain',
+	untouched: 'untouched',
+	bounded_loss: 'bounded_loss',
+	fragile: 'fragile'
+} as const;
+
+/**
+ * Deviation of one design and objective in one non-baseline leaf.
+ */
+export interface Deviation {
+	leaf: string;
+	value: number;
+	improvement: number;
+	improvement_raw: number;
+	event_class: DeviationEventClass;
+}
+
+/**
+ * Antifragility summary for one objective of one design.
+ */
+export interface ObjectiveAntifragility {
+	upside: number | null;
+	downside: number | null;
+	antifragility: number | null;
+	n_gain: number;
+	n_loss: number;
+	upside_raw: number | null;
+	downside_raw: number | null;
+	max_loss_raw: number | null;
+	best_gain_leaf: string | null;
+	worst_loss_leaf: string | null;
+	worst_outcome: number | null;
+	taleb_class: 'fragile' | 'robust' | 'antifragile' | null;
+	deviations: Deviation[];
+}
+
+export type AntifragilityObjectives = { [key: string]: ObjectiveAntifragility };
+
+/**
+ * Antifragility results for a single design.
+ */
+export interface Antifragility {
+	objectives: AntifragilityObjectives;
+}
+
 export interface BodyAddNewAnalystAddNewAnalystPost {
 	grant_type?: string | null;
 	username: string;
@@ -51,6 +99,8 @@ export interface RPMSolveRequest {
 	solver?: string | null;
 	solver_options?: RPMSolveRequestSolverOptions;
 	preference?: ReferencePoint;
+	/** Whether to also return the k solutions found with perturbed reference points. If false, a single solution is returned. */
+	include_perturbed?: boolean;
 }
 
 /**
@@ -120,6 +170,15 @@ export interface NautilusNavigatorNavigateRequest {
 	steps_remaining: number;
 }
 
+/**
+ * Request with the problem, interactive session and parent state of a JINA step.
+ */
+export interface JinaSessionRequest {
+	problem_id: number;
+	session_id?: number | null;
+	parent_state_id?: number | null;
+}
+
 export interface BodyAddProblemJsonProblemAddJsonPost {
 	json_file: Blob;
 	request?:
@@ -128,6 +187,7 @@ export interface BodyAddProblemJsonProblemAddJsonPost {
 		| CreateSessionRequest
 		| NautilusNavigatorInitRequest
 		| NautilusNavigatorNavigateRequest
+		| JinaSessionRequest
 		| null;
 }
 
@@ -252,7 +312,7 @@ export interface CumulusClassificationRequest {
 	scalarization_options?: CumulusClassificationRequestScalarizationOptions;
 	solver?: string | null;
 	solver_options?: CumulusClassificationRequestSolverOptions;
-	preference?: ReferencePoint;
+	preference: ReferencePoint;
 	/** Current objective values for classification. */
 	current_objectives: CumulusClassificationRequestCurrentObjectives;
 	/** List of CumulusScalarization enum values as strings. */
@@ -290,6 +350,8 @@ export interface CumulusClassificationResponse {
 	response_type?: 'cumulus.classification';
 	/** The newly created state id. */
 	state_id: number | null;
+	/** DB id of the ScenarioModelDB used for augmentation, if the problem has scenarios. */
+	scenario_model_id?: number | null;
 	/** The preference used in this iteration. */
 	previous_preference: ReferencePoint;
 	/** The current objectives used for iteration. */
@@ -479,14 +541,15 @@ export interface CumulusIntermediateSolutionResponse {
 }
 
 /**
- * Specification for converting a regular constraint into a soft penalty-based one.
+ * Specification for adding a constraint as a soft, penalty-based one.
 
-After standard element modifications are applied, any constraint listed here is passed
-to ``add_soft_constraint``, which introduces non-negative slack variables that absorb
+A constraint referenced here is never added as a hard constraint, even if it is also
+defined in this request's ``constraints`` list. Instead it is passed to
+``add_soft_constraint``, which introduces non-negative slack variables that absorb
 violations and accumulates them into a minimisation objective.
  */
 export interface SoftConstraintSpec {
-	/** Symbol of the constraint to soften. Must exist in the problem after standard modifications. */
+	/** Symbol of the constraint to add as soft. Must be defined either in this request's 'constraints' list or already present in the problem. */
 	constraint_symbol: string;
 	/** Symbol for the aggregated constraint-violation objective. */
 	violation_symbol?: string;
@@ -541,6 +604,8 @@ export interface CumulusModificationResponse {
 	problem_id: number;
 	/** The ID of the original problem. */
 	original_problem_id: number | null;
+	/** DB id of the ScenarioModelDB associated with the original problem, if any. */
+	scenario_model_id?: number | null;
 	/** False immediately after the endpoint returns; True once the background feasibility check completes. */
 	is_ready?: boolean;
 	/** Set if the background feasibility check failed. */
@@ -701,6 +766,16 @@ export const DistanceFormula = {
 	NUMBER_1: 1,
 	NUMBER_2: 2
 } as const;
+
+export type DomainCriterionCounts = { [key: string]: number };
+
+/**
+ * Per-design domain-criterion counts.
+ */
+export interface DomainCriterion {
+	counts: DomainCriterionCounts;
+	mean_count: number | null;
+}
 
 /**
  * The DM's position when viewing options.
@@ -1310,6 +1385,13 @@ If None, no additional hover information is displayed. Defaults to None.
 export type SCOREBandsResultClusterHoverInfo = { [key: string]: string } | null;
 
 /**
+ * Map cluster IDs to dictionaries of objective names and their corresponding extreme values (min, max).
+ */
+export type SCOREBandsResultClusterExtremes = {
+	[key: string]: { [key: string]: [number, number] };
+};
+
+/**
  * Dictionary mapping objective names to their positions on the axes in the SCORE bands visualization. The first
 objective is at position 0.0, and the last objective is at position 1.0.
  */
@@ -1348,6 +1430,8 @@ export interface SCOREBandsResult {
 	/** Optional dictionary mapping cluster IDs to hover information for display in the visualization.
   If None, no additional hover information is displayed. Defaults to None. */
 	cluster_hover_info?: SCOREBandsResultClusterHoverInfo;
+	/** Map cluster IDs to dictionaries of objective names and their corresponding extreme values (min, max). */
+	cluster_extremes: SCOREBandsResultClusterExtremes;
 	/** Dictionary mapping objective names to their positions on the axes in the SCORE bands visualization. The first
   objective is at position 0.0, and the last objective is at position 1.0. */
 	axis_positions: SCOREBandsResultAxisPositions;
@@ -1557,10 +1641,14 @@ export interface GroupRevertRequest {
 	state_id: number;
 }
 
+export type ValidationErrorCtx = { [key: string]: unknown };
+
 export interface ValidationError {
 	loc: (string | number)[];
 	msg: string;
 	type: string;
+	input?: unknown;
+	ctx?: ValidationErrorCtx;
 }
 
 export interface HTTPValidationError {
@@ -1598,6 +1686,522 @@ export interface IntermediateSolutionRequest {
 	num_desired?: number | null;
 	reference_solution_1: SolutionInfo;
 	reference_solution_2: SolutionInfo;
+}
+
+/**
+ * Domain-criterion thresholds by objective, original direction.
+ */
+export type JinaAnalysisRequestThresholds = { [key: string]: number };
+
+/**
+ * Worst acceptable outcome by objective for the antifragility classes, original direction.
+ */
+export type JinaAnalysisRequestAbsoluteFloors = { [key: string]: number } | null;
+
+/**
+ * Largest acceptable loss relative to the baseline leaf by objective, in original units.
+ */
+export type JinaAnalysisRequestLossFloors = { [key: string]: number } | null;
+
+/**
+ * Request model for the JINA robustness analysis endpoint.
+ */
+export interface JinaAnalysisRequest {
+	problem_id: number;
+	session_id?: number | null;
+	parent_state_id?: number | null;
+	setup_state_id: number;
+	/** The StateDB id of the evaluate state whose outcomes are analysed. */
+	evaluate_state_id: number;
+	/** Designs to compare. Defaults to all evaluated. */
+	design_ids?: number[] | null;
+	/** Domain-criterion thresholds by objective, original direction. */
+	thresholds?: JinaAnalysisRequestThresholds;
+	/** Worst acceptable outcome by objective for the antifragility classes, original direction. */
+	absolute_floors?: JinaAnalysisRequestAbsoluteFloors;
+	/** Largest acceptable loss relative to the baseline leaf by objective, in original units. */
+	loss_floors?: JinaAnalysisRequestLossFloors;
+}
+
+export type MaxRegretRegret = { [key: string]: number | null };
+
+/**
+ * Per-design maximum regret summary.
+ */
+export interface MaxRegret {
+	regret: MaxRegretRegret;
+	mean_regret: number | null;
+}
+
+export type JinaAnalysisResponseMaxRegret = { [key: string]: MaxRegret };
+
+export type JinaAnalysisResponseDomainCriterion = { [key: string]: DomainCriterion };
+
+/**
+ * None when the setup has no baseline leaf in the evaluated outcomes.
+ */
+export type JinaAnalysisResponseAntifragility = { [key: string]: Antifragility } | null;
+
+/**
+ * Robustness metrics of evaluated designs, by design id.
+ */
+export interface JinaAnalysisResponse {
+	max_regret: JinaAnalysisResponseMaxRegret;
+	domain_criterion: JinaAnalysisResponseDomainCriterion;
+	/** None when the setup has no baseline leaf in the evaluated outcomes. */
+	antifragility?: JinaAnalysisResponseAntifragility;
+	antifragile_objectives?: string[] | null;
+}
+
+/**
+ * Design variable values.
+ */
+export type JinaDesignValues = { [key: string]: number | number[] | number[][] };
+
+/**
+ * The target-keyed reference point a solved design was found at; None for imports.
+ */
+export type JinaDesignEffectiveReferencePoint = { [key: string]: number } | null;
+
+/**
+ * The objective-keyed reference point an imported design was evaluated at.
+ */
+export type JinaDesignImportReferencePoint = { [key: string]: number } | null;
+
+export type JinaDesignSource = (typeof JinaDesignSource)[keyof typeof JinaDesignSource];
+
+export const JinaDesignSource = {
+	solve: 'solve',
+	import: 'import'
+} as const;
+
+/**
+ * Objective values by leaf and objective symbol.
+ */
+export type JinaDesignLeafObjectives = { [key: string]: { [key: string]: number } };
+
+/**
+ * A design in the design registry of a JINA setup.
+ */
+export interface JinaDesign {
+	/** Id of the design, unique within the registry. */
+	id: number;
+	/** Design variable values. */
+	values: JinaDesignValues;
+	/** The target-keyed reference point a solved design was found at; None for imports. */
+	effective_reference_point?: JinaDesignEffectiveReferencePoint;
+	/** The objective-keyed reference point an imported design was evaluated at. */
+	import_reference_point?: JinaDesignImportReferencePoint;
+	/** View the design was solved in; None for imports. */
+	view?: 'aggregated' | 'per_scenario' | null;
+	source: JinaDesignSource;
+	/** Objective values by leaf and objective symbol. */
+	leaf_objectives?: JinaDesignLeafObjectives;
+}
+
+/**
+ * Design variable values.
+ */
+export type JinaDesignInfoValues = { [key: string]: number | number[] | number[][] };
+
+/**
+ * The target-keyed reference point a solved design was found at; None for imports.
+ */
+export type JinaDesignInfoEffectiveReferencePoint = { [key: string]: number } | null;
+
+/**
+ * The objective-keyed reference point an imported design was evaluated at.
+ */
+export type JinaDesignInfoImportReferencePoint = { [key: string]: number } | null;
+
+export type JinaDesignInfoSource = (typeof JinaDesignInfoSource)[keyof typeof JinaDesignInfoSource];
+
+export const JinaDesignInfoSource = {
+	solve: 'solve',
+	import: 'import'
+} as const;
+
+/**
+ * Objective values by leaf and objective symbol.
+ */
+export type JinaDesignInfoLeafObjectives = { [key: string]: { [key: string]: number } };
+
+/**
+ * Target values by view and target symbol.
+ */
+export type JinaDesignInfoTargetValues = Partial<
+	Record<'aggregated' | 'per_scenario', { [key: string]: number }>
+>;
+
+/**
+ * A design of the registry with the state it was found in and its target values.
+ */
+export interface JinaDesignInfo {
+	/** Id of the design, unique within the registry. */
+	id: number;
+	/** Design variable values. */
+	values: JinaDesignInfoValues;
+	/** The target-keyed reference point a solved design was found at; None for imports. */
+	effective_reference_point?: JinaDesignInfoEffectiveReferencePoint;
+	/** The objective-keyed reference point an imported design was evaluated at. */
+	import_reference_point?: JinaDesignInfoImportReferencePoint;
+	/** View the design was solved in; None for imports. */
+	view?: 'aggregated' | 'per_scenario' | null;
+	source: JinaDesignInfoSource;
+	/** Objective values by leaf and objective symbol. */
+	leaf_objectives?: JinaDesignInfoLeafObjectives;
+	/** The StateDB id of the iterate state that added the design. */
+	state_id: number;
+	/** Target values by view and target symbol. */
+	target_values: JinaDesignInfoTargetValues;
+}
+
+/**
+ * Aspiration levels by original objective symbol for leaves a design's own reference point does not cover; overrides the reference point of imported designs.
+ */
+export type JinaEvaluateRequestReferencePoint = { [key: string]: number } | null;
+
+/**
+ * Request model for the JINA evaluate endpoint.
+ */
+export interface JinaEvaluateRequest {
+	problem_id: number;
+	session_id?: number | null;
+	parent_state_id?: number | null;
+	setup_state_id: number;
+	/** Scenario model to evaluate in. Defaults to the setup's scenario model. */
+	scenario_model_id?: number | null;
+	/** Designs to evaluate. Defaults to all. */
+	design_ids?: number[] | null;
+	/** Aspiration levels by original objective symbol for leaves a design's own reference point does not cover; overrides the reference point of imported designs. */
+	reference_point?: JinaEvaluateRequestReferencePoint;
+}
+
+export type JinaEvaluateResultReferencePoint = { [key: string]: number } | null;
+
+/**
+ * Objective values in the leaf, in their original direction.
+ */
+export type LeafOutcomeObjectives = { [key: string]: number };
+
+/**
+ * Variable values in the leaf.
+ */
+export type LeafOutcomeVariables = { [key: string]: number | unknown[] };
+
+/**
+ * Result of evaluating a design in one leaf scenario.
+ */
+export interface LeafOutcome {
+	/** Whether the recourse problem was solved successfully. */
+	status: boolean;
+	/** Solver message. */
+	message: string;
+	/** Objective values in the leaf, in their original direction. */
+	objectives?: LeafOutcomeObjectives;
+	/** Variable values in the leaf. */
+	variables?: LeafOutcomeVariables;
+}
+
+export type JinaEvaluateResultOutcomes = { [key: string]: { [key: string]: LeafOutcome } };
+
+/**
+ * Contents of a JINA evaluate state.
+ */
+export interface JinaEvaluateResult {
+	kind: 'jina.evaluate';
+	setup_state_id: number;
+	scenario_model_id: number;
+	design_ids: number[];
+	reference_point: JinaEvaluateResultReferencePoint;
+	outcomes: JinaEvaluateResultOutcomes;
+}
+
+/**
+ * Stores the normalized kinds `{method}.{phase}` of supported states.
+
+Note:
+    Update this when adding new states. Be sure to update `KIND_TO_STATE`
+    in this file as well.
+ */
+export type StateKind = (typeof StateKind)[keyof typeof StateKind];
+
+export const StateKind = {
+	reference_point_methodsolve_candidates: 'reference_point_method.solve_candidates',
+	nimbussolve_candidates: 'nimbus.solve_candidates',
+	nimbussave_solutions: 'nimbus.save_solutions',
+	nimbusinitialize: 'nimbus.initialize',
+	nimbusfinal: 'nimbus.final',
+	gnimbusoptimize: 'gnimbus.optimize',
+	gnimbusvote: 'gnimbus.vote',
+	gnimbusend: 'gnimbus.end',
+	emorun: 'emo.run',
+	emosave_solutions: 'emo.save_solutions',
+	emofetch_solutions: 'emo.fetch_solutions',
+	emoscore_bands: 'emo.score_bands',
+	genericsolve_intermediate: 'generic.solve_intermediate',
+	'e-nautilusstepping': 'e-nautilus.stepping',
+	'e-nautilusfinal': 'e-nautilus.final',
+	nautilusnavigate: 'nautilus.navigate',
+	nautilusinitialize: 'nautilus.initialize',
+	xnimbussolve_candidates: 'xnimbus.solve_candidates',
+	xnimbussave_solutions: 'xnimbus.save_solutions',
+	xnimbusinitialize: 'xnimbus.initialize',
+	xnimbusfinal: 'xnimbus.final',
+	cumulussolve_candidates: 'cumulus.solve_candidates',
+	cumulussave_solutions: 'cumulus.save_solutions',
+	cumulusinitialize: 'cumulus.initialize',
+	cumulusfinal: 'cumulus.final',
+	cumulusmodify: 'cumulus.modify',
+	cumulusobjective_constraint: 'cumulus.objective_constraint',
+	jinasetup: 'jina.setup',
+	jinaiterate: 'jina.iterate',
+	jinaevaluate: 'jina.evaluate',
+	jinaselect: 'jina.select'
+} as const;
+
+export type JinaSetupResultMeasure =
+	(typeof JinaSetupResultMeasure)[keyof typeof JinaSetupResultMeasure];
+
+export const JinaSetupResultMeasure = {
+	worst_case: 'worst_case',
+	expected_value: 'expected_value',
+	cvar: 'cvar'
+} as const;
+
+/**
+ * One scalarised quantity of a JINA problem.
+ */
+export interface Target {
+	/** Objective symbol of the target in the built problem. */
+	symbol: string;
+	/** The original objective symbol. */
+	objective: string;
+	/** The leaf of a per-leaf target; None for a target over all leaves. */
+	leaf: string | null;
+	/** The leaves whose values the target depends on. */
+	leaves: string[];
+	/** Whether the target is maximised. */
+	maximize: boolean;
+}
+
+export type JinaSetupResultRanges = Partial<
+	Record<'aggregated' | 'per_scenario', { [key: string]: [number, number] }>
+> | null;
+
+/**
+ * Contents of a JINA setup state.
+ */
+export interface JinaSetupResult {
+	kind: 'jina.setup';
+	scenario_model_id: number;
+	design_variables: string[];
+	measure: JinaSetupResultMeasure;
+	cvar_alpha: number;
+	baseline_leaf: string | null;
+	design_rtol: number;
+	targets: Partial<Record<'aggregated' | 'per_scenario', Target[]>> | null;
+	ranges: JinaSetupResultRanges;
+}
+
+export type JinaIterateStateResultMode =
+	(typeof JinaIterateStateResultMode)[keyof typeof JinaIterateStateResultMode];
+
+export const JinaIterateStateResultMode = {
+	solve: 'solve',
+	pool: 'pool',
+	import: 'import'
+} as const;
+
+export type JinaIterateResultEffectiveReferencePoint = { [key: string]: number };
+
+export type JinaIterateResultTargetValues = { [key: string]: number };
+
+/**
+ * Result of one variant, pool scorer or imported row of an iterate state.
+ */
+export interface JinaIterateResult {
+	/** Variant name, pool scorer name or 'row_<i>'. */
+	name: string;
+	success: boolean;
+	message: string;
+	effective_reference_point?: JinaIterateResultEffectiveReferencePoint;
+	target_values?: JinaIterateResultTargetValues;
+	alpha?: number | null;
+	binding?: string[];
+	/** Registry id of the resulting design. */
+	design_id?: number | null;
+}
+
+export type JinaIterateStateResultReferencePoint = { [key: string]: number };
+
+/**
+ * Contents of a JINA iterate state.
+ */
+export interface JinaIterateStateResult {
+	kind: 'jina.iterate';
+	setup_state_id: number;
+	mode: JinaIterateStateResultMode;
+	view: 'aggregated' | 'per_scenario' | null;
+	reference_point: JinaIterateStateResultReferencePoint;
+	results: JinaIterateResult[];
+	new_design_ids: number[];
+	designs: JinaDesign[];
+}
+
+/**
+ * Contents of a JINA select state.
+ */
+export interface JinaSelectResult {
+	kind: 'jina.select';
+	setup_state_id: number;
+	wishlist: number[];
+	final_design_id: number | null;
+}
+
+/**
+ * A JINA state and whether its background job has finished.
+ */
+export interface JinaStateResponse {
+	state_id: number;
+	kind: StateKind;
+	is_ready: boolean;
+	error?: string | null;
+	result: JinaSetupResult | JinaIterateStateResult | JinaEvaluateResult | JinaSelectResult;
+}
+
+/**
+ * The latest JINA setup of the session and its later states, oldest first.
+ */
+export interface JinaGetOrInitializeResponse {
+	setup: JinaStateResponse | null;
+	states: JinaStateResponse[];
+}
+
+/**
+ * Aspiration levels by original objective symbol at which the designs are evaluated.
+ */
+export type JinaImportRequestReferencePoint = { [key: string]: number };
+
+/**
+ * Request model for importing designs from a representative solution set.
+ */
+export interface JinaImportRequest {
+	problem_id: number;
+	session_id?: number | null;
+	parent_state_id?: number | null;
+	setup_state_id: number;
+	/** Id of a RepresentativeNonDominatedSolutions of the problem. */
+	representative_set_id: number;
+	/** Aspiration levels by original objective symbol at which the designs are evaluated. */
+	reference_point: JinaImportRequestReferencePoint;
+}
+
+/**
+ * Solve new designs, or pick designs found earlier from the design pool.
+ */
+export type JinaIterateRequestMode =
+	(typeof JinaIterateRequestMode)[keyof typeof JinaIterateRequestMode];
+
+export const JinaIterateRequestMode = {
+	solve: 'solve',
+	pool: 'pool'
+} as const;
+
+export type JinaIterateRequestView =
+	(typeof JinaIterateRequestView)[keyof typeof JinaIterateRequestView];
+
+export const JinaIterateRequestView = {
+	aggregated: 'aggregated',
+	per_scenario: 'per_scenario'
+} as const;
+
+/**
+ * Aspiration levels by target symbol, original direction.
+ */
+export type JinaIterateRequestReferencePoint = { [key: string]: number };
+
+/**
+ * Request model for the JINA iterate endpoint.
+ */
+export interface JinaIterateRequest {
+	problem_id: number;
+	session_id?: number | null;
+	parent_state_id?: number | null;
+	setup_state_id: number;
+	/** Solve new designs, or pick designs found earlier from the design pool. */
+	mode?: JinaIterateRequestMode;
+	view?: JinaIterateRequestView;
+	/** Aspiration levels by target symbol, original direction. */
+	reference_point: JinaIterateRequestReferencePoint;
+}
+
+/**
+ * A scenario model of a problem.
+ */
+export interface JinaScenarioModelInfo {
+	id: number;
+	leaves: string[];
+	n_leaves: number;
+	has_probabilities: boolean;
+	/** Variables shared by all scenarios, the candidate design variables. */
+	root_variables: string[];
+	/** The design variables a setup defaults to. */
+	default_design_variables: string[];
+	/** Symbols of the objectives of the scenario model. */
+	objectives: string[];
+}
+
+/**
+ * Request model for the JINA select endpoint.
+ */
+export interface JinaSelectRequest {
+	problem_id: number;
+	session_id?: number | null;
+	parent_state_id?: number | null;
+	setup_state_id: number;
+	wishlist?: number[];
+	final_design_id?: number | null;
+}
+
+/**
+ * The aggregation of the aggregated view.
+ */
+export type JinaSetupRequestMeasure =
+	(typeof JinaSetupRequestMeasure)[keyof typeof JinaSetupRequestMeasure];
+
+export const JinaSetupRequestMeasure = {
+	worst_case: 'worst_case',
+	expected_value: 'expected_value',
+	cvar: 'cvar'
+} as const;
+
+/**
+ * Request model for the JINA setup endpoint.
+ */
+export interface JinaSetupRequest {
+	problem_id: number;
+	session_id?: number | null;
+	parent_state_id?: number | null;
+	/** DB id of the ScenarioModelDB. Defaults to the problem's first scenario model. */
+	scenario_model_id?: number | null;
+	/** Root variables forming a design. Defaults to the scalar root variables. */
+	design_variables?: string[] | null;
+	/** The aggregation of the aggregated view. */
+	measure?: JinaSetupRequestMeasure;
+	/**
+	 * The CVaR confidence level.
+	 * @exclusiveMinimum 0
+	 * @exclusiveMaximum 1
+	 */
+	cvar_alpha?: number;
+	/** Leaf the antifragility analysis compares against. */
+	baseline_leaf?: string | null;
+	/**
+	 * Relative tolerance for identifying equal designs.
+	 * @minimum 0
+	 */
+	design_rtol?: number;
 }
 
 export type NIMBUSClassificationRequestScalarizationOptions = {
@@ -2154,6 +2758,8 @@ export interface ProblemInfo {
 	discrete_representation: DiscreteRepresentationDB | null;
 	simulators: SimulatorDB[] | null;
 	problem_metadata: ProblemMetaDataPublic | null;
+	/** Ids of the problem's scenario models. */
+	scenario_model_ids?: number[];
 }
 
 /**
@@ -2169,6 +2775,8 @@ export interface ProblemInfoSmall {
 	id: number;
 	user_id: number;
 	problem_metadata: ProblemMetaDataPublic | null;
+	/** Ids of the problem's scenario models. */
+	scenario_model_ids?: number[];
 }
 
 /**
@@ -2582,6 +3190,45 @@ export type SetObjectiveConstraintsMethodCumulusObjectiveConstraintPostParams = 
 
 export type ModifyProblemMethodCumulusModifyProblemPostParams = {
 	problem_id?: number | null;
+};
+
+export type GetScenarioModelsMethodJinaScenarioModelsGetParams = {
+	problem_id?: number | null;
+	session_id?: number | null;
+};
+
+export type GetOrInitializeMethodJinaGetOrInitializePostParams = {
+	problem_id?: number | null;
+};
+
+export type SetupMethodJinaSetupPostParams = {
+	problem_id?: number | null;
+};
+
+export type IterateMethodJinaIteratePostParams = {
+	problem_id?: number | null;
+};
+
+export type ImportDesignsMethodJinaImportPostParams = {
+	problem_id?: number | null;
+};
+
+export type EvaluateMethodJinaEvaluatePostParams = {
+	problem_id?: number | null;
+};
+
+export type SelectDesignsMethodJinaSelectPostParams = {
+	problem_id?: number | null;
+};
+
+export type AnalysisMethodJinaAnalysisPostParams = {
+	problem_id?: number | null;
+};
+
+export type GetDesignsMethodJinaDesignsGetParams = {
+	setup_state_id: number;
+	problem_id?: number | null;
+	session_id?: number | null;
 };
 
 export type SolveIntermediateMethodGenericIntermediatePostParams = {
@@ -3291,12 +3938,13 @@ export const getAddProblemProblemAddPostUrl = (params?: AddProblemProblemAddPost
 };
 
 export const addProblemProblemAddPost = async (
-	rPMSolveRequestENautilusStepRequestCreateSessionRequestNautilusNavigatorInitRequestNautilusNavigatorNavigateRequestNull:
+	rPMSolveRequestENautilusStepRequestCreateSessionRequestNautilusNavigatorInitRequestNautilusNavigatorNavigateRequestJinaSessionRequestNull:
 		| RPMSolveRequest
 		| ENautilusStepRequest
 		| CreateSessionRequest
 		| NautilusNavigatorInitRequest
 		| NautilusNavigatorNavigateRequest
+		| JinaSessionRequest
 		| null,
 	params?: AddProblemProblemAddPostParams,
 	options?: RequestInit
@@ -3306,7 +3954,7 @@ export const addProblemProblemAddPost = async (
 		method: 'POST',
 		headers: { 'Content-Type': 'application/json', ...options?.headers },
 		body: JSON.stringify(
-			rPMSolveRequestENautilusStepRequestCreateSessionRequestNautilusNavigatorInitRequestNautilusNavigatorNavigateRequestNull
+			rPMSolveRequestENautilusStepRequestCreateSessionRequestNautilusNavigatorInitRequestNautilusNavigatorNavigateRequestJinaSessionRequestNull
 		)
 	});
 };
@@ -5786,6 +6434,592 @@ export const modifyProblemStatusMethodCumulusModifyProblemStatusStateIdGet = asy
 };
 
 /**
+ * List the scenario models of a problem; models that fail to load are left out.
+ * @summary Get Scenario Models
+ */
+export type getScenarioModelsMethodJinaScenarioModelsGetResponse200 = {
+	data: JinaScenarioModelInfo[];
+	status: 200;
+};
+
+export type getScenarioModelsMethodJinaScenarioModelsGetResponse422 = {
+	data: HTTPValidationError;
+	status: 422;
+};
+
+export type getScenarioModelsMethodJinaScenarioModelsGetResponseSuccess =
+	getScenarioModelsMethodJinaScenarioModelsGetResponse200 & {
+		headers: Headers;
+	};
+export type getScenarioModelsMethodJinaScenarioModelsGetResponseError =
+	getScenarioModelsMethodJinaScenarioModelsGetResponse422 & {
+		headers: Headers;
+	};
+
+export type getScenarioModelsMethodJinaScenarioModelsGetResponse =
+	| getScenarioModelsMethodJinaScenarioModelsGetResponseSuccess
+	| getScenarioModelsMethodJinaScenarioModelsGetResponseError;
+
+export const getGetScenarioModelsMethodJinaScenarioModelsGetUrl = (
+	params?: GetScenarioModelsMethodJinaScenarioModelsGetParams
+) => {
+	const normalizedParams = new URLSearchParams();
+
+	Object.entries(params || {}).forEach(([key, value]) => {
+		if (value !== undefined) {
+			normalizedParams.append(key, value === null ? 'null' : value.toString());
+		}
+	});
+
+	const stringifiedParams = normalizedParams.toString();
+
+	return stringifiedParams.length > 0
+		? `http://localhost:8000/method/jina/scenario-models?${stringifiedParams}`
+		: `http://localhost:8000/method/jina/scenario-models`;
+};
+
+export const getScenarioModelsMethodJinaScenarioModelsGet = async (
+	params?: GetScenarioModelsMethodJinaScenarioModelsGetParams,
+	options?: RequestInit
+): Promise<getScenarioModelsMethodJinaScenarioModelsGetResponse> => {
+	return customFetch<getScenarioModelsMethodJinaScenarioModelsGetResponse>(
+		getGetScenarioModelsMethodJinaScenarioModelsGetUrl(params),
+		{
+			...options,
+			method: 'GET'
+		}
+	);
+};
+
+/**
+ * Return the latest JINA setup of the session, or None, and all later JINA states of that setup.
+ * @summary Get Or Initialize
+ */
+export type getOrInitializeMethodJinaGetOrInitializePostResponse200 = {
+	data: JinaGetOrInitializeResponse;
+	status: 200;
+};
+
+export type getOrInitializeMethodJinaGetOrInitializePostResponse422 = {
+	data: HTTPValidationError;
+	status: 422;
+};
+
+export type getOrInitializeMethodJinaGetOrInitializePostResponseSuccess =
+	getOrInitializeMethodJinaGetOrInitializePostResponse200 & {
+		headers: Headers;
+	};
+export type getOrInitializeMethodJinaGetOrInitializePostResponseError =
+	getOrInitializeMethodJinaGetOrInitializePostResponse422 & {
+		headers: Headers;
+	};
+
+export type getOrInitializeMethodJinaGetOrInitializePostResponse =
+	| getOrInitializeMethodJinaGetOrInitializePostResponseSuccess
+	| getOrInitializeMethodJinaGetOrInitializePostResponseError;
+
+export const getGetOrInitializeMethodJinaGetOrInitializePostUrl = (
+	params?: GetOrInitializeMethodJinaGetOrInitializePostParams
+) => {
+	const normalizedParams = new URLSearchParams();
+
+	Object.entries(params || {}).forEach(([key, value]) => {
+		if (value !== undefined) {
+			normalizedParams.append(key, value === null ? 'null' : value.toString());
+		}
+	});
+
+	const stringifiedParams = normalizedParams.toString();
+
+	return stringifiedParams.length > 0
+		? `http://localhost:8000/method/jina/get-or-initialize?${stringifiedParams}`
+		: `http://localhost:8000/method/jina/get-or-initialize`;
+};
+
+export const getOrInitializeMethodJinaGetOrInitializePost = async (
+	jinaSessionRequest: JinaSessionRequest,
+	params?: GetOrInitializeMethodJinaGetOrInitializePostParams,
+	options?: RequestInit
+): Promise<getOrInitializeMethodJinaGetOrInitializePostResponse> => {
+	return customFetch<getOrInitializeMethodJinaGetOrInitializePostResponse>(
+		getGetOrInitializeMethodJinaGetOrInitializePostUrl(params),
+		{
+			...options,
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json', ...options?.headers },
+			body: JSON.stringify(jinaSessionRequest)
+		}
+	);
+};
+
+/**
+ * Start a JINA run on a scenario model of the problem; its target ranges are computed in the background.
+ * @summary Setup
+ */
+export type setupMethodJinaSetupPostResponse200 = {
+	data: JinaStateResponse;
+	status: 200;
+};
+
+export type setupMethodJinaSetupPostResponse422 = {
+	data: HTTPValidationError;
+	status: 422;
+};
+
+export type setupMethodJinaSetupPostResponseSuccess = setupMethodJinaSetupPostResponse200 & {
+	headers: Headers;
+};
+export type setupMethodJinaSetupPostResponseError = setupMethodJinaSetupPostResponse422 & {
+	headers: Headers;
+};
+
+export type setupMethodJinaSetupPostResponse =
+	| setupMethodJinaSetupPostResponseSuccess
+	| setupMethodJinaSetupPostResponseError;
+
+export const getSetupMethodJinaSetupPostUrl = (params?: SetupMethodJinaSetupPostParams) => {
+	const normalizedParams = new URLSearchParams();
+
+	Object.entries(params || {}).forEach(([key, value]) => {
+		if (value !== undefined) {
+			normalizedParams.append(key, value === null ? 'null' : value.toString());
+		}
+	});
+
+	const stringifiedParams = normalizedParams.toString();
+
+	return stringifiedParams.length > 0
+		? `http://localhost:8000/method/jina/setup?${stringifiedParams}`
+		: `http://localhost:8000/method/jina/setup`;
+};
+
+export const setupMethodJinaSetupPost = async (
+	jinaSetupRequest: JinaSetupRequest,
+	params?: SetupMethodJinaSetupPostParams,
+	options?: RequestInit
+): Promise<setupMethodJinaSetupPostResponse> => {
+	return customFetch<setupMethodJinaSetupPostResponse>(getSetupMethodJinaSetupPostUrl(params), {
+		...options,
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json', ...options?.headers },
+		body: JSON.stringify(jinaSetupRequest)
+	});
+};
+
+/**
+ * Solve new designs at a reference point in the background, or pick designs found earlier from the pool.
+ * @summary Iterate
+ */
+export type iterateMethodJinaIteratePostResponse200 = {
+	data: JinaStateResponse;
+	status: 200;
+};
+
+export type iterateMethodJinaIteratePostResponse422 = {
+	data: HTTPValidationError;
+	status: 422;
+};
+
+export type iterateMethodJinaIteratePostResponseSuccess =
+	iterateMethodJinaIteratePostResponse200 & {
+		headers: Headers;
+	};
+export type iterateMethodJinaIteratePostResponseError = iterateMethodJinaIteratePostResponse422 & {
+	headers: Headers;
+};
+
+export type iterateMethodJinaIteratePostResponse =
+	| iterateMethodJinaIteratePostResponseSuccess
+	| iterateMethodJinaIteratePostResponseError;
+
+export const getIterateMethodJinaIteratePostUrl = (params?: IterateMethodJinaIteratePostParams) => {
+	const normalizedParams = new URLSearchParams();
+
+	Object.entries(params || {}).forEach(([key, value]) => {
+		if (value !== undefined) {
+			normalizedParams.append(key, value === null ? 'null' : value.toString());
+		}
+	});
+
+	const stringifiedParams = normalizedParams.toString();
+
+	return stringifiedParams.length > 0
+		? `http://localhost:8000/method/jina/iterate?${stringifiedParams}`
+		: `http://localhost:8000/method/jina/iterate`;
+};
+
+export const iterateMethodJinaIteratePost = async (
+	jinaIterateRequest: JinaIterateRequest,
+	params?: IterateMethodJinaIteratePostParams,
+	options?: RequestInit
+): Promise<iterateMethodJinaIteratePostResponse> => {
+	return customFetch<iterateMethodJinaIteratePostResponse>(
+		getIterateMethodJinaIteratePostUrl(params),
+		{
+			...options,
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json', ...options?.headers },
+			body: JSON.stringify(jinaIterateRequest)
+		}
+	);
+};
+
+/**
+ * Import the designs of a representative solution set of the problem; they are evaluated in the background.
+ * @summary Import Designs
+ */
+export type importDesignsMethodJinaImportPostResponse200 = {
+	data: JinaStateResponse;
+	status: 200;
+};
+
+export type importDesignsMethodJinaImportPostResponse422 = {
+	data: HTTPValidationError;
+	status: 422;
+};
+
+export type importDesignsMethodJinaImportPostResponseSuccess =
+	importDesignsMethodJinaImportPostResponse200 & {
+		headers: Headers;
+	};
+export type importDesignsMethodJinaImportPostResponseError =
+	importDesignsMethodJinaImportPostResponse422 & {
+		headers: Headers;
+	};
+
+export type importDesignsMethodJinaImportPostResponse =
+	| importDesignsMethodJinaImportPostResponseSuccess
+	| importDesignsMethodJinaImportPostResponseError;
+
+export const getImportDesignsMethodJinaImportPostUrl = (
+	params?: ImportDesignsMethodJinaImportPostParams
+) => {
+	const normalizedParams = new URLSearchParams();
+
+	Object.entries(params || {}).forEach(([key, value]) => {
+		if (value !== undefined) {
+			normalizedParams.append(key, value === null ? 'null' : value.toString());
+		}
+	});
+
+	const stringifiedParams = normalizedParams.toString();
+
+	return stringifiedParams.length > 0
+		? `http://localhost:8000/method/jina/import?${stringifiedParams}`
+		: `http://localhost:8000/method/jina/import`;
+};
+
+export const importDesignsMethodJinaImportPost = async (
+	jinaImportRequest: JinaImportRequest,
+	params?: ImportDesignsMethodJinaImportPostParams,
+	options?: RequestInit
+): Promise<importDesignsMethodJinaImportPostResponse> => {
+	return customFetch<importDesignsMethodJinaImportPostResponse>(
+		getImportDesignsMethodJinaImportPostUrl(params),
+		{
+			...options,
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json', ...options?.headers },
+			body: JSON.stringify(jinaImportRequest)
+		}
+	);
+};
+
+/**
+ * Evaluate designs in the leaves of the setup's or another scenario model of the problem in the background.
+
+See `_evaluation_point` for the reference point each design is evaluated at.  Every leaf must
+get an objective from it; otherwise ``reference_point`` must supply one.
+ * @summary Evaluate
+ */
+export type evaluateMethodJinaEvaluatePostResponse200 = {
+	data: JinaStateResponse;
+	status: 200;
+};
+
+export type evaluateMethodJinaEvaluatePostResponse422 = {
+	data: HTTPValidationError;
+	status: 422;
+};
+
+export type evaluateMethodJinaEvaluatePostResponseSuccess =
+	evaluateMethodJinaEvaluatePostResponse200 & {
+		headers: Headers;
+	};
+export type evaluateMethodJinaEvaluatePostResponseError =
+	evaluateMethodJinaEvaluatePostResponse422 & {
+		headers: Headers;
+	};
+
+export type evaluateMethodJinaEvaluatePostResponse =
+	| evaluateMethodJinaEvaluatePostResponseSuccess
+	| evaluateMethodJinaEvaluatePostResponseError;
+
+export const getEvaluateMethodJinaEvaluatePostUrl = (
+	params?: EvaluateMethodJinaEvaluatePostParams
+) => {
+	const normalizedParams = new URLSearchParams();
+
+	Object.entries(params || {}).forEach(([key, value]) => {
+		if (value !== undefined) {
+			normalizedParams.append(key, value === null ? 'null' : value.toString());
+		}
+	});
+
+	const stringifiedParams = normalizedParams.toString();
+
+	return stringifiedParams.length > 0
+		? `http://localhost:8000/method/jina/evaluate?${stringifiedParams}`
+		: `http://localhost:8000/method/jina/evaluate`;
+};
+
+export const evaluateMethodJinaEvaluatePost = async (
+	jinaEvaluateRequest: JinaEvaluateRequest,
+	params?: EvaluateMethodJinaEvaluatePostParams,
+	options?: RequestInit
+): Promise<evaluateMethodJinaEvaluatePostResponse> => {
+	return customFetch<evaluateMethodJinaEvaluatePostResponse>(
+		getEvaluateMethodJinaEvaluatePostUrl(params),
+		{
+			...options,
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json', ...options?.headers },
+			body: JSON.stringify(jinaEvaluateRequest)
+		}
+	);
+};
+
+/**
+ * Return a JINA state and whether its background job has finished.
+ * @summary Get Status
+ */
+export type getStatusMethodJinaStatusStateIdGetResponse200 = {
+	data: JinaStateResponse;
+	status: 200;
+};
+
+export type getStatusMethodJinaStatusStateIdGetResponse422 = {
+	data: HTTPValidationError;
+	status: 422;
+};
+
+export type getStatusMethodJinaStatusStateIdGetResponseSuccess =
+	getStatusMethodJinaStatusStateIdGetResponse200 & {
+		headers: Headers;
+	};
+export type getStatusMethodJinaStatusStateIdGetResponseError =
+	getStatusMethodJinaStatusStateIdGetResponse422 & {
+		headers: Headers;
+	};
+
+export type getStatusMethodJinaStatusStateIdGetResponse =
+	| getStatusMethodJinaStatusStateIdGetResponseSuccess
+	| getStatusMethodJinaStatusStateIdGetResponseError;
+
+export const getGetStatusMethodJinaStatusStateIdGetUrl = (stateId: number) => {
+	return `http://localhost:8000/method/jina/status/${stateId}`;
+};
+
+export const getStatusMethodJinaStatusStateIdGet = async (
+	stateId: number,
+	options?: RequestInit
+): Promise<getStatusMethodJinaStatusStateIdGetResponse> => {
+	return customFetch<getStatusMethodJinaStatusStateIdGetResponse>(
+		getGetStatusMethodJinaStatusStateIdGetUrl(stateId),
+		{
+			...options,
+			method: 'GET'
+		}
+	);
+};
+
+/**
+ * Store the wishlist and the final design of the decision maker.
+ * @summary Select Designs
+ */
+export type selectDesignsMethodJinaSelectPostResponse200 = {
+	data: JinaStateResponse;
+	status: 200;
+};
+
+export type selectDesignsMethodJinaSelectPostResponse422 = {
+	data: HTTPValidationError;
+	status: 422;
+};
+
+export type selectDesignsMethodJinaSelectPostResponseSuccess =
+	selectDesignsMethodJinaSelectPostResponse200 & {
+		headers: Headers;
+	};
+export type selectDesignsMethodJinaSelectPostResponseError =
+	selectDesignsMethodJinaSelectPostResponse422 & {
+		headers: Headers;
+	};
+
+export type selectDesignsMethodJinaSelectPostResponse =
+	| selectDesignsMethodJinaSelectPostResponseSuccess
+	| selectDesignsMethodJinaSelectPostResponseError;
+
+export const getSelectDesignsMethodJinaSelectPostUrl = (
+	params?: SelectDesignsMethodJinaSelectPostParams
+) => {
+	const normalizedParams = new URLSearchParams();
+
+	Object.entries(params || {}).forEach(([key, value]) => {
+		if (value !== undefined) {
+			normalizedParams.append(key, value === null ? 'null' : value.toString());
+		}
+	});
+
+	const stringifiedParams = normalizedParams.toString();
+
+	return stringifiedParams.length > 0
+		? `http://localhost:8000/method/jina/select?${stringifiedParams}`
+		: `http://localhost:8000/method/jina/select`;
+};
+
+export const selectDesignsMethodJinaSelectPost = async (
+	jinaSelectRequest: JinaSelectRequest,
+	params?: SelectDesignsMethodJinaSelectPostParams,
+	options?: RequestInit
+): Promise<selectDesignsMethodJinaSelectPostResponse> => {
+	return customFetch<selectDesignsMethodJinaSelectPostResponse>(
+		getSelectDesignsMethodJinaSelectPostUrl(params),
+		{
+			...options,
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json', ...options?.headers },
+			body: JSON.stringify(jinaSelectRequest)
+		}
+	);
+};
+
+/**
+ * Compute max regret, the domain criterion and, with a baseline leaf, antifragility of evaluated designs.
+
+The thresholds are those of the domain criterion; the absolute and loss floors set the Taleb classes of
+the antifragility.
+
+Leaves where a design failed are missing outcomes, treated by the metrics' default policy.  The
+antifragility is None when the setup has no baseline leaf or no design has an outcome in it.
+ * @summary Analysis
+ */
+export type analysisMethodJinaAnalysisPostResponse200 = {
+	data: JinaAnalysisResponse;
+	status: 200;
+};
+
+export type analysisMethodJinaAnalysisPostResponse422 = {
+	data: HTTPValidationError;
+	status: 422;
+};
+
+export type analysisMethodJinaAnalysisPostResponseSuccess =
+	analysisMethodJinaAnalysisPostResponse200 & {
+		headers: Headers;
+	};
+export type analysisMethodJinaAnalysisPostResponseError =
+	analysisMethodJinaAnalysisPostResponse422 & {
+		headers: Headers;
+	};
+
+export type analysisMethodJinaAnalysisPostResponse =
+	| analysisMethodJinaAnalysisPostResponseSuccess
+	| analysisMethodJinaAnalysisPostResponseError;
+
+export const getAnalysisMethodJinaAnalysisPostUrl = (
+	params?: AnalysisMethodJinaAnalysisPostParams
+) => {
+	const normalizedParams = new URLSearchParams();
+
+	Object.entries(params || {}).forEach(([key, value]) => {
+		if (value !== undefined) {
+			normalizedParams.append(key, value === null ? 'null' : value.toString());
+		}
+	});
+
+	const stringifiedParams = normalizedParams.toString();
+
+	return stringifiedParams.length > 0
+		? `http://localhost:8000/method/jina/analysis?${stringifiedParams}`
+		: `http://localhost:8000/method/jina/analysis`;
+};
+
+export const analysisMethodJinaAnalysisPost = async (
+	jinaAnalysisRequest: JinaAnalysisRequest,
+	params?: AnalysisMethodJinaAnalysisPostParams,
+	options?: RequestInit
+): Promise<analysisMethodJinaAnalysisPostResponse> => {
+	return customFetch<analysisMethodJinaAnalysisPostResponse>(
+		getAnalysisMethodJinaAnalysisPostUrl(params),
+		{
+			...options,
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json', ...options?.headers },
+			body: JSON.stringify(jinaAnalysisRequest)
+		}
+	);
+};
+
+/**
+ * List the design registry of a setup with the target values of each design in both views.
+ * @summary Get Designs
+ */
+export type getDesignsMethodJinaDesignsGetResponse200 = {
+	data: JinaDesignInfo[];
+	status: 200;
+};
+
+export type getDesignsMethodJinaDesignsGetResponse422 = {
+	data: HTTPValidationError;
+	status: 422;
+};
+
+export type getDesignsMethodJinaDesignsGetResponseSuccess =
+	getDesignsMethodJinaDesignsGetResponse200 & {
+		headers: Headers;
+	};
+export type getDesignsMethodJinaDesignsGetResponseError =
+	getDesignsMethodJinaDesignsGetResponse422 & {
+		headers: Headers;
+	};
+
+export type getDesignsMethodJinaDesignsGetResponse =
+	| getDesignsMethodJinaDesignsGetResponseSuccess
+	| getDesignsMethodJinaDesignsGetResponseError;
+
+export const getGetDesignsMethodJinaDesignsGetUrl = (
+	params: GetDesignsMethodJinaDesignsGetParams
+) => {
+	const normalizedParams = new URLSearchParams();
+
+	Object.entries(params || {}).forEach(([key, value]) => {
+		if (value !== undefined) {
+			normalizedParams.append(key, value === null ? 'null' : value.toString());
+		}
+	});
+
+	const stringifiedParams = normalizedParams.toString();
+
+	return stringifiedParams.length > 0
+		? `http://localhost:8000/method/jina/designs?${stringifiedParams}`
+		: `http://localhost:8000/method/jina/designs`;
+};
+
+export const getDesignsMethodJinaDesignsGet = async (
+	params: GetDesignsMethodJinaDesignsGetParams,
+	options?: RequestInit
+): Promise<getDesignsMethodJinaDesignsGetResponse> => {
+	return customFetch<getDesignsMethodJinaDesignsGetResponse>(
+		getGetDesignsMethodJinaDesignsGetUrl(params),
+		{
+			...options,
+			method: 'GET'
+		}
+	);
+};
+
+/**
  * Solve intermediate solutions between given two solutions.
 
 Args:
@@ -7608,9 +8842,10 @@ export const getSolutionDescriptionSolutionDescriptionGetPost = async (
 /**
  * Add a new solution description metadata instance for a problem.
 
-Validates that all expressions in the parts are parseable, then appends the
-new metadata to the database. The most recent entry is used when generating
-descriptions, so this effectively updates what description is produced.
+Validates that all expressions in the parts are parseable and only refer to symbols the
+problem's solutions provide, then appends the new metadata to the database. The most
+recent entry is used when generating descriptions, so this effectively updates what
+description is produced.
 
 Args:
     request: the problem id and new description metadata.
