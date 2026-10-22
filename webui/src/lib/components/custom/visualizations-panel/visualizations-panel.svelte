@@ -104,6 +104,11 @@
 			previousSolutionLabels?: string[];
 			otherSolutionLabels?: string[];
 		};
+		// Parallel-coordinates layout options; off by default
+		verticalAxisLabels?: boolean;
+		compactTickLabels?: boolean;
+		fitMargins?: boolean;
+		minAxisSpacing?: number;
 	}
 
 	const {
@@ -120,7 +125,11 @@
 		externalSelectedIndex = null,
 		externalSelectedIndexes = null,
 		lineLabels = {},
-		referenceDataLabels = {}
+		referenceDataLabels = {},
+		verticalAxisLabels = false,
+		compactTickLabels = false,
+		fitMargins = false,
+		minAxisSpacing = undefined
 	}: Props = $props();
 
 	/**
@@ -258,6 +267,10 @@
 					multipleSelectedIndexes={externalSelectedIndexes}
 					onLineSelect={handleLineSelect}
 					{lineLabels}
+					{verticalAxisLabels}
+					{compactTickLabels}
+					{fitMargins}
+					{minAxisSpacing}
 				/>
 			{:else if visualizationType === 'bar'}
 				<!-- Placeholder for Bar Chart Visualization -->

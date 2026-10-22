@@ -40,6 +40,7 @@
 	 * - compactTickLabels: boolean — Render tick text in compact SI form (e.g. "7.9k")
 	 * - verticalAxisLabels: boolean — Draw axis names rotated along each axis
 	 * - fitMargins: boolean — Size left/bottom margins to fit tick labels and the filter status line
+	 * - minAxisSpacing: number — Minimum pixels between axes; wider charts scroll horizontally
 	 * - selectedIndex: number | null — Index of selected line in single selection mode
 	 * - multipleSelectedIndexes: number[] | null — Indexes of selected lines in multi-selection mode
 	 * - brushFilters: { [dimension: string]: [number, number] } — Brush filter ranges for each dimension
@@ -128,8 +129,8 @@
 	// Render tick text in compact SI form at a smaller font with a white halo
 	export let compactTickLabels: boolean = false;
 
-	const COMPACT_TICK_FONT_PX = 8;
-	const COMPACT_TICK_CHAR_PX = 5.2; // ~average glyph width at COMPACT_TICK_FONT_PX
+	const COMPACT_TICK_FONT_PX = 10;
+	const COMPACT_TICK_CHAR_PX = 6.5; // ~average glyph width at COMPACT_TICK_FONT_PX
 	const COMPACT_TICK_PAD_PX = 9; // d3's tick mark length + text padding
 
 	/** Formats a number in compact SI form, e.g. "-32.1M", "7.9k", "158". */
@@ -160,6 +161,19 @@
 
 	// Fit the left margin to tick text and add bottom room for the filter status line
 	export let fitMargins: boolean = false;
+
+	// Minimum distance between axes in pixels; when the axes need more than the container's width,
+	// the chart is drawn wider and the container scrolls horizontally. Undefined fits the container.
+	export let minAxisSpacing: number | undefined = undefined;
+
+	/** Width the chart is drawn at. */
+	function chartWidth(containerWidth: number): number {
+		return minAxisSpacing
+			? Math.max(containerWidth, Math.ceil(dimensions.length * minAxisSpacing))
+			: containerWidth;
+	}
+
+	const VERTICAL_LABEL_CHAR_PX = 6; // ~average glyph width of the 10px bold axis names
 
 	// Index of currently selected line (null = no selection)
 	export let selectedIndex: number | null = null;
@@ -830,7 +844,8 @@
 		const bottomMargin = fitMargins && Object.keys(brushFilters).length > 0 ? 34 : 20;
 		// Define margins around the chart area
 		const margin = { top: 20, right: 40, bottom: bottomMargin, left: leftMargin };
-		const innerWidth = width - margin.left - margin.right; // Available width for chart
+		const drawWidth = chartWidth(width);
+		const innerWidth = drawWidth - margin.left - margin.right; // Available width for chart
 		const innerHeight = height - margin.top - margin.bottom; // Available height for chart
 
 		// Clear any previous chart content
@@ -843,7 +858,7 @@
 		// Create main SVG group with proper positioning
 		const svgElement = d3
 			.select(svg)
-			.attr('width', width)
+			.attr('width', drawWidth)
 			.attr('height', height)
 			.append('g')
 			.attr('transform', `translate(${margin.left}, ${margin.top})`); // Offset by margins
@@ -923,24 +938,32 @@
 
 			// Draw axis labels and colored identification squares
 			if (options.showAxisLabels && verticalAxisLabels) {
-				// Rotated name centred along the axis, with a white halo over the data lines
-				svgElement
+				// Rotated name reading up from the bottom end of the axis, away from mid-range data and
+				// reference markers, with a white halo over the data lines; a name longer than the axis is
+				// cut short, with the full name on hover
+				const maxChars = Math.max(
+					4,
+					Math.floor((innerHeight - margin.top - margin.bottom) / VERTICAL_LABEL_CHAR_PX)
+				);
+				const truncated = dim.name.length > maxChars;
+				const label = svgElement
 					.append('text')
 					.attr('class', 'axis-label axis-label-vertical')
 					// Left of the axis, or right of it when compact tick text occupies the left
 					.attr(
 						'transform',
-						`translate(${x + (showTickLabels && compactTickLabels ? 11 : -12)}, ${innerHeight / 2}) rotate(-90)`
+						`translate(${x + (showTickLabels && compactTickLabels ? 11 : -12)}, ${innerHeight - margin.bottom - 2}) rotate(-90)`
 					)
-					.attr('text-anchor', 'middle')
+					.attr('text-anchor', 'start')
 					.style('font-size', '10px')
 					.style('font-weight', '600')
 					.style('fill', '#333')
 					.style('stroke', '#fff')
 					.style('stroke-width', '3px')
 					.style('paint-order', 'stroke')
-					.style('pointer-events', 'none')
-					.text(dim.name);
+					.style('pointer-events', truncated ? 'auto' : 'none')
+					.text(truncated ? `${dim.name.slice(0, maxChars - 1)}…` : dim.name);
+				if (truncated) label.append('title').text(dim.name);
 			} else if (options.showAxisLabels) {
 				const showSquare = options.showAxisColorSquares !== false;
 
@@ -1139,6 +1162,7 @@
 		compactTickLabels,
 		verticalAxisLabels,
 		fitMargins,
+		minAxisSpacing,
 		width,
 		height,
 		drawChart());
@@ -1148,8 +1172,16 @@
     Responsive container for the parallel coordinates plot.
     Uses aspect ratio to maintain consistent proportions.
 -->
-<div bind:this={container} style="height: 100%;width: 100%;">
-	<svg bind:this={svg} style="width: 100%; height: 100%;" />
+<div
+	bind:this={container}
+	style="height: 100%;width: 100%;{minAxisSpacing ? 'overflow-x: auto; overflow-y: hidden;' : ''}"
+>
+	<svg
+		bind:this={svg}
+		style="width: {minAxisSpacing
+			? `${Math.max(width, Math.ceil(dimensions.length * minAxisSpacing))}px`
+			: '100%'}; height: 100%;"
+	/>
 </div>
 
 <style>
