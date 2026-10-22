@@ -1,7 +1,7 @@
 <script lang="ts">
 	/**
 	 * Objective values of one design in each leaf scenario, compact with the full value on hover.
-	 * Leaves listed in `failed` show their message instead of values.
+	 * Leaves listed in `failed` show their message instead of values; rows of `checkedLeaves` are bold.
 	 */
 	import * as Table from '$lib/components/ui/table/index.js';
 	import type { ProblemInfo } from '$lib/gen/endpoints/DESDEOFastAPI';
@@ -12,13 +12,15 @@
 		leafObjectives,
 		failed = {},
 		baselineLeaf = null,
-		leafColors = {}
+		leafColors = {},
+		checkedLeaves = []
 	}: {
 		problem: ProblemInfo;
 		leafObjectives: Record<string, Record<string, number>>;
 		failed?: Record<string, string>;
 		baselineLeaf?: string | null;
 		leafColors?: Record<string, string>;
+		checkedLeaves?: string[];
 	} = $props();
 
 	let leaves = $derived([...new Set([...Object.keys(leafObjectives), ...Object.keys(failed)])]);
@@ -46,7 +48,7 @@
 		<Table.Body>
 			{#each leaves as leaf (leaf)}
 				{@const isBaseline = leaf === baselineLeaf}
-				<Table.Row>
+				<Table.Row class={checkedLeaves.includes(leaf) ? 'font-semibold' : ''}>
 					<Table.Cell
 						class="truncate px-1"
 						style={leafColors[leaf] ? `color: ${leafColors[leaf]}` : undefined}

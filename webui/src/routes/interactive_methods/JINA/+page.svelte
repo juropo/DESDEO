@@ -30,6 +30,10 @@
 	import { MEASURE_LABELS, modelLabel, plural } from '$lib/components/custom/jina/labels';
 	import { pointArray, viewProblem, viewRows } from '$lib/components/custom/jina/view-problem';
 	import {
+		aggregateAvailable,
+		aggregateLines,
+		concatLines,
+		defaultChartSelection,
 		hideLines,
 		scenarioColor,
 		scenarioLines,
@@ -193,7 +197,7 @@
 		selectedDesignId = null;
 		referencePoints = { aggregated: {}, per_scenario: {} };
 		shownIteration = { aggregated: '', per_scenario: '', pool: '' };
-		checkedLeaves = [];
+		chartSelections = { aggregated: null, per_scenario: null };
 		hiddenDesigns = [];
 		chartIterationIds = { aggregated: [], per_scenario: [], pool: [] };
 		pending = children
@@ -336,9 +340,13 @@
 			: 'No designs in this iteration.'
 	);
 
-	// Chart state of the current setup: the scenarios whose outcomes are plotted, the designs hidden
-	// from the chart and the iterations plotted in each tab (none chosen: the shown iteration).
-	let checkedLeaves = $state<string[]>([]);
+	// Chart state of the current setup: per view, the scenarios plotted and whether the aggregate
+	// is (null: the default), the designs hidden from the chart and the iterations plotted in each
+	// tab (none chosen: the shown iteration).
+	let chartSelections = $state<Record<View, { leaves: string[]; aggregate: boolean } | null>>({
+		aggregated: null,
+		per_scenario: null
+	});
 	let hiddenDesigns = $state<number[]>([]);
 	let chartIterationIds = $state<Record<Tab, number[]>>({
 		aggregated: [],
@@ -348,16 +356,41 @@
 
 	let leafOrder = $derived(setupModel?.leaves ?? []);
 	let leafColors = $derived(Object.fromEntries(leafOrder.map((l, i) => [l, scenarioColor(i)])));
+	let chartSelection = $derived(chartSelections[view] ?? defaultChartSelection(view, leafOrder));
 	let chartIterations = $derived.by(() => {
 		const chosen = tabIterations.filter((s) => chartIterationIds[tab].includes(s.state_id));
 		return chosen.length > 0 ? chosen : iteration ? [iteration] : [];
 	});
-	let scenarioMode = $derived(
-		checkedLeaves.length > 0 && (setup?.result.targets?.per_scenario ?? []).length > 0
+
+	function selectChart(change: Partial<{ leaves: string[]; aggregate: boolean }>) {
+		chartSelections[view] = { ...chartSelection, ...change };
+	}
+
+	// The aggregate entry of the aggregated view: its targets on the original objective axes.
+	let perScenarioTargets = $derived(setup?.result.targets?.per_scenario ?? []);
+	let aggregatedTargets = $derived(setup?.result.targets?.aggregated ?? []);
+	let objectiveSymbols = $derived([...new Set(perScenarioTargets.map((t) => t.objective))]);
+	let aggregateEntry = $derived(
+		view === 'aggregated' && setup
+			? {
+					label: `Aggregate (${MEASURE_LABELS[setup.result.measure]}${
+						setup.result.measure === 'cvar' ? `, α = ${setup.result.cvar_alpha}` : ''
+					})`,
+					available: aggregateAvailable(aggregatedTargets, objectiveSymbols),
+					note: 'Some objectives exist only in some scenarios, so the aggregate has no value on every objective axis.'
+				}
+			: null
 	);
+	let showAggregate = $derived(
+		!!aggregateEntry?.available && chartSelection.aggregate && perScenarioTargets.length > 0
+	);
+	let objectiveMode = $derived(
+		showAggregate || (chartSelection.leaves.length > 0 && perScenarioTargets.length > 0)
+	);
+
 	// The target view's axes are the shown iteration's targets, so it plots only iterations in that
-	// view; the scenario view plots them all.
-	let comparable = (s: IterateState) => scenarioMode || s.result.view === iteration?.result.view;
+	// view; the objective axes plot them all.
+	let comparable = (s: IterateState) => objectiveMode || s.result.view === iteration?.result.view;
 	let plottedIterations = $derived(chartIterations.filter(comparable));
 	let plottedIds = $derived([
 		...new Set(
@@ -371,7 +404,8 @@
 	);
 
 	// Target view: the shown iteration's targets as axes, one line per visible design of the plotted
-	// iterations in that view.
+	// iterations in that view. The reference point is the one being edited; the previous one is the
+	// shown iteration's.
 	let targetChart = $derived.by(() => {
 		if (!problem || !iteration) return null;
 		const ranges = (
@@ -379,66 +413,76 @@
 		) as Record<string, Range>;
 		const results = plottedIterations.flatMap((s) => s.result.results);
 		const lines = hideLines(viewRows(results, iterationTargets), hiddenDesigns);
-		const previous = tabIterations
-			.slice(0, tabIterations.indexOf(iteration))
-			.filter((s) => s.result.view === iteration.result.view)
-			.at(-1);
-		const previousPoint = previous
-			? pointArray(previous.result.reference_point, iterationTargets)
-			: null;
+		const previous = pointArray(iteration.result.reference_point, iterationTargets);
 		return {
 			problem: viewProblem(problem, iterationTargets, ranges),
 			designIds: lines.designIds,
 			labels: lines.labels,
 			values: lines.values,
 			colors: undefined,
-			reference: pointArray(iteration.result.reference_point, iterationTargets),
+			reference:
+				iteration.result.view === view ? pointArray(referencePoints[view], iterationTargets) : null,
 			referenceLabel: 'Reference point',
-			previous: previousPoint ? [previousPoint] : [],
+			previous: previous ? [previous] : [],
+			previousLabel: 'Previous reference point',
 			note: null as string | null
 		};
 	});
 
-	// Scenario view: the original objectives as axes, one line per visible design and checked
-	// scenario with the design's objective values in that scenario, coloured by scenario.
+	// Objective axes: the original objectives, one line per visible design and checked scenario with
+	// its objective values there, coloured by scenario, and in the aggregated view one per design
+	// with its aggregated target values.
 	let scenarioChart = $derived.by(() => {
-		if (!problem || !iteration || !setup || !scenarioMode) return null;
+		if (!problem || !iteration || !setup || !objectiveMode) return null;
+		const leaves = chartSelection.leaves;
 		const chartProblem = scenarioProblem(
 			problem,
-			setup.result.targets?.per_scenario ?? [],
-			(setup.result.ranges?.per_scenario ?? {}) as Record<string, Range>
+			perScenarioTargets,
+			(setup.result.ranges?.per_scenario ?? {}) as Record<string, Range>,
+			leaves,
+			showAggregate
+				? {
+						targets: aggregatedTargets,
+						ranges: (setup.result.ranges?.aggregated ?? {}) as Record<string, Range>
+					}
+				: null
 		);
 		const objectives = chartProblem.objectives.map((o) => o.symbol);
 		const ids = plottedIds.filter((id) => !hiddenDesigns.includes(id));
 		const leafObjectives = Object.fromEntries(designs.map((d) => [d.id, d.leaf_objectives]));
-		const lines = scenarioLines(
-			ids,
-			leafObjectives,
-			checkedLeaves,
-			leafOrder,
-			objectives,
-			selectedDesignId
+		const aggregatedValues = Object.fromEntries(
+			designs.map((d) => [d.id, d.target_values.aggregated])
 		);
-		const reference = scenarioReferencePoint(
+		const lines = concatLines(
+			...(showAggregate
+				? [aggregateLines(ids, aggregatedValues, aggregatedTargets, objectives, selectedDesignId)]
+				: []),
+			scenarioLines(ids, leafObjectives, leaves, leafOrder, objectives, selectedDesignId)
+		);
+		const current = scenarioReferencePoint(
+			setup.result.targets?.[view] ?? [],
+			referencePoints[view],
+			objectives,
+			leaves
+		);
+		const previous = scenarioReferencePoint(
 			iterationTargets,
 			iteration.result.reference_point,
 			objectives,
-			checkedLeaves
+			leaves
 		);
+		const suffix = (shared: boolean) => (shared ? '' : ` — ${leaves[0]}`);
 		return {
 			problem: chartProblem,
 			designIds: lines.designIds,
 			labels: lines.labels,
 			values: lines.values,
 			colors: lines.colors,
-			reference: reference.values,
-			referenceLabel: reference.shared
-				? iteration.result.view === 'aggregated'
-					? 'Reference point (aggregated)'
-					: 'Reference point'
-				: `Reference point — ${checkedLeaves[0]}`,
-			previous: [] as number[][],
-			note: reference.note
+			reference: current.values,
+			referenceLabel: `Reference point${suffix(current.shared)}`,
+			previous: previous.values ? [previous.values] : [],
+			previousLabel: `Previous reference point${suffix(previous.shared)}`,
+			note: current.note ?? previous.note
 		};
 	});
 
@@ -672,13 +716,14 @@
 										chart.labels.map((label, i) => [String(i), label])
 									)}
 									colorByIndex={chart.colors}
+									showHeader={false}
 									verticalAxisLabels
 									compactTickLabels
 									fitMargins
 									minAxisSpacing={80}
 									referenceDataLabels={{
 										currentRefLabel: chart.referenceLabel,
-										previousRefLabel: 'Previous reference point'
+										previousRefLabel: chart.previousLabel
 									}}
 								/>
 							</div>
@@ -694,7 +739,13 @@
 						<ScenarioPicker
 							leaves={leafOrder}
 							baselineLeaf={setup?.result.baseline_leaf ?? null}
-							bind:checked={checkedLeaves}
+							bind:checked={
+								() => chartSelection.leaves, (leaves: string[]) => selectChart({ leaves })
+							}
+							aggregate={aggregateEntry}
+							bind:aggregateChecked={
+								() => chartSelection.aggregate, (aggregate: boolean) => selectChart({ aggregate })
+							}
 						/>
 						{#if selectedDesign}
 							<div class="border-t pt-2">
@@ -704,6 +755,7 @@
 									leafObjectives={selectedDesign.leaf_objectives ?? {}}
 									baselineLeaf={setup?.result.baseline_leaf ?? null}
 									{leafColors}
+									checkedLeaves={objectiveMode ? chartSelection.leaves : []}
 								/>
 							</div>
 						{:else}

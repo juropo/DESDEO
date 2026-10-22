@@ -158,13 +158,51 @@ export function scenarioLineColor(index: number, selected = false): string {
 	);
 }
 
-/** Builds a ProblemInfo whose objectives are derived from the given targets and ranges. */
+/** Lines of the objective-axes chart; `leaves` holds each line's scenario, or null for the aggregate. */
+export interface ChartLines {
+	designIds: number[];
+	leaves: (string | null)[];
+	labels: string[];
+	values: number[][];
+	colors: Record<string, string>;
+	selected: number[];
+}
+
+/** Colours of the aggregate lines, outside the scenario palette. */
+export const AGGREGATE_COLOR = '#374151';
+export const AGGREGATE_SELECTED_COLOR = '#111827';
+
+/**
+ * The problem with the original objectives of the per-scenario `targets` as its objectives. Each
+ * axis spans the per-scenario ranges of the scenarios in `leaves` (and of targets shared by all
+ * scenarios), plus the aggregate's range if `aggregate` is given, widened if zero-width.
+ */
 export function scenarioProblem(
 	problem: ProblemInfo,
 	targets: Target[],
-	ranges: Record<string, Range>
+	ranges: Record<string, Range>,
+	leaves: string[],
+	aggregate: { targets: Target[]; ranges: Record<string, Range> } | null = null
 ): ProblemInfo {
-	const envelopes = objectiveRanges(targets, ranges);
+	// Prefixed keys keep per-scenario and aggregate ranges apart where their symbols coincide.
+	const spanned = [
+		...targets
+			.filter((t) => t.leaf === null || leaves.includes(t.leaf))
+			.map((t) => ({ key: `s:${t.symbol}`, range: ranges[t.symbol], target: t })),
+		...(aggregate?.targets ?? [])
+			.filter((t) => t.leaf === null)
+			.map((t) => ({ key: `a:${t.symbol}`, range: aggregate?.ranges[t.symbol], target: t }))
+	];
+	const envelopes = objectiveRanges(
+		spanned.map(({ key, target }) => ({
+			symbol: key,
+			objective: target.objective,
+			maximize: target.maximize
+		})),
+		Object.fromEntries(
+			spanned.flatMap(({ key, range }) => (range ? [[key, range] as [string, Range]] : []))
+		)
+	);
 	const seen = new Set<string>();
 	const objectives: ObjectiveDB[] = [];
 	for (const target of targets) {
@@ -172,26 +210,91 @@ export function scenarioProblem(
 		if (seen.has(sym)) continue;
 		seen.add(sym);
 		const maximize = target.maximize;
-		const unit = problem.objectives.find((o) => o.symbol === sym)?.unit ?? null;
 		const env = envelopes[sym];
-		let ideal: number | null = null;
-		let nadir: number | null = null;
-		if (env !== undefined) {
-			const widened = axisRange(env, maximize);
-			ideal = widened[0];
-			nadir = widened[1];
-		}
+		const range = env ? axisRange(env, maximize) : null;
 		objectives.push({
 			func: null,
 			name: objectiveLabel(problem, sym),
 			symbol: sym,
-			unit,
+			unit: problem.objectives.find((o) => o.symbol === sym)?.unit ?? null,
 			maximize,
-			ideal,
-			nadir
+			ideal: range?.[0] ?? null,
+			nadir: range?.[1] ?? null
 		});
 	}
 	return { ...problem, objectives };
+}
+
+/** Whether every objective has a target over all scenarios, so the aggregate can be drawn on the objective axes. */
+export function aggregateAvailable(targets: Target[], objectives: string[]): boolean {
+	return objectives.every((o) => targets.some((t) => t.objective === o && t.leaf === null));
+}
+
+/** One aggregate line per design with its values of the targets over all scenarios, in objective order. */
+export function aggregateLines(
+	designIds: number[],
+	targetValues: Record<number, Record<string, number> | undefined>,
+	targets: Target[],
+	objectives: string[],
+	selectedId: number | null
+): ChartLines {
+	const lines: ChartLines = {
+		designIds: [],
+		leaves: [],
+		labels: [],
+		values: [],
+		colors: {},
+		selected: []
+	};
+	const symbols = objectives.map(
+		(o) => targets.find((t) => t.objective === o && t.leaf === null)?.symbol
+	);
+	for (const id of designIds) {
+		const values = symbols.map((sym) => (sym === undefined ? undefined : targetValues[id]?.[sym]));
+		if (!values.every((v): v is number => typeof v === 'number')) continue;
+		const i = lines.designIds.length;
+		lines.designIds.push(id);
+		lines.leaves.push(null);
+		lines.labels.push(`#${id} — Aggregate`);
+		lines.values.push(values);
+		lines.colors[String(i)] = id === selectedId ? AGGREGATE_SELECTED_COLOR : AGGREGATE_COLOR;
+		if (id === selectedId) lines.selected.push(i);
+	}
+	return lines;
+}
+
+/** The lines of all parts in order, with colours and selections re-indexed. */
+export function concatLines(...parts: ChartLines[]): ChartLines {
+	const lines: ChartLines = {
+		designIds: [],
+		leaves: [],
+		labels: [],
+		values: [],
+		colors: {},
+		selected: []
+	};
+	for (const part of parts) {
+		const offset = lines.designIds.length;
+		lines.designIds.push(...part.designIds);
+		lines.leaves.push(...part.leaves);
+		lines.labels.push(...part.labels);
+		lines.values.push(...part.values);
+		for (const [i, color] of Object.entries(part.colors)) {
+			lines.colors[String(Number(i) + offset)] = color;
+		}
+		lines.selected.push(...part.selected.map((i) => i + offset));
+	}
+	return lines;
+}
+
+/** The scenarios and whether the aggregate are plotted by default: the aggregate alone in the aggregated view, all scenarios in the per-scenario view. */
+export function defaultChartSelection(
+	view: 'aggregated' | 'per_scenario',
+	leaves: string[]
+): { leaves: string[]; aggregate: boolean } {
+	return view === 'aggregated'
+		? { leaves: [], aggregate: true }
+		: { leaves: [...leaves], aggregate: false };
 }
 
 /** Builds line-chart data for scenario objectives, skipping pairs with missing values. */
@@ -202,14 +305,7 @@ export function scenarioLines(
 	leafOrder: string[],
 	objectives: string[],
 	selectedId: number | null
-): {
-	designIds: number[];
-	leaves: string[];
-	labels: string[];
-	values: number[][];
-	colors: Record<string, string>;
-	selected: number[];
-} {
+): ChartLines {
 	const resultDesignIds: number[] = [];
 	const resultLeaves: string[] = [];
 	const labels: string[] = [];
@@ -248,19 +344,21 @@ export function scenarioLines(
 	return { designIds: resultDesignIds, leaves: resultLeaves, labels, values, colors, selected };
 }
 
-/** Computes the reference-point polyline for checked scenarios, detecting shared vs per-leaf values. */
+/**
+ * The reference point on the objective axes for the checked scenarios: each objective from its
+ * target over all scenarios, else from the scenario's own target. Null with a note if the
+ * scenarios' points differ; with no scenarios, only targets over all scenarios are used.
+ */
 export function scenarioReferencePoint(
 	targets: Target[],
 	point: Record<string, number>,
 	objectives: string[],
 	leaves: string[]
 ): { values: number[] | null; shared: boolean; note: string | null } {
-	if (leaves.length === 0) {
-		return { values: null, shared: false, note: null };
-	}
-
+	// Without scenarios, only the targets over all scenarios give the point.
+	const polylineLeaves: (string | null)[] = leaves.length > 0 ? leaves : [null];
 	const results: { values: number[]; shared: boolean }[] = [];
-	for (const leaf of leaves) {
+	for (const leaf of polylineLeaves) {
 		const values: number[] = [];
 		let allShared = true;
 		let valid = true;
