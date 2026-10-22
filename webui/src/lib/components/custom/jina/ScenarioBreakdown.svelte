@@ -11,12 +11,14 @@
 		problem,
 		leafObjectives,
 		failed = {},
-		baselineLeaf = null
+		baselineLeaf = null,
+		leafColors = {}
 	}: {
 		problem: ProblemInfo;
 		leafObjectives: Record<string, Record<string, number>>;
 		failed?: Record<string, string>;
 		baselineLeaf?: string | null;
+		leafColors?: Record<string, string>;
 	} = $props();
 
 	let leaves = $derived([...new Set([...Object.keys(leafObjectives), ...Object.keys(failed)])]);
@@ -47,6 +49,7 @@
 				<Table.Row>
 					<Table.Cell
 						class="truncate px-1"
+						style={leafColors[leaf] ? `color: ${leafColors[leaf]}` : undefined}
 						title={isBaseline ? `${leaf} (baseline leaf of the antifragility analysis)` : leaf}
 					>
 						{#if isBaseline}<span aria-label="baseline">★</span>{/if}

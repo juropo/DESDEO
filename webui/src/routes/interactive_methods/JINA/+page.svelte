@@ -27,8 +27,17 @@
 		objectiveRanges,
 		type Range
 	} from '$lib/components/custom/jina/reference-point';
-	import { MEASURE_LABELS, modelLabel } from '$lib/components/custom/jina/labels';
+	import { MEASURE_LABELS, modelLabel, plural } from '$lib/components/custom/jina/labels';
 	import { pointArray, viewProblem, viewRows } from '$lib/components/custom/jina/view-problem';
+	import {
+		hideLines,
+		scenarioColor,
+		scenarioLines,
+		scenarioProblem,
+		scenarioReferencePoint
+	} from '$lib/components/custom/jina/scenario-chart';
+	import ScenarioPicker from '$lib/components/custom/jina/ScenarioPicker.svelte';
+	import * as DropdownMenu from '$lib/components/ui/dropdown-menu/index.js';
 
 	import type { ProblemInfo } from '$lib/gen/endpoints/DESDEOFastAPI';
 	import type {
@@ -184,6 +193,9 @@
 		selectedDesignId = null;
 		referencePoints = { aggregated: {}, per_scenario: {} };
 		shownIteration = { aggregated: '', per_scenario: '', pool: '' };
+		checkedLeaves = [];
+		hiddenDesigns = [];
+		chartIterationIds = { aggregated: [], per_scenario: [], pool: [] };
 		pending = children
 			.filter((s) => !s.is_ready)
 			.map((s) => ({ id: s.state_id, label: jobLabel(s) }));
@@ -324,19 +336,117 @@
 			: 'No designs in this iteration.'
 	);
 
-	// The shown iteration in the shared chart, with its view's targets as the objectives.
-	let chartRanges = $derived<Record<string, Range>>(
-		(iteration?.result.view ? (setup?.result.ranges?.[iteration.result.view] ?? {}) : {}) as Record<
-			string,
-			Range
-		>
-	);
-	let chartProblem = $derived(problem ? viewProblem(problem, iterationTargets, chartRanges) : null);
-	let chart = $derived(viewRows(iteration?.result.results ?? [], iterationTargets));
-	let chartSelected = $derived.by(() => {
-		const index = selectedDesignId === null ? -1 : chart.designIds.indexOf(selectedDesignId);
-		return index < 0 ? null : index;
+	// Chart state of the current setup: the scenarios whose outcomes are plotted, the designs hidden
+	// from the chart and the iterations plotted in each tab (none chosen: the shown iteration).
+	let checkedLeaves = $state<string[]>([]);
+	let hiddenDesigns = $state<number[]>([]);
+	let chartIterationIds = $state<Record<Tab, number[]>>({
+		aggregated: [],
+		per_scenario: [],
+		pool: []
 	});
+
+	let leafOrder = $derived(setupModel?.leaves ?? []);
+	let leafColors = $derived(Object.fromEntries(leafOrder.map((l, i) => [l, scenarioColor(i)])));
+	let chartIterations = $derived.by(() => {
+		const chosen = tabIterations.filter((s) => chartIterationIds[tab].includes(s.state_id));
+		return chosen.length > 0 ? chosen : iteration ? [iteration] : [];
+	});
+	let scenarioMode = $derived(
+		checkedLeaves.length > 0 && (setup?.result.targets?.per_scenario ?? []).length > 0
+	);
+	// The target view's axes are the shown iteration's targets, so it plots only iterations in that
+	// view; the scenario view plots them all.
+	let comparable = (s: IterateState) => scenarioMode || s.result.view === iteration?.result.view;
+	let plottedIterations = $derived(chartIterations.filter(comparable));
+	let plottedIds = $derived([
+		...new Set(
+			plottedIterations.flatMap((s) =>
+				s.result.results.flatMap((r) => (r.success && r.design_id != null ? [r.design_id] : []))
+			)
+		)
+	]);
+	let allHidden = $derived(
+		plottedIds.length > 0 && plottedIds.every((id) => hiddenDesigns.includes(id))
+	);
+
+	// Target view: the shown iteration's targets as axes, one line per visible design of the plotted
+	// iterations in that view.
+	let targetChart = $derived.by(() => {
+		if (!problem || !iteration) return null;
+		const ranges = (
+			iteration.result.view ? (setup?.result.ranges?.[iteration.result.view] ?? {}) : {}
+		) as Record<string, Range>;
+		const results = plottedIterations.flatMap((s) => s.result.results);
+		const lines = hideLines(viewRows(results, iterationTargets), hiddenDesigns);
+		const previous = tabIterations
+			.slice(0, tabIterations.indexOf(iteration))
+			.filter((s) => s.result.view === iteration.result.view)
+			.at(-1);
+		const previousPoint = previous
+			? pointArray(previous.result.reference_point, iterationTargets)
+			: null;
+		return {
+			problem: viewProblem(problem, iterationTargets, ranges),
+			designIds: lines.designIds,
+			labels: lines.labels,
+			values: lines.values,
+			colors: undefined,
+			reference: pointArray(iteration.result.reference_point, iterationTargets),
+			referenceLabel: 'Reference point',
+			previous: previousPoint ? [previousPoint] : [],
+			note: null as string | null
+		};
+	});
+
+	// Scenario view: the original objectives as axes, one line per visible design and checked
+	// scenario with the design's objective values in that scenario, coloured by scenario.
+	let scenarioChart = $derived.by(() => {
+		if (!problem || !iteration || !setup || !scenarioMode) return null;
+		const chartProblem = scenarioProblem(
+			problem,
+			setup.result.targets?.per_scenario ?? [],
+			(setup.result.ranges?.per_scenario ?? {}) as Record<string, Range>
+		);
+		const objectives = chartProblem.objectives.map((o) => o.symbol);
+		const ids = plottedIds.filter((id) => !hiddenDesigns.includes(id));
+		const leafObjectives = Object.fromEntries(designs.map((d) => [d.id, d.leaf_objectives]));
+		const lines = scenarioLines(
+			ids,
+			leafObjectives,
+			checkedLeaves,
+			leafOrder,
+			objectives,
+			selectedDesignId
+		);
+		const reference = scenarioReferencePoint(
+			iterationTargets,
+			iteration.result.reference_point,
+			objectives,
+			checkedLeaves
+		);
+		return {
+			problem: chartProblem,
+			designIds: lines.designIds,
+			labels: lines.labels,
+			values: lines.values,
+			colors: lines.colors,
+			reference: reference.values,
+			referenceLabel: reference.shared
+				? iteration.result.view === 'aggregated'
+					? 'Reference point (aggregated)'
+					: 'Reference point'
+				: `Reference point — ${checkedLeaves[0]}`,
+			previous: [] as number[][],
+			note: reference.note
+		};
+	});
+
+	let chart = $derived(scenarioChart ?? targetChart);
+	let chartSelected = $derived(
+		chart ? chart.designIds.flatMap((id, i) => (id === selectedDesignId ? [i] : [])) : []
+	);
+
 	// Keeps the selection on a design of the shown iteration when another iteration is shown.
 	$effect(() => {
 		const ids = (iteration?.result.results ?? [])
@@ -346,16 +456,15 @@
 		if (current === null || !ids.includes(current)) selectedDesignId = ids[0] ?? null;
 	});
 
-	// The reference point of the iteration before the shown one in this tab and view.
-	let chartPrevious = $derived.by(() => {
-		if (!iteration) return [];
-		const before = tabIterations
-			.slice(0, tabIterations.indexOf(iteration))
-			.filter((s) => s.result.view === iteration.result.view)
-			.at(-1);
-		const point = before ? pointArray(before.result.reference_point, iterationTargets) : null;
-		return point ? [point] : [];
-	});
+	function toggleChartIteration(id: number, on: boolean) {
+		const current =
+			chartIterationIds[tab].length > 0
+				? chartIterationIds[tab]
+				: iteration
+					? [iteration.state_id]
+					: [];
+		chartIterationIds[tab] = on ? [...current, id] : current.filter((c) => c !== id);
+	}
 </script>
 
 <svelte:head>
@@ -467,6 +576,45 @@
 						</Select.Content>
 					</Select.Root>
 				{/if}
+				{#if tabIterations.length > 1 && iteration}
+					<DropdownMenu.Root>
+						<DropdownMenu.Trigger>
+							{#snippet child({ props })}
+								<Button {...props} variant="outline" size="sm" class="shrink-0">
+									Chart: {chartIterationIds[tab].length > 0
+										? plural(plottedIterations.length, 'iteration')
+										: 'shown iteration'}
+								</Button>
+							{/snippet}
+						</DropdownMenu.Trigger>
+						<DropdownMenu.Content align="end">
+							<DropdownMenu.Item onclick={() => (chartIterationIds[tab] = [])}>
+								Shown iteration only
+							</DropdownMenu.Item>
+							<DropdownMenu.Separator />
+							{#each tabIterations as s, i (s.state_id)}
+								<DropdownMenu.CheckboxItem
+									checked={chartIterations.includes(s) && comparable(s)}
+									disabled={!comparable(s)}
+									onCheckedChange={(on: boolean) => toggleChartIteration(s.state_id, on)}
+									closeOnSelect={false}
+								>
+									{iterationLabel(s, i)}
+									{#if !comparable(s)}
+										<span class="text-xs text-gray-500">(other view)</span>
+									{/if}
+								</DropdownMenu.CheckboxItem>
+							{/each}
+							{#if tabIterations.some((s) => !comparable(s))}
+								<DropdownMenu.Separator />
+								<p class="max-w-64 px-2 py-1 text-xs text-gray-500">
+									Iterations in another view have other targets; check a scenario to compare them by
+									their objective values.
+								</p>
+							{/if}
+						</DropdownMenu.Content>
+					</DropdownMenu.Root>
+				{/if}
 				{#if finalId !== null}
 					<span
 						class="shrink-0 rounded bg-green-100 px-1.5 py-0.5 text-xs whitespace-nowrap text-green-800"
@@ -497,47 +645,67 @@
 				<Resizable.Pane defaultSize={50} minSize={30} class="h-full p-2">
 					{#if !iteration.is_ready}
 						<div class="flex h-full items-center justify-center text-gray-500">Solving…</div>
-					{:else if chart.designIds.length === 0}
+					{:else if !chart || chart.designIds.length === 0}
 						<div class="flex h-full items-center justify-center text-gray-500">
-							{iteration.error ?? emptyMessage}
+							{iteration.error ??
+								(allHidden
+									? 'All designs are hidden. Use Show all or the eye icons to plot them.'
+									: iteration.result.results.some((r) => r.success && r.design_id != null)
+										? 'No visible designs to plot.'
+										: emptyMessage)}
 						</div>
 					{:else}
-						<VisualizationsPanel
-							problem={chartProblem}
-							solutionsObjectiveValues={chart.values}
-							currentPreferenceValues={pointArray(
-								iteration.result.reference_point,
-								iterationTargets
-							) ?? []}
-							previousPreferenceValues={chartPrevious}
-							currentPreferenceType={PREFERENCE_TYPES.ReferencePoint}
-							previousPreferenceType={PREFERENCE_TYPES.ReferencePoint}
-							externalSelectedIndex={chartSelected}
-							onSelectSolution={(index: number) => {
-								selectedDesignId = chart.designIds[index] ?? null;
-							}}
-							lineLabels={Object.fromEntries(chart.labels.map((label, i) => [String(i), label]))}
-							verticalAxisLabels
-							compactTickLabels
-							fitMargins
-							minAxisSpacing={80}
-							referenceDataLabels={{
-								currentRefLabel: 'Reference point',
-								previousRefLabel: 'Previous reference point'
-							}}
-						/>
+						<div class="flex h-full flex-col">
+							<div class="min-h-0 flex-1">
+								<VisualizationsPanel
+									problem={chart.problem}
+									solutionsObjectiveValues={chart.values}
+									currentPreferenceValues={chart.reference ?? []}
+									previousPreferenceValues={chart.previous}
+									currentPreferenceType={PREFERENCE_TYPES.ReferencePoint}
+									previousPreferenceType={PREFERENCE_TYPES.ReferencePoint}
+									externalSelectedIndexes={chartSelected}
+									onSelectSolution={(index: number) => {
+										selectedDesignId = chart?.designIds[index] ?? null;
+									}}
+									lineLabels={Object.fromEntries(
+										chart.labels.map((label, i) => [String(i), label])
+									)}
+									colorByIndex={chart.colors}
+									verticalAxisLabels
+									compactTickLabels
+									fitMargins
+									minAxisSpacing={80}
+									referenceDataLabels={{
+										currentRefLabel: chart.referenceLabel,
+										previousRefLabel: 'Previous reference point'
+									}}
+								/>
+							</div>
+							{#if chart.note}
+								<p class="shrink-0 text-xs text-gray-500">{chart.note}</p>
+							{/if}
+						</div>
 					{/if}
 				</Resizable.Pane>
 				<ResizableHandle withHandle />
 				<Resizable.Pane defaultSize={50} minSize={30} class="h-full">
-					<div class="h-full min-w-0 overflow-auto p-2">
+					<div class="h-full min-w-0 space-y-3 overflow-auto p-2">
+						<ScenarioPicker
+							leaves={leafOrder}
+							baselineLeaf={setup?.result.baseline_leaf ?? null}
+							bind:checked={checkedLeaves}
+						/>
 						{#if selectedDesign}
-							<h3 class="mb-1 text-sm font-semibold">Design #{selectedDesign.id} by scenario</h3>
-							<ScenarioBreakdown
-								{problem}
-								leafObjectives={selectedDesign.leaf_objectives ?? {}}
-								baselineLeaf={setup?.result.baseline_leaf ?? null}
-							/>
+							<div class="border-t pt-2">
+								<h3 class="mb-1 text-sm font-semibold">Design #{selectedDesign.id} by scenario</h3>
+								<ScenarioBreakdown
+									{problem}
+									leafObjectives={selectedDesign.leaf_objectives ?? {}}
+									baselineLeaf={setup?.result.baseline_leaf ?? null}
+									{leafColors}
+								/>
+							</div>
 						{:else}
 							<p class="text-sm text-gray-500">Select a design to see its values by scenario.</p>
 						{/if}
@@ -559,6 +727,7 @@
 				designVariables={setup.result.design_variables}
 				nameLabel={tab === 'pool' ? 'Scorer' : 'Variant'}
 				bind:selectedId={selectedDesignId}
+				bind:hidden={hiddenDesigns}
 			/>
 		{/if}
 	{/snippet}
