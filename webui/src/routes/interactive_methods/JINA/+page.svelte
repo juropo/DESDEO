@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, untrack } from 'svelte';
 	import { BaseLayout } from '$lib/components/custom/method_layout/index.js';
 	import { methodSelection } from '../../../stores/methodSelection';
 	import { errorMessage, isLoading } from '../../../stores/uiState';
@@ -11,7 +11,8 @@
 	import * as Select from '$lib/components/ui/select/index.js';
 	import * as Tabs from '$lib/components/ui/tabs/index.js';
 	import { Button } from '$lib/components/ui/button';
-	import ParallelCoordinates from '$lib/components/visualizations/parallel-coordinates/parallel-coordinates.svelte';
+	import VisualizationsPanel from '$lib/components/custom/visualizations-panel/visualizations-panel.svelte';
+	import { PREFERENCE_TYPES } from '$lib/constants';
 
 	import SetupDialog from '$lib/components/custom/jina/SetupDialog.svelte';
 	import ReferencePointEditor from '$lib/components/custom/jina/ReferencePointEditor.svelte';
@@ -26,7 +27,8 @@
 		objectiveRanges,
 		type Range
 	} from '$lib/components/custom/jina/reference-point';
-	import { MEASURE_LABELS, targetLabel } from '$lib/components/custom/jina/labels';
+	import { MEASURE_LABELS, modelLabel } from '$lib/components/custom/jina/labels';
+	import { pointArray, viewProblem, viewRows } from '$lib/components/custom/jina/view-problem';
 
 	import type { ProblemInfo } from '$lib/gen/endpoints/DESDEOFastAPI';
 	import type {
@@ -316,26 +318,43 @@
 		return `Iteration ${index + 1}${viewLabel}`;
 	}
 
-	let pcDimensions = $derived(
-		problem
-			? iterationTargets.map((t) => ({
-					symbol: t.symbol,
-					name: targetLabel(problem!, t),
-					direction: (t.maximize ? 'max' : 'min') as 'max' | 'min'
-				}))
-			: []
-	);
 	let emptyMessage = $derived(
 		iteration?.result.mode === 'pool'
 			? 'No unpicked designs left.'
 			: 'No designs in this iteration.'
 	);
-	let pcRows = $derived(
-		(iteration?.result.results ?? []).filter((r) => r.success && r.design_id != null)
+
+	// The shown iteration in the shared chart, with its view's targets as the objectives.
+	let chartRanges = $derived<Record<string, Range>>(
+		(iteration?.result.view ? (setup?.result.ranges?.[iteration.result.view] ?? {}) : {}) as Record<
+			string,
+			Range
+		>
 	);
-	let pcSelected = $derived.by(() => {
-		const index = pcRows.findIndex((r) => r.design_id === selectedDesignId);
+	let chartProblem = $derived(problem ? viewProblem(problem, iterationTargets, chartRanges) : null);
+	let chart = $derived(viewRows(iteration?.result.results ?? [], iterationTargets));
+	let chartSelected = $derived.by(() => {
+		const index = selectedDesignId === null ? -1 : chart.designIds.indexOf(selectedDesignId);
 		return index < 0 ? null : index;
+	});
+	// Keeps the selection on a design of the shown iteration when another iteration is shown.
+	$effect(() => {
+		const ids = (iteration?.result.results ?? [])
+			.map((r) => r.design_id)
+			.filter((id): id is number => id != null);
+		const current = untrack(() => selectedDesignId);
+		if (current === null || !ids.includes(current)) selectedDesignId = ids[0] ?? null;
+	});
+
+	// The reference point of the iteration before the shown one in this tab and view.
+	let chartPrevious = $derived.by(() => {
+		if (!iteration) return [];
+		const before = tabIterations
+			.slice(0, tabIterations.indexOf(iteration))
+			.filter((s) => s.result.view === iteration.result.view)
+			.at(-1);
+		const point = before ? pointArray(before.result.reference_point, iterationTargets) : null;
+		return point ? [point] : [];
 	});
 </script>
 
@@ -373,11 +392,12 @@
 	bottomPanelTitle={tab === 'pool' ? 'Pool picks' : 'Iteration results'}
 >
 	{#snippet leftSidebar()}
-		<div class="space-y-4 p-3">
+		<!-- At most the viewport's height: the editor scrolls and the solve button stays visible. -->
+		<div class="flex max-h-[calc(100vh-3rem)] flex-col gap-4 p-3">
 			{#if setup && setupModel}
 				<div class="space-y-1 text-xs text-gray-600">
-					<p>
-						Scenario model #{setupModel.id}: {setupModel.leaves.join(', ')}
+					<p class="truncate" title={modelLabel(setupModel, true)}>
+						Scenario model {modelLabel(setupModel)}
 					</p>
 					<p>
 						Aggregation: {MEASURE_LABELS[setup.result.measure]}{setup.result.measure === 'cvar'
@@ -388,7 +408,7 @@
 					<p>Baseline leaf: {setup.result.baseline_leaf ?? 'none'}</p>
 				</div>
 			{/if}
-			<Button variant="outline" size="sm" onclick={() => (showSetup = true)}>
+			<Button variant="outline" size="sm" class="self-start" onclick={() => (showSetup = true)}>
 				{setup ? 'New setup' : 'Set up'}
 			</Button>
 			{#if setupJobId !== null}
@@ -408,14 +428,16 @@
 					</div>
 				{/if}
 				<h3 class="text-sm font-semibold">Reference point</h3>
-				<ReferencePointEditor
-					{problem}
-					{targets}
-					{ranges}
-					previous={previousPoints[view] ?? null}
-					bind:value={referencePoints[view]}
-				/>
-				<Button class="w-full" onclick={runIterate}>
+				<div class="min-h-0 flex-1 overflow-y-auto pr-1">
+					<ReferencePointEditor
+						{problem}
+						{targets}
+						{ranges}
+						previous={previousPoints[view] ?? null}
+						bind:value={referencePoints[view]}
+					/>
+				</div>
+				<Button class="w-full shrink-0" onclick={runIterate}>
 					{tab === 'pool' ? 'Pick from pool' : 'Solve'}
 				</Button>
 			{/if}
@@ -472,38 +494,42 @@
 			</div>
 		{:else}
 			<Resizable.PaneGroup direction="horizontal" class="h-full">
-				<Resizable.Pane defaultSize={60} minSize={30} class="h-full p-2">
+				<Resizable.Pane defaultSize={50} minSize={30} class="h-full p-2">
 					{#if !iteration.is_ready}
 						<div class="flex h-full items-center justify-center text-gray-500">Solving…</div>
-					{:else if pcRows.length === 0}
+					{:else if chart.designIds.length === 0}
 						<div class="flex h-full items-center justify-center text-gray-500">
 							{iteration.error ?? emptyMessage}
 						</div>
 					{:else}
-						<ParallelCoordinates
-							data={pcRows.map((r) => r.target_values ?? {})}
-							dimensions={pcDimensions}
-							lineLabels={Object.fromEntries(
-								pcRows.map((r, i) => [String(i), `#${r.design_id} ${r.name}`])
-							)}
-							referenceData={{
-								referencePoint: {
-									values: iteration.result.reference_point,
-									label: 'Reference point'
-								}
+						<VisualizationsPanel
+							problem={chartProblem}
+							solutionsObjectiveValues={chart.values}
+							currentPreferenceValues={pointArray(
+								iteration.result.reference_point,
+								iterationTargets
+							) ?? []}
+							previousPreferenceValues={chartPrevious}
+							currentPreferenceType={PREFERENCE_TYPES.ReferencePoint}
+							previousPreferenceType={PREFERENCE_TYPES.ReferencePoint}
+							externalSelectedIndex={chartSelected}
+							onSelectSolution={(index) => {
+								selectedDesignId = chart.designIds[index] ?? null;
 							}}
-							selectedIndex={pcSelected}
+							lineLabels={Object.fromEntries(chart.labels.map((label, i) => [String(i), label]))}
 							verticalAxisLabels
 							compactTickLabels
 							fitMargins
-							onLineSelect={(index) => {
-								if (index !== null) selectedDesignId = pcRows[index]?.design_id ?? null;
+							minAxisSpacing={80}
+							referenceDataLabels={{
+								currentRefLabel: 'Reference point',
+								previousRefLabel: 'Previous reference point'
 							}}
 						/>
 					{/if}
 				</Resizable.Pane>
 				<ResizableHandle withHandle />
-				<Resizable.Pane defaultSize={40} minSize={20} class="h-full">
+				<Resizable.Pane defaultSize={50} minSize={30} class="h-full">
 					<div class="h-full min-w-0 overflow-auto p-2">
 						{#if selectedDesign}
 							<h3 class="mb-1 text-sm font-semibold">Design #{selectedDesign.id} by scenario</h3>

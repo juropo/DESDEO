@@ -39,6 +39,19 @@ export function formatNumber(value: number | null | undefined, digits = 4): stri
 	return Number(value.toPrecision(digits)).toString();
 }
 
+/** A number in compact SI form, e.g. "-32.1M", "7.9k", "158", "0.12". */
+export function compactNumber(value: number | null | undefined): string {
+	if (value === null || value === undefined || !Number.isFinite(value)) return '—';
+	if (value === 0) return '0';
+	const abs = Math.abs(value);
+	const [divisor, suffix] =
+		abs >= 1e9 ? [1e9, 'B'] : abs >= 1e6 ? [1e6, 'M'] : abs >= 1e3 ? [1e3, 'k'] : [1, ''];
+	const scaled = value / divisor;
+	if (!suffix && abs < 1) return formatNumber(value, 2);
+	const digits = Math.abs(scaled) >= 100 ? 0 : Math.abs(scaled) >= 10 ? 1 : suffix ? 1 : 2;
+	return `${Number(scaled.toFixed(digits))}${suffix}`;
+}
+
 /** Scalars as numbers; vectors and matrices by their first entries. */
 export function formatValue(value: unknown): string {
 	if (typeof value === 'number') return formatNumber(value);

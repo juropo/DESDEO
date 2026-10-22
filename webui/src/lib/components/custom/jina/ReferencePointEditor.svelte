@@ -9,6 +9,7 @@
 	import { SegmentedControl } from '$lib/components/custom/segmented-control';
 	import type { ProblemInfo, Target } from '$lib/gen/endpoints/DESDEOFastAPI';
 	import {
+		applyEntry,
 		changeToRaw,
 		percentToRaw,
 		rawToChange,
@@ -56,27 +57,52 @@
 		return Number(raw.toPrecision(6));
 	}
 
-	/** Apply an entered value; a rejected one resets the input to the value that will be sent. */
-	function update(target: Target, input: HTMLInputElement) {
-		const raw = toRaw(target, input.value);
-		if (raw === null) {
-			const current = shown(target);
-			input.value = current === null ? '' : String(current);
-			return;
-		}
-		value = { ...value, [target.symbol]: raw };
+	// Text being typed per target, shown instead of the converted value until the input is left,
+	// and the value each input had when it was focused.
+	let drafts = $state<Record<string, string>>({});
+	let warnings = $state<Record<string, string>>({});
+	let atFocus: Record<string, number | undefined> = {};
+
+	$effect(() => {
+		void mode;
+		drafts = {};
+		warnings = {};
+	});
+
+	function without<T>(record: Record<string, T>, key: string): Record<string, T> {
+		const { [key]: _, ...rest } = record;
+		return rest;
 	}
 
-	function toRaw(target: Target, input: string): number | null {
-		const entered = Number(input);
+	function focused(target: Target) {
+		atFocus[target.symbol] = value[target.symbol];
+	}
+
+	/** Apply each keystroke at once, so a typed value is never lost; an invalid entry restores the value at focus. */
+	function typed(target: Target, input: string) {
+		drafts = { ...drafts, [target.symbol]: input };
 		const range = ranges[target.symbol];
-		if (input === '' || !Number.isFinite(entered) || !range) return null;
-		if (mode === 'percent') return percentToRaw(entered, range);
-		if (mode === 'change') {
-			const prev = previous?.[target.symbol];
-			return prev === undefined ? null : changeToRaw(entered, prev, range);
-		}
-		return entered;
+		const initial = atFocus[target.symbol] ?? value[target.symbol];
+		const prev = previous?.[target.symbol];
+		if (!range || initial === undefined || (mode === 'change' && prev === undefined)) return;
+		const convert =
+			mode === 'percent'
+				? (v: number) => percentToRaw(v, range)
+				: mode === 'change'
+					? (v: number) => changeToRaw(v, prev!, range)
+					: (v: number) => v;
+		const result = applyEntry(input, initial, convert, mode === 'percent' ? [0, 100] : undefined);
+		warnings = result.warning
+			? { ...warnings, [target.symbol]: result.warning }
+			: without(warnings, target.symbol);
+		value = { ...value, [target.symbol]: result.value };
+	}
+
+	/** On leaving the input, show the value that will be sent. */
+	function left(target: Target) {
+		drafts = without(drafts, target.symbol);
+		warnings = without(warnings, target.symbol);
+		atFocus[target.symbol] = undefined;
 	}
 </script>
 
@@ -94,7 +120,7 @@
 	</p>
 	{#each targets as target (target.symbol)}
 		{@const range = ranges[target.symbol]}
-		<div class="grid gap-1">
+		<div class="grid grid-cols-[minmax(0,1fr)] gap-1">
 			<label for="rp-{target.symbol}" class="text-sm font-medium">
 				{targetLabel(problem, target)}
 				<span class="text-gray-500">({target.maximize ? 'max' : 'min'})</span>
@@ -105,20 +131,29 @@
 					type="number"
 					step="any"
 					class="w-28 rounded border px-2 py-1 text-sm"
-					value={shown(target)}
-					onchange={(e) => update(target, e.currentTarget)}
+					min={mode === 'percent' ? 0 : undefined}
+					max={mode === 'percent' ? 100 : undefined}
+					value={drafts[target.symbol] ?? shown(target)}
+					onfocus={() => focused(target)}
+					oninput={(e) => typed(target, e.currentTarget.value)}
+					onblur={() => left(target)}
 				/>
 				{#if mode !== 'raw'}
 					<span class="text-xs text-gray-600">= {formatNumber(value[target.symbol])}</span>
 				{/if}
 			</div>
-			{#if range}
-				<span class="text-xs text-gray-500">
-					ideal {formatNumber(range[0])} · nadir {formatNumber(range[1])}
-					{#if previous?.[target.symbol] !== undefined}
-						· previous {formatNumber(previous[target.symbol])}
-					{/if}
+			<!-- The warning takes the place of the range line, so nothing below moves when it appears. -->
+			{#if warnings[target.symbol]}
+				<span class="truncate text-xs text-amber-700" role="alert" title={warnings[target.symbol]}>
+					{warnings[target.symbol]}
 				</span>
+			{:else if range}
+				{@const hint = `ideal ${formatNumber(range[0])} · nadir ${formatNumber(range[1])}${
+					previous?.[target.symbol] !== undefined
+						? ` · previous ${formatNumber(previous[target.symbol])}`
+						: ''
+				}`}
+				<span class="truncate text-xs text-gray-500" title={hint}>{hint}</span>
 			{/if}
 		</div>
 	{/each}

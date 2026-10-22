@@ -7,6 +7,7 @@ import {
 	midpoint,
 	objectiveRanges,
 	finitePoint,
+	applyEntry,
 	midpointPrefill,
 	type Range
 } from './reference-point';
@@ -98,5 +99,29 @@ describe('finitePoint', () => {
 describe('midpointPrefill', () => {
 	it('rounds midpoints to four significant digits and leaves objectives without a range empty', () => {
 		expect(midpointPrefill(['a', 'b'], { a: [0, 2 / 3] })).toEqual({ a: 0.3333, b: null });
+	});
+});
+
+describe('applyEntry', () => {
+	const toRaw = (pct: number) => percentToRaw(pct, minimised);
+
+	it('applies a valid entry', () => {
+		expect(applyEntry('25', 6, toRaw, [0, 100])).toEqual({ value: 8, warning: null });
+	});
+
+	it('reverts to the value at focus, not a valid prefix, once the entry goes out of range', () => {
+		// Typing 5000 passes through the valid prefixes 5 and 50 before leaving the range.
+		const steps = ['5', '50', '500', '5000'].map((entry) => applyEntry(entry, 9, toRaw, [0, 100]));
+		expect(steps[1]).toEqual({ value: 6, warning: null });
+		expect(steps[3]).toEqual({ value: 9, warning: 'Must be 0–100; not applied.' });
+	});
+
+	it('keeps the value at focus for empty or non-numeric entries', () => {
+		expect(applyEntry('', 9, toRaw, [0, 100])).toEqual({ value: 9, warning: null });
+		expect(applyEntry('-', 9, toRaw, [0, 100])).toEqual({ value: 9, warning: null });
+	});
+
+	it('has no bounds unless given', () => {
+		expect(applyEntry('5000', 6, (v) => v)).toEqual({ value: 5000, warning: null });
 	});
 });

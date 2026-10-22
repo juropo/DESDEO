@@ -77,3 +77,21 @@ export function midpointPrefill(
 		objectives.map((obj) => [obj, ranges[obj] ? roundSignificant(midpoint(ranges[obj])) : null])
 	);
 }
+
+/**
+ * The aspiration level an entry being typed gives: the converted entry, or the level the input had
+ * when focused if the entry is not a number or lies outside `bounds`, with a warning in the latter case.
+ */
+export function applyEntry(
+	entry: string,
+	atFocus: number,
+	convert: (entered: number) => number,
+	bounds?: [number, number]
+): { value: number; warning: string | null } {
+	const entered = Number(entry);
+	if (entry.trim() === '' || !Number.isFinite(entered)) return { value: atFocus, warning: null };
+	if (bounds && (entered < bounds[0] || entered > bounds[1])) {
+		return { value: atFocus, warning: `Must be ${bounds[0]}–${bounds[1]}; not applied.` };
+	}
+	return { value: convert(entered), warning: null };
+}
