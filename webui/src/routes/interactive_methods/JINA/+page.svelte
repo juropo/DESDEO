@@ -140,9 +140,9 @@
 
 	let selectedDesign = $derived(designs.find((d) => d.id === selectedDesignId) ?? null);
 	let representativeSets = $derived(
-		(problem?.problem_metadata?.representative_nd_metadata ?? [])
-			.filter((s) => s.id != null)
-			.map((s) => ({ id: s.id as number, name: s.name }))
+		(problem?.problem_metadata?.representative_nd_metadata ?? []).flatMap((s) =>
+			s.id == null ? [] : [{ id: s.id, name: s.name }]
+		)
 	);
 	let setupModel = $derived(scenarioModels.find((m) => m.id === setup?.result.scenario_model_id));
 
@@ -187,7 +187,7 @@
 		pending = children
 			.filter((s) => !s.is_ready)
 			.map((s) => ({ id: s.state_id, label: jobLabel(s) }));
-		if (ready) refreshDesigns();
+		if (ready) void refreshDesigns();
 	}
 
 	// Only the response to the latest request for the current setup is kept.
@@ -228,7 +228,7 @@
 
 	function afterIterate(state: JinaStateResponse) {
 		if (state.result.kind !== 'jina.iterate') return;
-		refreshDesigns();
+		void refreshDesigns();
 		const first = state.result.results.find((r) => r.design_id != null)?.design_id;
 		if (state.result.mode !== 'import' && first != null) selectedDesignId = first;
 	}
@@ -380,7 +380,7 @@
 		problemId={problem.id}
 		{scenarioModels}
 		onStart={startSetup}
-		onStarted={(state) => (setupJobId = state.state_id)}
+		onStarted={(state: JinaStateResponse) => (setupJobId = state.state_id)}
 	/>
 {/if}
 
@@ -513,7 +513,7 @@
 							currentPreferenceType={PREFERENCE_TYPES.ReferencePoint}
 							previousPreferenceType={PREFERENCE_TYPES.ReferencePoint}
 							externalSelectedIndex={chartSelected}
-							onSelectSolution={(index) => {
+							onSelectSolution={(index: number) => {
 								selectedDesignId = chart.designIds[index] ?? null;
 							}}
 							lineLabels={Object.fromEntries(chart.labels.map((label, i) => [String(i), label]))}

@@ -70,7 +70,8 @@
 	});
 
 	function without<T>(record: Record<string, T>, key: string): Record<string, T> {
-		const { [key]: _, ...rest } = record;
+		const rest = { ...record };
+		delete rest[key];
 		return rest;
 	}
 
