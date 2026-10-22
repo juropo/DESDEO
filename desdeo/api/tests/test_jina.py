@@ -599,6 +599,29 @@ def test_iterate_failure(client: TestClient, session_and_user: dict, monkeypatch
     assert body["result"]["designs"] == []
 
 
+def test_cvar_maximize_setup(client: TestClient, session_and_user: dict):
+    """A CVaR setup with a maximised objective computes its ranges."""
+    session = session_and_user["session"]
+    model = simple_scenario_model()
+    f_3 = model.base_problem.objectives[0].model_copy(update={"func": ["Multiply", 1, "x_2"], "maximize": True})
+    model = model.with_base_problem(model.base_problem.model_copy(update={"objectives": [f_3]}))
+    max_db = ProblemDB.from_problem(model.base_problem, user=session_and_user["user"])
+    session.add(max_db)
+    session.commit()
+    session.refresh(max_db)
+    session.add(ScenarioModelDB.from_scenario_model(model, user=session_and_user["user"], base_problem_id=max_db.id))
+    session.commit()
+    token = login(client)
+
+    result = _setup(client, token, max_db.id, measure="cvar")["result"]
+    aggregated = result["targets"]["aggregated"]
+    assert [t["maximize"] for t in aggregated] == [True, False, False]
+    assert set(result["ranges"]["aggregated"]) == {t["symbol"] for t in aggregated}
+    for t in aggregated:
+        ideal, nadir = result["ranges"]["aggregated"][t["symbol"]]
+        assert ideal >= nadir if t["maximize"] else ideal <= nadir
+
+
 def test_invalid_inputs(client: TestClient, session_and_user: dict):
     """Invalid setups and iterations are rejected."""
     seeded = _seed(session_and_user)
@@ -635,20 +658,6 @@ def test_invalid_inputs(client: TestClient, session_and_user: dict):
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
     )
     assert response.status_code == 422
-
-    # CVaR of a maximised objective is rejected before the setup is stored.
-    model = simple_scenario_model()
-    f_3 = model.base_problem.objectives[0].model_copy(update={"func": ["Multiply", 1, "x_2"], "maximize": True})
-    model = model.with_base_problem(model.base_problem.model_copy(update={"objectives": [f_3]}))
-    max_db = ProblemDB.from_problem(model.base_problem, user=session_and_user["user"])
-    session.add(max_db)
-    session.commit()
-    session.refresh(max_db)
-    session.add(ScenarioModelDB.from_scenario_model(model, user=session_and_user["user"], base_problem_id=max_db.id))
-    session.commit()
-    response = post_json(client, f"{URL}/setup", {"problem_id": max_db.id, "measure": "cvar"}, token)
-    assert response.status_code == 422
-    assert "CVaR" in response.json()["detail"]
 
     other_id, foreign_id = _setup_simple_scenario(session_and_user)
     assert setup_status(scenario_model_id=foreign_id) == 422

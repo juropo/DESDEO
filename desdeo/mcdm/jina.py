@@ -103,8 +103,7 @@ def build_jina_problem(
         The JINA problem.
 
     Raises:
-        ValueError: if ``view`` or ``measure`` is unknown, or ``measure="cvar"`` would aggregate a
-            maximised objective, since that CVaR formulation is unbounded for maximisation.
+        ValueError: if ``view`` or ``measure`` is unknown.
     """
     if view not in get_args(View):
         raise ValueError(f"Unknown view '{view}'.")
@@ -133,10 +132,6 @@ def build_jina_problem(
             ]
 
     if aggregate:
-        if measure == "cvar" and (maximized := [sym for sym in aggregate if maximize[obj_maps[sym][leaves[0]]]]):
-            names = {obj.symbol: obj.name for obj in [*model.objectives, *model.base_problem.objectives]}
-            listed = ", ".join(f"{names.get(sym, sym)} ({sym})" for sym in maximized)
-            raise ValueError(f"CVaR is not supported for maximised objectives: {listed}.")
         if measure == "worst_case":
             combined, added = add_worst_case_robust(model, aggregate, combined=combined, symbol_maps=symbol_maps)
         elif measure == "expected_value":
@@ -567,7 +562,8 @@ def aggregate_outcomes(
     A per-leaf target takes the value of its leaf.  A target over all leaves aggregates them with
     ``measure`` as `build_jina_problem` does: the worst case in the objective's direction, the
     probability-weighted sum, or the CVaR ``min_eta eta + 1 / (1 - alpha) * sum_s p_s * max(v_s - eta, 0)``.
-    For a maximised target, the CVaR is that of the negated values, negated back.
+    For a maximised target, the CVaR is that of the negated values, negated back, i.e., the mean of
+    the lowest ``1 - alpha`` tail.
 
     Args:
         targets: the targets.

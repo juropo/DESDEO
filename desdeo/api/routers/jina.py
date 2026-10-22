@@ -591,13 +591,6 @@ def setup(
         targets=None,
         ranges=None,
     )
-    if setup.measure == "cvar" and any(obj.maximize for obj in [*model.base_problem.objectives, *model.objectives]):
-        # Building is the exact check of whether a maximised objective would be aggregated.
-        try:
-            _jina_problem(problem_db.id, setup, "aggregated", model)
-        except ValueError as e:
-            raise _unprocessable(str(e)) from e
-
     sub = JinaSetupState(**setup.model_dump(exclude={"kind", "targets", "ranges"}))
     state = _create_state(context, sub, request.parent_state_id)
     background_tasks.add_task(

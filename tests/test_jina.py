@@ -125,12 +125,6 @@ def test_maximize_targets(model):
     assert [t.maximize for t in per_scenario if t.objective == "f_3"] == [True] * 3
 
 
-def test_cvar_maximize_rejected(model):
-    """CVaR of a maximised objective is rejected, naming the objective by name and symbol."""
-    with pytest.raises(ValueError, match=r"CVaR is not supported for maximised objectives: .+ \(f_3\)\."):
-        build_jina_problem(_maximize_f_3(model), "aggregated", "cvar")
-
-
 def test_build_rejects_unknown_view_and_measure(model):
     """Unknown views and measures are rejected when building."""
     with pytest.raises(ValueError, match="view"):
@@ -198,9 +192,12 @@ def test_solve_variants(model, solver, measure, maximize):
 
 
 @pytest.mark.parametrize("solver", SOLVERS)
-def test_solve_variants_cvar(model, solver):
+@pytest.mark.parametrize("maximize", [False, True], ids=["min", "max"])
+def test_solve_variants_cvar(model, solver, maximize):
     """The CVaR problem builds and every variant solves."""
+    model = _maximize_f_3(model) if maximize else model
     jp = build_jina_problem(model, "aggregated", "cvar", cvar_alpha=0.8)
+    assert jp.targets[0].maximize == maximize
     ranges = target_ranges(jp, model, solver)
     results = solve_variants(jp, _midpoint(ranges), ranges, solver, design_variables=["x_1"])
     assert all(r.success for r in results), [r.message for r in results]
@@ -293,19 +290,24 @@ def _solve_balanced(jp, rp, ranges, rho=1e-3):
 
 @pytest.mark.gurobipy
 @pytest.mark.parametrize("measure", ["worst_case", "expected_value", "cvar"])
-def test_aggregate_outcomes_matches_symbolic(model, measure):
+@pytest.mark.parametrize("maximize", [False, True], ids=["min", "max"])
+def test_aggregate_outcomes_matches_symbolic(model, measure, maximize):
     """The numpy aggregation of per-leaf outcomes equals the solved aggregated objective values."""
+    model = _maximize_f_3(model) if maximize else model
     jp = build_jina_problem(model, "aggregated", measure, cvar_alpha=0.6)
+    assert jp.targets[0].maximize == maximize
     ranges = target_ranges(jp, model, GurobipySolver)
     results, _ = _solve_balanced(jp, _midpoint(ranges), ranges)
     assert results.success
 
     values = target_values(jp, outcomes_from_combined(results.optimal_objectives, jp.symbol_maps))
-    symbolic = {t.symbol: results.optimal_objectives[t.symbol] for t in jp.targets}
-    # Auxiliary variables of a target are only pushed down by the small augmentation term, so the
-    # symbolic value bounds the aggregate from above, tightly up to the solver's feasibility tolerance.
-    for sym, value in symbolic.items():
-        assert values[sym] <= value + 1e-5
+    symbolic = {t.symbol: (results.optimal_objectives[t.symbol], t.maximize) for t in jp.targets}
+    # Auxiliary variables of a target are only pushed towards optimal by the small augmentation term,
+    # so the symbolic value bounds the aggregate from the worse side, tightly up to the solver's
+    # feasibility tolerance.
+    for sym, (value, maximized) in symbolic.items():
+        sign = -1 if maximized else 1
+        assert sign * values[sym] <= sign * value + 1e-5
         assert values[sym] == pytest.approx(value, rel=1e-3)
 
 
