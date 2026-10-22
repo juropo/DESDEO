@@ -109,6 +109,8 @@
 		compactTickLabels?: boolean;
 		fitMargins?: boolean;
 		minAxisSpacing?: number;
+		// Fixed stroke colour per line index; unlisted lines use the default colouring
+		colorByIndex?: { [key: string]: string };
 	}
 
 	const {
@@ -129,7 +131,8 @@
 		verticalAxisLabels = false,
 		compactTickLabels = false,
 		fitMargins = false,
-		minAxisSpacing = undefined
+		minAxisSpacing = undefined,
+		colorByIndex = undefined
 	}: Props = $props();
 
 	/**
@@ -271,6 +274,7 @@
 					{compactTickLabels}
 					{fitMargins}
 					{minAxisSpacing}
+					{colorByIndex}
 				/>
 			{:else if visualizationType === 'bar'}
 				<!-- Placeholder for Bar Chart Visualization -->
