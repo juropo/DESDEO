@@ -453,11 +453,12 @@
 		const aggregatedValues = Object.fromEntries(
 			designs.map((d) => [d.id, d.target_values.aggregated])
 		);
+		// Aggregate lines last so they are drawn on top of the scenario lines.
 		const lines = concatLines(
+			scenarioLines(ids, leafObjectives, leaves, leafOrder, objectives, selectedDesignId),
 			...(showAggregate
 				? [aggregateLines(ids, aggregatedValues, aggregatedTargets, objectives, selectedDesignId)]
-				: []),
-			scenarioLines(ids, leafObjectives, leaves, leafOrder, objectives, selectedDesignId)
+				: [])
 		);
 		const current = scenarioReferencePoint(
 			setup.result.targets?.[view] ?? [],
