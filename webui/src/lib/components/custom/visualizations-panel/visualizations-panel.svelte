@@ -111,6 +111,8 @@
 		minAxisSpacing?: number;
 		// Fixed stroke colour per line index; unlisted lines use the default colouring
 		colorByIndex?: { [key: string]: string };
+		// Whether to show the header row above the chart
+		showHeader?: boolean;
 	}
 
 	const {
@@ -132,7 +134,8 @@
 		compactTickLabels = false,
 		fitMargins = false,
 		minAxisSpacing = undefined,
-		colorByIndex = undefined
+		colorByIndex = undefined,
+		showHeader = true
 	}: Props = $props();
 
 	/**
@@ -228,7 +231,7 @@
 	// Calculate dynamic height for visualizations
 	const plotHeight = $derived(() => {
 		// Reserve space for header with visualization selector, instructions, and table
-		const reservedSpace = 50; // Increased to accommodate the visualization selector, adjust based on your layout, maybe a prop? TODO
+		const reservedSpace = showHeader ? 50 : 0; // Increased to accommodate the visualization selector, adjust based on your layout, maybe a prop? TODO
 		return Math.max(containerSize.height - reservedSpace, 10);
 	});
 </script>
@@ -245,6 +248,7 @@
 <div bind:this={containerElement} class="flex h-full w-full flex-col space-y-4 overflow-hidden">
 	{#if solutionsObjectiveValues.length > 0}
 		<!-- Visualization Type Selector -->
+		{#if showHeader}
 		<div class="mb-2 flex items-center justify-between">
 			<h3>Visualization</h3>
 			<SegmentedControl
@@ -257,6 +261,7 @@
 			/>
 			<!--To implement the bar chart, remove the invisible class above and add the visualization below-->
 		</div>
+		{/if}
 
 		<!-- Visualization Container with dynamic height -->
 		<div class="w-full border-t border-gray-200" style="height: {plotHeight()}px;">
