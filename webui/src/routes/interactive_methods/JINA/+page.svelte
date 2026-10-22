@@ -199,6 +199,7 @@
 		shownIteration = { aggregated: '', per_scenario: '', pool: '' };
 		chartSelections = { aggregated: null, per_scenario: null };
 		hiddenDesigns = [];
+		collapsedGroups = [];
 		chartIterationIds = { aggregated: [], per_scenario: [], pool: [] };
 		pending = children
 			.filter((s) => !s.is_ready)
@@ -348,6 +349,8 @@
 		per_scenario: null
 	});
 	let hiddenDesigns = $state<number[]>([]);
+	// Objective groups collapsed in the reference-point editor.
+	let collapsedGroups = $state<string[]>([]);
 	let chartIterationIds = $state<Record<Tab, number[]>>({
 		aggregated: [],
 		per_scenario: [],
@@ -582,13 +585,15 @@
 					</div>
 				{/if}
 				<h3 class="text-sm font-semibold">Reference point</h3>
-				<div class="min-h-0 flex-1 overflow-y-auto pr-1">
+				<div class="relative min-h-0 flex-1 overflow-y-auto pr-1">
 					<ReferencePointEditor
 						{problem}
 						{targets}
 						{ranges}
 						previous={previousPoints[view] ?? null}
 						bind:value={referencePoints[view]}
+						checkedLeaves={chartSelection.leaves}
+						bind:collapsed={collapsedGroups}
 					/>
 				</div>
 				<Button class="w-full shrink-0" onclick={runIterate}>
