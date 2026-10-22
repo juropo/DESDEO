@@ -197,22 +197,7 @@ def test_solve_variants(model, solver, measure, maximize):
     assert sign * results[1].target_values[f_3.symbol] <= sign * results[0].target_values[f_3.symbol] + 1e-6
 
 
-@pytest.mark.parametrize(
-    "solver",
-    [
-        pytest.param(GurobipySolver, marks=pytest.mark.gurobipy, id="gurobipy"),
-        pytest.param(
-            CVXPYSolver,
-            marks=[
-                pytest.mark.cvxpy,
-                pytest.mark.xfail(
-                    raises=RuntimeError, strict=True, reason="cvxpy has no cp.inf (cvxpy_evaluator.py:286)"
-                ),
-            ],
-            id="cvxpy",
-        ),
-    ],
-)
+@pytest.mark.parametrize("solver", SOLVERS)
 def test_solve_variants_cvar(model, solver):
     """The CVaR problem builds and every variant solves."""
     jp = build_jina_problem(model, "aggregated", "cvar", cvar_alpha=0.8)
