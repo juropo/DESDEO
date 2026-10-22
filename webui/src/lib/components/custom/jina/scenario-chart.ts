@@ -128,14 +128,31 @@ function lightest(
 }
 
 /**
- * The line and selected colours of scenario `index`: its hue (in hue-spread order) at a raised saturation, the
- * line as light as gives 3:1 on the chart as drawn, the selected about 10 points darker and at
- * least 4.5:1.
+ * Saturation and lightness offset of each pass through the palette: scenarios beyond the first
+ * ten repeat the hues, darker in the second pass and greyer in the third.
+ */
+const PASSES = [
+	{ saturation: LINE_SATURATION, offset: 0 },
+	{ saturation: 0.75, offset: -0.14 },
+	{ saturation: 0.35, offset: -0.07 }
+];
+
+/**
+ * The line and selected colours of scenario `index`: its hue (in hue-spread order) at a raised
+ * saturation, the line as light as gives 3:1 on the chart as drawn (a darker or greyer variant in
+ * later passes), the selected about 10 points darker and at least 4.5:1.
  */
 function scenarioShades(index: number): { line: string; selected: string } {
 	const [hue] = hexToHsl(COLOR_PALETTE[HUE_SPREAD_ORDER[index % HUE_SPREAD_ORDER.length]]);
-	const line = lightest(hue, LINE_SATURATION, 0.55, MIN_LINE_CONTRAST, (hex) =>
-		blend(hex, LINE_ALPHA, CHART_BACKGROUND)
+	const drawn = (hex: string) => blend(hex, LINE_ALPHA, CHART_BACKGROUND);
+	const base = lightest(hue, LINE_SATURATION, 0.55, MIN_LINE_CONTRAST, drawn);
+	const pass = PASSES[Math.floor(index / HUE_SPREAD_ORDER.length) % PASSES.length];
+	const line = lightest(
+		hue,
+		pass.saturation,
+		base.lightness + pass.offset,
+		MIN_LINE_CONTRAST,
+		drawn
 	);
 	const selected = lightest(hue, SELECTED_SATURATION, line.lightness - 0.1, MIN_SELECTED_CONTRAST);
 	return { line: line.hex, selected: selected.hex };

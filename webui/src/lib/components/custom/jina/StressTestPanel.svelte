@@ -3,7 +3,7 @@
 	 * Evaluates designs in the leaves of a scenario model of the problem: the setup's own model,
 	 * or another one as a stress test. For another model a fallback reference point over that
 	 * model's objectives is sent for the objectives a design's own reference point does not cover;
-	 * empty entries are left out. Shows the per-leaf outcomes of finished evaluations.
+	 * empty entries are left out.
 	 */
 	import * as Select from '$lib/components/ui/select/index.js';
 	import { Button } from '$lib/components/ui/button';
@@ -14,30 +14,24 @@
 		JinaScenarioModelInfo,
 		ProblemInfo
 	} from '$lib/gen/endpoints/DESDEOFastAPI';
-	import ScenarioBreakdown from './ScenarioBreakdown.svelte';
 	import ObjectivePointInputs from './ObjectivePointInputs.svelte';
 	import { finitePoint, midpointPrefill, type Range } from './reference-point';
-	import { formatNumber, modelLabel, objectiveLabel, plural } from './labels';
-	import type { EvaluateState } from './types';
+	import { modelLabel } from './labels';
 
 	let {
 		problem,
 		setupModelId,
-		baselineLeaf,
 		scenarioModels,
 		designs,
 		wishlist,
-		evaluations,
 		objectiveRanges,
 		onEvaluate
 	}: {
 		problem: ProblemInfo;
 		setupModelId: number;
-		baselineLeaf: string | null;
 		scenarioModels: JinaScenarioModelInfo[];
 		designs: JinaDesignInfo[];
 		wishlist: number[];
-		evaluations: EvaluateState[];
 		objectiveRanges: Record<string, Range>;
 		onEvaluate: (request: {
 			scenario_model_id: number;
@@ -49,8 +43,6 @@
 	let modelId = $state('');
 	let chosen = $state<number[]>([]);
 	let fallback = $state<Record<string, number | null>>({});
-	let shownEvaluation = $state('');
-	let shownDesign = $state<number | null>(null);
 
 	$effect(() => {
 		if (!modelId) modelId = String(setupModelId);
@@ -72,21 +64,9 @@
 
 	let isOtherModel = $derived(modelId !== String(setupModelId));
 	let model = $derived(scenarioModels.find((m) => String(m.id) === modelId));
-	let finished = $derived(evaluations.filter((e) => e.is_ready && !e.error));
-	let evaluation = $derived(
-		finished.find((e) => String(e.state_id) === shownEvaluation) ?? finished.at(-1)
-	);
-	let outcomes = $derived(
-		evaluation && shownDesign !== null ? evaluation.result.outcomes[String(shownDesign)] : undefined
-	);
 
 	function label(m: JinaScenarioModelInfo, full = false): string {
 		return m.id === setupModelId ? `${modelLabel(m, full)} (setup)` : modelLabel(m, full);
-	}
-
-	function evaluationLabel(e: EvaluateState): string {
-		const m = scenarioModels.find((s) => s.id === e.result.scenario_model_id);
-		return `Evaluation ${e.state_id} — model #${m?.id ?? e.result.scenario_model_id}, ${plural(e.result.design_ids.length, 'design')}`;
 	}
 
 	function run() {
@@ -97,15 +77,6 @@
 			reference_point: isOtherModel ? finitePoint(fallback, model.objectives) : null
 		});
 	}
-
-	$effect(() => {
-		if (
-			evaluation &&
-			(shownDesign === null || !evaluation.result.design_ids.includes(shownDesign))
-		) {
-			shownDesign = evaluation.result.design_ids[0] ?? null;
-		}
-	});
 </script>
 
 <div class="min-w-0 space-y-3">
@@ -176,57 +147,4 @@
 	{/if}
 
 	<Button size="sm" disabled={!model || chosen.length === 0} onclick={run}>Evaluate</Button>
-
-	{#if finished.length > 0 && evaluation}
-		<div class="space-y-2 border-t pt-2">
-			<Select.Root type="single" bind:value={shownEvaluation}>
-				<Select.Trigger class="w-full min-w-0 text-xs"
-					><span class="min-w-0 truncate">{evaluationLabel(evaluation)}</span></Select.Trigger
-				>
-				<Select.Content>
-					{#each finished as e (e.state_id)}
-						<Select.Item value={String(e.state_id)}>{evaluationLabel(e)}</Select.Item>
-					{/each}
-				</Select.Content>
-			</Select.Root>
-			<div class="flex flex-wrap gap-1">
-				{#each evaluation.result.design_ids as id (id)}
-					{@const leafOutcomes = Object.values(evaluation.result.outcomes[String(id)] ?? {})}
-					{@const failures = leafOutcomes.filter((o) => !o.status).length}
-					<Button
-						variant={id === shownDesign ? 'default' : 'outline'}
-						size="sm"
-						class="h-7 px-2 text-xs"
-						onclick={() => (shownDesign = id)}
-					>
-						#{id}{failures > 0 ? ` (${failures} failed)` : ''}
-					</Button>
-				{/each}
-			</div>
-			{#if outcomes}
-				<ScenarioBreakdown
-					{problem}
-					baselineLeaf={evaluation.result.scenario_model_id === setupModelId ? baselineLeaf : null}
-					leafObjectives={Object.fromEntries(
-						Object.entries(outcomes)
-							.filter(([, o]) => o.status)
-							.map(([leaf, o]) => [leaf, o.objectives ?? {}])
-					)}
-					failed={Object.fromEntries(
-						Object.entries(outcomes)
-							.filter(([, o]) => !o.status)
-							.map(([leaf, o]) => [leaf, o.message])
-					)}
-				/>
-			{/if}
-			{#if evaluation.result.reference_point}
-				<p class="text-xs text-gray-500">
-					Fallback reference point:
-					{Object.entries(evaluation.result.reference_point)
-						.map(([obj, v]) => `${objectiveLabel(problem, obj)} ${formatNumber(v)}`)
-						.join(', ')}
-				</p>
-			{/if}
-		</div>
-	{/if}
 </div>

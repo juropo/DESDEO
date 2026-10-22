@@ -42,14 +42,25 @@ describe('contrastRatio', () => {
 });
 
 describe('scenario colours', () => {
-	it('wraps around the palette (index 10 equals index 0)', () => {
-		expect(scenarioColor(10)).toBe(scenarioColor(0));
-		expect(scenarioLineColor(10, true)).toBe(scenarioLineColor(0, true));
+	it('reuses the palette hues after ten scenarios', () => {
+		expect(hexToHsl(scenarioColor(10))[0]).toBeCloseTo(hexToHsl(scenarioColor(0))[0], -1);
 	});
 
 	it('draws lines at 3:1 or more and selected lines at 4.5:1 or more on the chart', () => {
 		COLOR_PALETTE.forEach((_, i) => {
 			const drawn = blend(scenarioColor(i), LINE_ALPHA, CHART_BACKGROUND);
+			expect(contrastRatio(drawn, CHART_BACKGROUND)).toBeGreaterThanOrEqual(3);
+			expect(contrastRatio(scenarioLineColor(i, true), CHART_BACKGROUND)).toBeGreaterThanOrEqual(
+				4.5
+			);
+		});
+	});
+
+	it('varies the colours of scenarios beyond the palette, all at 3:1 or more', () => {
+		const lines = Array.from({ length: 30 }, (_, i) => scenarioColor(i));
+		expect(new Set(lines).size).toBe(30);
+		lines.forEach((line, i) => {
+			const drawn = blend(line, LINE_ALPHA, CHART_BACKGROUND);
 			expect(contrastRatio(drawn, CHART_BACKGROUND)).toBeGreaterThanOrEqual(3);
 			expect(contrastRatio(scenarioLineColor(i, true), CHART_BACKGROUND)).toBeGreaterThanOrEqual(
 				4.5

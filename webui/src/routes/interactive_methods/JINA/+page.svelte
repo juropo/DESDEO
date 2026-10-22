@@ -9,7 +9,6 @@
 	import * as Resizable from '$lib/components/ui/resizable/index.js';
 	import ResizableHandle from '$lib/components/ui/resizable/resizable-handle.svelte';
 	import * as Select from '$lib/components/ui/select/index.js';
-	import * as Tabs from '$lib/components/ui/tabs/index.js';
 	import { Button } from '$lib/components/ui/button';
 	import VisualizationsPanel from '$lib/components/custom/visualizations-panel/visualizations-panel.svelte';
 	import { PREFERENCE_TYPES } from '$lib/constants';
@@ -19,8 +18,9 @@
 	import DesignTable from '$lib/components/custom/jina/DesignTable.svelte';
 	import ScenarioBreakdown from '$lib/components/custom/jina/ScenarioBreakdown.svelte';
 	import WishlistPanel from '$lib/components/custom/jina/WishlistPanel.svelte';
-	import StressTestPanel from '$lib/components/custom/jina/StressTestPanel.svelte';
-	import AnalysisPanel from '$lib/components/custom/jina/AnalysisPanel.svelte';
+	import RobustnessPanel from '$lib/components/custom/jina/RobustnessPanel.svelte';
+	import AnalysisTables from '$lib/components/custom/jina/AnalysisTables.svelte';
+	import type { AnalysisInputs, AnalysisResult } from '$lib/components/custom/jina/types';
 	import JobStatus from '$lib/components/custom/jina/JobStatus.svelte';
 	import {
 		midpoint,
@@ -69,11 +69,12 @@
 	const { data } = $props<{ data: { problems: ProblemInfo[] } }>();
 	let problemList = $derived(data.problems ?? []);
 
-	type Tab = View | 'pool';
+	type Tab = View | 'pool' | 'robustness';
 	const TABS: { value: Tab; label: string }[] = [
 		{ value: 'aggregated', label: 'Aggregated' },
 		{ value: 'per_scenario', label: 'Per-scenario' },
-		{ value: 'pool', label: 'Pool' }
+		{ value: 'pool', label: 'Pool' },
+		{ value: 'robustness', label: 'Robustness' }
 	];
 	const VIEW_OPTIONS: { value: View; label: string }[] = [
 		{ value: 'aggregated', label: 'Aggregated' },
@@ -93,14 +94,20 @@
 	let tab = $state<Tab>('aggregated');
 	let poolView = $state<View>('aggregated');
 	let selectedDesignId = $state<number | null>(null);
-	let shownIteration = $state<Record<Tab, string>>({ aggregated: '', per_scenario: '', pool: '' });
+	let shownIteration = $state<Record<Tab, string>>({
+		aggregated: '',
+		per_scenario: '',
+		pool: '',
+		robustness: ''
+	});
 	let referencePoints = $state<Record<View, Record<string, number>>>({
 		aggregated: {},
 		per_scenario: {}
 	});
 
 	let ready = $derived(!!setup && setup.is_ready && !setup.error && !!setup.result.ranges);
-	let view = $derived<View>(tab === 'pool' ? poolView : tab);
+	// The Robustness tab edits no reference point; its view is only a placeholder.
+	let view = $derived<View>(tab === 'pool' ? poolView : tab === 'robustness' ? 'aggregated' : tab);
 	let targets = $derived<Target[]>(setup?.result.targets?.[view] ?? []);
 	let ranges = $derived<Record<string, Range>>(
 		(setup?.result.ranges?.[view] ?? {}) as Record<string, Range>
@@ -196,11 +203,13 @@
 		designs = [];
 		selectedDesignId = null;
 		referencePoints = { aggregated: {}, per_scenario: {} };
-		shownIteration = { aggregated: '', per_scenario: '', pool: '' };
+		shownIteration = { aggregated: '', per_scenario: '', pool: '', robustness: '' };
 		chartSelections = { aggregated: null, per_scenario: null };
 		hiddenDesigns = [];
 		collapsedGroups = [];
-		chartIterationIds = { aggregated: [], per_scenario: [], pool: [] };
+		analysisResult = null;
+		analysisInputs = {};
+		chartIterationIds = { aggregated: [], per_scenario: [], pool: [], robustness: [] };
 		pending = children
 			.filter((s) => !s.is_ready)
 			.map((s) => ({ id: s.state_id, label: jobLabel(s) }));
@@ -349,12 +358,17 @@
 		per_scenario: null
 	});
 	let hiddenDesigns = $state<number[]>([]);
+	// The latest robustness analysis, for the Robustness tab's charts and tables.
+	let analysisResult = $state<AnalysisResult | null>(null);
+	// The analysis entries of each evaluation, kept across tab switches.
+	let analysisInputs = $state<Record<number, AnalysisInputs>>({});
 	// Objective groups collapsed in the reference-point editor.
 	let collapsedGroups = $state<string[]>([]);
 	let chartIterationIds = $state<Record<Tab, number[]>>({
 		aggregated: [],
 		per_scenario: [],
-		pool: []
+		pool: [],
+		robustness: []
 	});
 
 	let leafOrder = $derived(setupModel?.leaves ?? []);
@@ -546,7 +560,11 @@
 	showRightSidebar={ready}
 	leftSidebarWidth="20rem"
 	rightSidebarWidth="24rem"
-	bottomPanelTitle={tab === 'pool' ? 'Pool picks' : 'Iteration results'}
+	bottomPanelTitle={tab === 'pool'
+		? 'Pool picks'
+		: tab === 'robustness'
+			? 'Robustness tables'
+			: 'Iteration results'}
 >
 	{#snippet leftSidebar()}
 		<!-- At most the viewport's height: the editor scrolls and the solve button stays visible. -->
@@ -577,7 +595,7 @@
 				/>
 			{/if}
 
-			{#if ready && problem}
+			{#if ready && problem && tab !== 'robustness'}
 				{#if tab === 'pool'}
 					<div class="space-y-1">
 						<span class="text-sm font-medium">Targets of view</span>
@@ -678,7 +696,22 @@
 	{/snippet}
 
 	{#snippet visualizationArea()}
-		{#if !problem}
+		{#if problem && setup && ready && tab === 'robustness'}
+			<RobustnessPanel
+				{problem}
+				{setup}
+				{scenarioModels}
+				{designs}
+				{wishlist}
+				{evaluations}
+				objectiveRanges={objRanges}
+				bind:selectedId={selectedDesignId}
+				bind:result={analysisResult}
+				bind:analysisInputs
+				onEvaluate={runEvaluate}
+				onAnalyse={runAnalysis}
+			/>
+		{:else if !problem}
 			<div class="flex h-full items-center justify-center text-gray-500">
 				Select a problem with a scenario model to use JINA.
 			</div>
@@ -774,7 +807,22 @@
 	{/snippet}
 
 	{#snippet numericalValues()}
-		{#if problem && setup && iteration?.is_ready && iteration.result.results.length === 0}
+		{#if tab === 'robustness'}
+			{#if problem && setup && analysisResult}
+				<div class="h-full overflow-auto">
+					<AnalysisTables
+						{problem}
+						result={analysisResult}
+						baselineLeaf={analysisResult.scenarioModelId === setup.result.scenario_model_id
+							? setup.result.baseline_leaf
+							: null}
+						selectedId={selectedDesignId}
+					/>
+				</div>
+			{:else}
+				<p class="p-2 text-sm text-gray-500">Analyse an evaluation to see its tables.</p>
+			{/if}
+		{:else if problem && setup && iteration?.is_ready && iteration.result.results.length === 0}
 			<p class="p-2 text-sm text-gray-500">{iteration.error ?? emptyMessage}</p>
 		{:else if problem && setup && iteration}
 			<DesignTable
@@ -802,49 +850,18 @@
 							onDismiss={() => (pending = pending.filter((p) => p.id !== job.id))}
 						/>
 					{/each}
-					<Tabs.Root value="designs" class="min-w-0">
-						<Tabs.List class="w-full">
-							<Tabs.Trigger value="designs">Designs</Tabs.Trigger>
-							<Tabs.Trigger value="evaluate">Evaluate</Tabs.Trigger>
-							<Tabs.Trigger value="analysis">Analysis</Tabs.Trigger>
-						</Tabs.List>
-						<Tabs.Content value="designs" class="min-w-0 pt-2">
-							<WishlistPanel
-								{problem}
-								{designs}
-								{wishlist}
-								{finalId}
-								bind:selectedId={selectedDesignId}
-								{representativeSets}
-								importObjectives={setupModel?.objectives ?? []}
-								objectiveRanges={objRanges}
-								onSave={saveSelection}
-								onImport={runImport}
-							/>
-						</Tabs.Content>
-						<Tabs.Content value="evaluate" class="min-w-0 pt-2">
-							<StressTestPanel
-								{problem}
-								setupModelId={setup.result.scenario_model_id}
-								baselineLeaf={setup.result.baseline_leaf}
-								{scenarioModels}
-								{designs}
-								{wishlist}
-								{evaluations}
-								objectiveRanges={objRanges}
-								onEvaluate={runEvaluate}
-							/>
-						</Tabs.Content>
-						<Tabs.Content value="analysis" class="min-w-0 pt-2">
-							<AnalysisPanel
-								{problem}
-								{evaluations}
-								baselineLeaf={setup.result.baseline_leaf}
-								objectiveRanges={objRanges}
-								onAnalyse={runAnalysis}
-							/>
-						</Tabs.Content>
-					</Tabs.Root>
+					<WishlistPanel
+						{problem}
+						{designs}
+						{wishlist}
+						{finalId}
+						bind:selectedId={selectedDesignId}
+						{representativeSets}
+						importObjectives={setupModel?.objectives ?? []}
+						objectiveRanges={objRanges}
+						onSave={saveSelection}
+						onImport={runImport}
+					/>
 				</div>
 			{/key}
 		{/if}

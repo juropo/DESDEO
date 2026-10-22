@@ -78,6 +78,12 @@
 			<p class="text-xs text-gray-500">{aggregate.note}</p>
 		{/if}
 	{/if}
+	{#if leaves.length > 10}
+		<p class="text-xs text-gray-500">
+			Beyond ten scenarios the colours repeat in darker or greyer variants; hover a line to see its
+			scenario.
+		</p>
+	{/if}
 	<div class="flex max-h-28 flex-wrap gap-x-3 gap-y-1 overflow-y-auto">
 		{#each leaves as leaf, i (leaf)}
 			<div class="flex min-w-0 items-center gap-1">
