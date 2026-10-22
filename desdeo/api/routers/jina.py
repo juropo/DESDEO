@@ -133,33 +133,26 @@ def _leaf_objectives(model: ScenarioModel) -> dict[str, set[str]]:
     return {leaf: {obj.symbol for obj in model.get_scenario_problem(leaf).objectives} for leaf in model.leaf_scenarios}
 
 
-def _get_state(state_id: int, user: User, db_session: Session) -> StateDB:
-    """Return a JINA state; raise 404 if there is none and 403 if the user may not access it."""
+def _get_state(
+    state_id: int, user: User, db_session: Session, kinds: tuple[StateKind, ...] = tuple(_RESULT_MODELS)
+) -> StateDB:
+    """Return a state of one of ``kinds``; raise 404 if there is none or the user may not access it."""
     state = db_session.get(StateDB, state_id)
-    if state is None or state.base_state is None or state.base_state.kind not in _RESULT_MODELS:
-        raise _not_found(f"No JINA state with id={state_id}.")
-    if not _may_access_state(user, state, db_session):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"No access to state {state_id}.")
-    return state
-
-
-def _session_state(state_id: int, kind: StateKind, context: SessionContext) -> StateDB:
-    """Return a state of ``kind`` of the context's problem and interactive session; raise 404 otherwise.
-
-    A setup must also belong to the user; other JINA states are reached through their setup.
-    """
-    state = context.db_session.get(StateDB, state_id)
-    session_id = context.interactive_session.id if context.interactive_session is not None else None
     if (
         state is None
         or state.base_state is None
-        or state.base_state.kind != kind
-        or state.session_id != session_id
-        or state.problem_id != context.problem_db.id
-        or not _may_access_state(context.user, state, context.db_session)
-        or (kind == StateKind.JINA_SETUP and state.state.user_id != context.user.id)
+        or state.base_state.kind not in kinds
+        or not _may_access_state(user, state, db_session)
     ):
-        raise _not_found(f"No {kind.value} state with id={state_id} in this problem and session.")
+        raise _not_found(f"No JINA state with id={state_id}.")
+    return state
+
+
+def _problem_state(state_id: int, kind: StateKind, context: SessionContext) -> StateDB:
+    """Return a state of ``kind`` of the context's problem; raise 404 otherwise."""
+    state = _get_state(state_id, context.user, context.db_session, (kind,))
+    if state.problem_id != context.problem_db.id:
+        raise _not_found(f"No {kind.value} state with id={state_id} in problem {context.problem_db.id}.")
     return state
 
 
@@ -181,7 +174,7 @@ def _get_setup(setup_state_id: int, context: SessionContext, *, ready: bool = Tr
 
     Raises 409 if the ranges are still being computed and 422 if computing them failed.
     """
-    state = _session_state(setup_state_id, StateKind.JINA_SETUP, context)
+    state = _problem_state(setup_state_id, StateKind.JINA_SETUP, context)
     sub = state.state
     if ready and not sub.is_ready:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="The JINA setup is not ready yet.")
@@ -529,18 +522,17 @@ def get_or_initialize(
     context: Annotated[SessionContext, Depends(SessionContextGuard(require=[ContextField.PROBLEM]).post)],
 ) -> JinaGetOrInitializeResponse:
     """Return the latest JINA setup of the session, or None, and all later JINA states of that setup."""
-    session_id = context.interactive_session.id if context.interactive_session is not None else None
+    interactive_session = context.interactive_session
     setup_state = context.db_session.exec(
         select(StateDB)
         .join(JinaSetupState, JinaSetupState.id == StateDB.state_id)
         .where(
             StateDB.problem_id == context.problem_db.id,
-            StateDB.session_id == session_id,
-            JinaSetupState.user_id == context.user.id,
+            StateDB.session_id == (interactive_session.id if interactive_session else context.user.active_session_id),
         )
         .order_by(StateDB.id.desc())
     ).first()
-    if setup_state is None or not _may_access_state(context.user, setup_state, context.db_session):
+    if setup_state is None:
         return JinaGetOrInitializeResponse(setup=None, states=[])
     states = _child_states(setup_state.id, context.db_session, (JinaIterateState, JinaEvaluateState, JinaSelectState))
     return JinaGetOrInitializeResponse(
@@ -606,7 +598,7 @@ def setup(
         except ValueError as e:
             raise _unprocessable(str(e)) from e
 
-    sub = JinaSetupState(**setup.model_dump(exclude={"kind", "targets", "ranges"}), user_id=context.user.id)
+    sub = JinaSetupState(**setup.model_dump(exclude={"kind", "targets", "ranges"}))
     state = _create_state(context, sub, request.parent_state_id)
     background_tasks.add_task(
         _run_setup, context.db_session.get_bind(), problem_db.id, state.base_state.id, check_solver(problem_db)
@@ -815,7 +807,7 @@ def analysis(
     antifragility is None when the setup has no baseline leaf or no design has an outcome in it.
     """
     setup_state, setup = _get_setup(request.setup_state_id, context, ready=False)
-    evaluated = _session_state(request.evaluate_state_id, StateKind.JINA_EVALUATE, context).state
+    evaluated = _problem_state(request.evaluate_state_id, StateKind.JINA_EVALUATE, context).state
     if evaluated.setup_state_id != setup_state.id:
         raise _unprocessable(f"Evaluate state {request.evaluate_state_id} is not of setup {setup_state.id}.")
     if not evaluated.is_ready:

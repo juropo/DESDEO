@@ -417,7 +417,6 @@ class JinaSetupState(ResultInterface, SQLModel, table=True):
 
     id: int | None = Field(sa_column=Column(Integer, ForeignKey("states.id", ondelete="CASCADE"), primary_key=True))
 
-    user_id: int | None = Field(foreign_key="user.id", default=None, description="The user who owns the setup.")
     scenario_model_id: int = Field(description="DB id of the ScenarioModelDB.")
     design_variables: list[str] = Field(sa_column=Column(JSON), default_factory=list)
     measure: str = Field(default="worst_case", description="'worst_case', 'expected_value' or 'cvar'.")

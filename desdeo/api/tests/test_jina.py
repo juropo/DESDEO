@@ -440,8 +440,16 @@ def test_analysis_with_baseline(client: TestClient, session_and_user: dict):
         assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
 
 
+def _add_dm(session: Session, username: str) -> User:
+    dm = User(username=username, password_hash=get_password_hash(username), role=UserRole.dm, group="test")
+    session.add(dm)
+    session.commit()
+    session.refresh(dm)
+    return dm
+
+
 def test_status_errors(client: TestClient, session_and_user: dict):
-    """Status is 404 for unknown and non-JINA states and 403 for a state of another user."""
+    """Status is 404 for unknown and non-JINA states and for a state the user may not access."""
     seeded = _seed(session_and_user)
     session = session_and_user["session"]
     token = login(client)
@@ -455,10 +463,9 @@ def test_status_errors(client: TestClient, session_and_user: dict):
 
     response = post_json(client, f"{URL}/setup", {"problem_id": seeded["problem_id"]}, token)
     setup_id = response.json()["state_id"]
-    session.add(User(username="dm", password_hash=get_password_hash("dm"), role=UserRole.dm, group="test"))
-    session.commit()
+    _add_dm(session, "dm")
     dm_token = login(client, "dm", "dm")
-    assert get_json(client, f"{URL}/status/{setup_id}", dm_token).status_code == status.HTTP_403_FORBIDDEN
+    assert get_json(client, f"{URL}/status/{setup_id}", dm_token).status_code == status.HTTP_404_NOT_FOUND
 
 
 def _new_session(client: TestClient, token: str) -> int:
@@ -468,52 +475,68 @@ def _new_session(client: TestClient, token: str) -> int:
     return response.json()["id"]
 
 
+def _restored_setup(client: TestClient, token: str, problem_id: int, **kwargs) -> int | None:
+    response = post_json(client, f"{URL}/get-or-initialize", {"problem_id": problem_id} | kwargs, token)
+    assert response.status_code == status.HTTP_200_OK, response.text
+    setup = response.json()["setup"]
+    return setup["state_id"] if setup is not None else None
+
+
 def test_setup_access(client: TestClient, session_and_user: dict):
-    """A setup is only usable from its own interactive session, and not by another user."""
+    """A setup is accessible like any state: in its owner's sessions, to analysts, and sessionless by problem."""
     seeded = _seed(session_and_user)
     session = session_and_user["session"]
     problem_id = seeded["problem_id"]
-    token = login(client)
-
-    first_session = _new_session(client, token)
-    setup_id = post_json(client, f"{URL}/setup", {"problem_id": problem_id}, token).json()["state_id"]
-    request = {"problem_id": problem_id, "setup_state_id": setup_id, "wishlist": []}
-    assert post_json(client, f"{URL}/select", request, token).status_code == status.HTTP_200_OK
-
-    # Another session of the same user.
-    _new_session(client, token)
-    assert post_json(client, f"{URL}/select", request, token).status_code == status.HTTP_404_NOT_FOUND
-    restored = post_json(client, f"{URL}/get-or-initialize", {"problem_id": problem_id}, token).json()
-    assert restored["setup"] is None
-    explicit = request | {"session_id": first_session}
-    assert post_json(client, f"{URL}/select", explicit, token).status_code == status.HTTP_200_OK
-
-    # Another user with access to the problem through a group, with or without a session of their own.
-    dm = User(username="dm", password_hash=get_password_hash("dm"), role=UserRole.dm, group="test")
-    session.add(dm)
+    analyst_token = login(client)
+    owner = _add_dm(session, "owner")
+    other = _add_dm(session, "other")
+    group = Group(name="g", owner_id=session_and_user["user"].id, user_ids=[owner.id, other.id], problem_id=problem_id)
+    session.add(group)
     session.commit()
-    session.refresh(dm)
-    session.add(Group(name="g", owner_id=session_and_user["user"].id, user_ids=[dm.id], problem_id=problem_id))
-    session.commit()
-    dm_token = login(client, "dm", "dm")
-    assert post_json(client, f"{URL}/select", request, dm_token).status_code == status.HTTP_404_NOT_FOUND
-    # Both users without a session.
-    with Session(session.get_bind()) as fresh:
-        analyst = fresh.get(User, session_and_user["user"].id)
-        analyst.active_session_id = None
-        fresh.add(analyst)
-        fresh.commit()
-    sessionless_id = post_json(client, f"{URL}/setup", {"problem_id": problem_id}, token).json()["state_id"]
-    sessionless = request | {"setup_state_id": sessionless_id}
-    assert post_json(client, f"{URL}/select", sessionless, token).status_code == status.HTTP_200_OK
-    assert post_json(client, f"{URL}/select", sessionless, dm_token).status_code == status.HTTP_404_NOT_FOUND
-    restored = post_json(client, f"{URL}/get-or-initialize", {"problem_id": problem_id}, dm_token).json()
-    assert restored["setup"] is None
-    assert post_json(client, f"{URL}/select", explicit, dm_token).status_code == status.HTTP_404_NOT_FOUND
-    _new_session(client, dm_token)
-    assert post_json(client, f"{URL}/select", request, dm_token).status_code == status.HTTP_404_NOT_FOUND
+    owner_token = login(client, "owner", "owner")
+    other_token = login(client, "other", "other")
+
+    def select(token: str, setup_id: int) -> int:
+        request = {"problem_id": problem_id, "setup_state_id": setup_id, "wishlist": []}
+        return post_json(client, f"{URL}/select", request, token).status_code
+
+    first_session = _new_session(client, owner_token)
+    setup_id = post_json(client, f"{URL}/setup", {"problem_id": problem_id}, owner_token).json()["state_id"]
+    assert select(owner_token, setup_id) == status.HTTP_200_OK
+    assert _restored_setup(client, owner_token, problem_id) == setup_id
+
+    # get-or-initialize is scoped to the session; the owner's states stay usable from other sessions.
+    _new_session(client, owner_token)
+    assert _restored_setup(client, owner_token, problem_id) is None
+    assert _restored_setup(client, owner_token, problem_id, session_id=first_session) == setup_id
+    assert select(owner_token, setup_id) == status.HTTP_200_OK
+
+    # Analysts may use any state and session.
+    assert select(analyst_token, setup_id) == status.HTTP_200_OK
+    assert _restored_setup(client, analyst_token, problem_id, session_id=first_session) == setup_id
+
+    # Another DM of the problem may not use a state in the owner's session, nor name that session.
+    _new_session(client, other_token)
+    assert select(other_token, setup_id) == status.HTTP_404_NOT_FOUND
+    assert get_json(client, f"{URL}/status/{setup_id}", other_token).status_code == status.HTTP_404_NOT_FOUND
     designs_url = f"{URL}/designs?problem_id={problem_id}&setup_state_id={setup_id}"
-    assert get_json(client, designs_url, dm_token).status_code == status.HTTP_404_NOT_FOUND
+    assert get_json(client, designs_url, other_token).status_code == status.HTTP_404_NOT_FOUND
+    assert _restored_setup(client, other_token, problem_id) is None
+    response = post_json(
+        client, f"{URL}/get-or-initialize", {"problem_id": problem_id, "session_id": first_session}, other_token
+    )
+    assert response.status_code == status.HTTP_404_NOT_FOUND
+
+    # A state outside any session is accessible to the users of its problem.
+    with Session(session.get_bind()) as fresh:
+        for user_id in (owner.id, other.id):
+            user = fresh.get(User, user_id)
+            user.active_session_id = None
+            fresh.add(user)
+        fresh.commit()
+    sessionless_id = post_json(client, f"{URL}/setup", {"problem_id": problem_id}, owner_token).json()["state_id"]
+    assert select(other_token, sessionless_id) == status.HTTP_200_OK
+    assert _restored_setup(client, other_token, problem_id) == sessionless_id
 
 
 @pytest.mark.gurobipy
