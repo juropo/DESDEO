@@ -40,6 +40,7 @@
 	 * - compactTickLabels: boolean — Render tick text in compact SI form (e.g. "7.9k")
 	 * - verticalAxisLabels: boolean — Draw axis names rotated along each axis
 	 * - fitMargins: boolean — Size left/bottom margins to fit tick labels and the filter status line
+	 * - improvementArrows: boolean — Draw an up arrow above each axis (axes run from worst to best)
 	 * - minAxisSpacing: number — Minimum pixels between axes; wider charts scroll horizontally
 	 * - selectedIndex: number | null — Index of selected line in single selection mode
 	 * - multipleSelectedIndexes: number[] | null — Indexes of selected lines in multi-selection mode
@@ -161,6 +162,9 @@
 
 	// Fit the left margin to tick text and add bottom room for the filter status line
 	export let fitMargins: boolean = false;
+
+	// Draw an up arrow above each axis marking upward as the improving direction
+	export let improvementArrows: boolean = false;
 
 	// Minimum distance between axes in pixels; when the axes need more than the container's width,
 	// the chart is drawn wider and the container scrolls horizontally. Undefined fits the container.
@@ -936,6 +940,23 @@
 					.text((v) => categories[Math.round(v as number) - 1] ?? '');
 			}
 
+			if (improvementArrows) {
+				const arrow = svgElement.append('g').attr('class', 'improvement-arrow');
+				arrow
+					.append('path')
+					.attr('d', `M${x - 4},9 L${x},3 L${x + 4},9 Z`)
+					.attr('fill', '#555');
+				arrow
+					.append('line')
+					.attr('x1', x)
+					.attr('x2', x)
+					.attr('y1', 9)
+					.attr('y2', 16)
+					.attr('stroke', '#555')
+					.attr('stroke-width', 1.5);
+				arrow.append('title').text('Higher is better');
+			}
+
 			// Draw axis labels and colored identification squares
 			if (options.showAxisLabels && verticalAxisLabels) {
 				// Rotated name reading up from the bottom end of the axis, away from mid-range data and
@@ -996,7 +1017,7 @@
 					.text(dim.name);
 
 				// Add an arrow if direction is specified
-				if (dim.direction) {
+				if (dim.direction && !improvementArrows) {
 					const arrowX = x; // Rough estimate of text width
 					svgElement
 						.append('path')
@@ -1162,6 +1183,7 @@
 		compactTickLabels,
 		verticalAxisLabels,
 		fitMargins,
+		improvementArrows,
 		minAxisSpacing,
 		width,
 		height,

@@ -34,6 +34,12 @@ export function modelLabel(model: JinaScenarioModelInfo, full = false, shown = 3
 	return `#${model.id} — ${plural(model.n_leaves, 'leaf', 'leaves')}: ${leaves}`;
 }
 
+/** The leaves with the baseline first and the others in their given order. */
+export function baselineFirst(leaves: string[], baseline: string | null): string[] {
+	if (baseline === null || !leaves.includes(baseline)) return leaves;
+	return [baseline, ...leaves.filter((l) => l !== baseline)];
+}
+
 export function formatNumber(value: number | null | undefined, digits = 4): string {
 	if (value === null || value === undefined || !Number.isFinite(value)) return '—';
 	return Number(value.toPrecision(digits)).toString();

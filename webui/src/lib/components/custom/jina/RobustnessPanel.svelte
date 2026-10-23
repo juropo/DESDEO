@@ -17,7 +17,7 @@
 	import ScenarioBreakdown from './ScenarioBreakdown.svelte';
 	import ScenarioPicker from './ScenarioPicker.svelte';
 	import StressTestPanel from './StressTestPanel.svelte';
-	import { formatNumber, objectiveLabel, plural } from './labels';
+	import { baselineFirst, formatNumber, objectiveLabel, plural } from './labels';
 	import type { Range } from './reference-point';
 	import {
 		evaluatedLeafObjectives,
@@ -80,11 +80,11 @@
 			: undefined
 	);
 	let outcomes = $derived(evaluation?.result.outcomes ?? {});
-	let leaves = $derived(model?.leaves ?? evaluatedLeaves(outcomes));
-	let leafColors = $derived(Object.fromEntries(leaves.map((l, i) => [l, scenarioColor(i)])));
-	let checkedLeaves = $derived(evaluation ? (checked[evaluation.state_id] ?? leaves) : []);
 	let sameModel = $derived(evaluation?.result.scenario_model_id === setup.result.scenario_model_id);
 	let baselineLeaf = $derived(sameModel ? setup.result.baseline_leaf : null);
+	let leaves = $derived(baselineFirst(model?.leaves ?? evaluatedLeaves(outcomes), baselineLeaf));
+	let leafColors = $derived(Object.fromEntries(leaves.map((l, i) => [l, scenarioColor(i)])));
+	let checkedLeaves = $derived(evaluation ? (checked[evaluation.state_id] ?? leaves) : []);
 
 	// Objective axes over the evaluated objectives; the setup's ranges apply only in its own model.
 	let chart = $derived.by(() => {

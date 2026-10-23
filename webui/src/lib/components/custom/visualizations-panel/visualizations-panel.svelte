@@ -108,6 +108,7 @@
 		verticalAxisLabels?: boolean;
 		compactTickLabels?: boolean;
 		fitMargins?: boolean;
+		improvementArrows?: boolean;
 		minAxisSpacing?: number;
 		// Fixed stroke colour per line index; unlisted lines use the default colouring
 		colorByIndex?: { [key: string]: string };
@@ -133,6 +134,7 @@
 		verticalAxisLabels = false,
 		compactTickLabels = false,
 		fitMargins = false,
+		improvementArrows = false,
 		minAxisSpacing = undefined,
 		colorByIndex = undefined,
 		showHeader = true
@@ -278,6 +280,7 @@
 					{verticalAxisLabels}
 					{compactTickLabels}
 					{fitMargins}
+					{improvementArrows}
 					{minAxisSpacing}
 					{colorByIndex}
 				/>

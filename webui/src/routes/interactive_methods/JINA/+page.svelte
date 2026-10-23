@@ -27,7 +27,13 @@
 		objectiveRanges,
 		type Range
 	} from '$lib/components/custom/jina/reference-point';
-	import { MEASURE_LABELS, modelLabel, plural } from '$lib/components/custom/jina/labels';
+	import {
+		MEASURE_LABELS,
+		baselineFirst,
+		modelLabel,
+		plural
+	} from '$lib/components/custom/jina/labels';
+	import { orderTargets } from '$lib/components/custom/jina/fill';
 	import { pointArray, viewProblem, viewRows } from '$lib/components/custom/jina/view-problem';
 	import {
 		aggregateAvailable,
@@ -371,7 +377,9 @@
 		robustness: []
 	});
 
-	let leafOrder = $derived(setupModel?.leaves ?? []);
+	let leafOrder = $derived(
+		baselineFirst(setupModel?.leaves ?? [], setup?.result.baseline_leaf ?? null)
+	);
 	let leafColors = $derived(Object.fromEntries(leafOrder.map((l, i) => [l, scenarioColor(i)])));
 	let chartSelection = $derived(chartSelections[view] ?? defaultChartSelection(view, leafOrder));
 	let chartIterations = $derived.by(() => {
@@ -606,9 +614,11 @@
 				<div class="relative min-h-0 flex-1 overflow-y-auto pr-1">
 					<ReferencePointEditor
 						{problem}
-						{targets}
+						targets={orderTargets(targets, leafOrder)}
 						{ranges}
 						previous={previousPoints[view] ?? null}
+						solution={selectedDesign?.target_values?.[view] ?? null}
+						{leafColors}
 						bind:value={referencePoints[view]}
 						checkedLeaves={chartSelection.leaves}
 						bind:collapsed={collapsedGroups}
@@ -759,6 +769,7 @@
 									verticalAxisLabels
 									compactTickLabels
 									fitMargins
+									improvementArrows
 									minAxisSpacing={80}
 									referenceDataLabels={{
 										currentRefLabel: chart.referenceLabel,

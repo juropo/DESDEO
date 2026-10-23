@@ -5,7 +5,7 @@
 	 */
 	import * as Table from '$lib/components/ui/table/index.js';
 	import type { ProblemInfo } from '$lib/gen/endpoints/DESDEOFastAPI';
-	import { compactNumber, formatNumber, objectiveLabel } from './labels';
+	import { baselineFirst, compactNumber, formatNumber, objectiveLabel } from './labels';
 
 	let {
 		problem,
@@ -23,7 +23,12 @@
 		checkedLeaves?: string[];
 	} = $props();
 
-	let leaves = $derived([...new Set([...Object.keys(leafObjectives), ...Object.keys(failed)])]);
+	let leaves = $derived(
+		baselineFirst(
+			[...new Set([...Object.keys(leafObjectives), ...Object.keys(failed)])],
+			baselineLeaf
+		)
+	);
 	let objectives = $derived([
 		...new Set(Object.values(leafObjectives).flatMap((values) => Object.keys(values)))
 	]);

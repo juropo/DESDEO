@@ -8,6 +8,10 @@
 	 *
 	 * With a target per scenario, the cells are grouped by objective, and each group has a fill row
 	 * that writes one entry into the cells of all scenarios or of the scenarios in `checkedLeaves`.
+	 *
+	 * Each cell has a bar for picking the raw value, filled up to `solution`, the selected design's
+	 * value of the target, if given, in the scenario's colour for a per-scenario target and dark grey
+	 * otherwise.
 	 */
 	import { SegmentedControl } from '$lib/components/custom/segmented-control';
 	import type { ProblemInfo, Target } from '$lib/gen/endpoints/DESDEOFastAPI';
@@ -19,7 +23,7 @@
 		rawToPercent,
 		type Range
 	} from './reference-point';
-	import { formatNumber, objectiveLabel, targetLabel } from './labels';
+	import { compactNumber, formatNumber, objectiveLabel, targetLabel } from './labels';
 	import {
 		applyAllFills,
 		applyFill,
@@ -29,12 +33,15 @@
 		scopedTargets
 	} from './fill';
 	import { Button } from '$lib/components/ui/button';
+	import { HorizontalBar } from '$lib/components/visualizations/horizontal-bar';
 
 	let {
 		problem,
 		targets,
 		ranges,
 		previous = null,
+		solution = null,
+		leafColors = {},
 		value = $bindable({}),
 		checkedLeaves = [],
 		collapsed = $bindable([])
@@ -43,22 +50,24 @@
 		targets: Target[];
 		ranges: Record<string, Range>;
 		previous?: Record<string, number> | null;
+		solution?: Record<string, number> | null;
+		leafColors?: Record<string, string>;
 		value?: Record<string, number>;
 		checkedLeaves?: string[];
 		collapsed?: string[];
 	} = $props();
 
 	type Mode = 'percent' | 'raw' | 'change';
-	let mode = $state<Mode>('percent');
+	let mode = $state<Mode>('raw');
 
 	let modes = $derived([
-		{ value: 'percent', label: 'Percent' },
 		{ value: 'raw', label: 'Value' },
-		...(previous ? [{ value: 'change', label: 'Change' }] : [])
+		...(previous ? [{ value: 'change', label: 'Change' }] : []),
+		{ value: 'percent', label: 'Percent' }
 	]);
 
 	$effect(() => {
-		if (mode === 'change' && !previous) mode = 'percent';
+		if (mode === 'change' && !previous) mode = 'raw';
 	});
 
 	function shown(target: Target): number | null {
@@ -155,6 +164,19 @@
 		value = { ...value, [target.symbol]: result.value };
 	}
 
+	/** Set a raw value picked on the bar and show it converted in the input. */
+	function picked(target: Target, raw: number) {
+		value = { ...value, [target.symbol]: raw };
+		drafts = without(drafts, target.symbol);
+		warnings = without(warnings, target.symbol);
+	}
+
+	/** Decimals for values picked on a bar over `range`: about four significant digits of its span. */
+	function barDecimals(range: Range): number {
+		const span = Math.abs(range[1] - range[0]);
+		return span > 0 ? Math.max(0, 3 - Math.floor(Math.log10(span))) : 2;
+	}
+
 	/** On leaving the input, show the value that will be sent. */
 	function left(target: Target) {
 		drafts = without(drafts, target.symbol);
@@ -192,6 +214,31 @@
 				<span class="text-xs text-gray-600">= {formatNumber(value[target.symbol])}</span>
 			{/if}
 		</div>
+		{#if range}
+			{@const solutionValue = solution?.[target.symbol]}
+			<!-- Without a solution value the bar is unfilled; the padding fits the rotated tick labels. -->
+			<div class="pb-6">
+				<HorizontalBar
+					axisRanges={[Math.min(...range), Math.max(...range)]}
+					direction={target.maximize ? 'max' : 'min'}
+					{solutionValue}
+					selectedValue={value[target.symbol]}
+					previousValue={previous?.[target.symbol]}
+					barColor={solutionValue === undefined
+						? '#eee'
+						: ((target.leaf && leafColors[target.leaf]) ?? '#4b5563')}
+					options={{
+						decimalPrecision: barDecimals(range),
+						showPreviousValue: true,
+						showSelectedValueLabel: false,
+						showPreviousValueLabel: false,
+						tickFormat: compactNumber,
+						aspectRatio: 'aspect-[6/1]'
+					}}
+					onSelect={(v: number) => picked(target, v)}
+				/>
+			</div>
+		{/if}
 		<!-- The warning takes the place of the range line, so nothing below moves when it appears. -->
 		{#if warnings[target.symbol]}
 			<span class="truncate text-xs text-amber-700" role="alert" title={warnings[target.symbol]}>

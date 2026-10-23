@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { compactNumber } from './labels';
+import { baselineFirst, compactNumber } from './labels';
 
 describe('compactNumber', () => {
 	it('abbreviates large values with SI suffixes', () => {
@@ -14,5 +14,17 @@ describe('compactNumber', () => {
 		expect(compactNumber(0.012345)).toBe('0.012');
 		expect(compactNumber(0)).toBe('0');
 		expect(compactNumber(null)).toBe('—');
+	});
+});
+
+describe('baselineFirst', () => {
+	it('moves the baseline to the front and keeps the other leaves in order', () => {
+		expect(baselineFirst(['a', 'b', 'c', 'd'], 'c')).toEqual(['c', 'a', 'b', 'd']);
+		expect(baselineFirst(['a', 'b'], 'a')).toEqual(['a', 'b']);
+	});
+
+	it('keeps the order without a baseline among the leaves', () => {
+		expect(baselineFirst(['a', 'b'], null)).toEqual(['a', 'b']);
+		expect(baselineFirst(['a', 'b'], 'x')).toEqual(['a', 'b']);
 	});
 });

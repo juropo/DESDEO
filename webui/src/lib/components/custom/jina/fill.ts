@@ -22,6 +22,23 @@ export function groupByObjective(targets: Target[]): ObjectiveGroup[] {
 	return groups;
 }
 
+/**
+ * The targets with each objective's targets together in order of the objective's first appearance,
+ * a target over all scenarios first and the others in the order of `leafOrder`.
+ */
+export function orderTargets(targets: Target[], leafOrder: string[]): Target[] {
+	const objectives = [...new Set(targets.map((t) => t.objective))];
+	const leafRank = (t: Target) => {
+		if (t.leaf === null) return -1;
+		const i = leafOrder.indexOf(t.leaf);
+		return i === -1 ? leafOrder.length : i;
+	};
+	return [...targets].sort(
+		(a, b) =>
+			objectives.indexOf(a.objective) - objectives.indexOf(b.objective) || leafRank(a) - leafRank(b)
+	);
+}
+
 /** The targets of the scenarios in `leaves` (all if null); a target over all scenarios is always in scope. */
 export function scopedTargets(targets: Target[], leaves: string[] | null): Target[] {
 	return targets.filter((t) => leaves === null || t.leaf === null || leaves.includes(t.leaf));

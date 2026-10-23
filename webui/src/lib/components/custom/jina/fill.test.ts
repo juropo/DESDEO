@@ -6,6 +6,7 @@ import {
 	fillWithIdeals,
 	groupByObjective,
 	objectiveSpan,
+	orderTargets,
 	parseFill,
 	scopedTargets
 } from './fill';
@@ -46,6 +47,30 @@ describe('groupByObjective', () => {
 			['g', true, ['g_a', 'g_c']],
 			['h', false, ['h']]
 		]);
+	});
+});
+
+describe('orderTargets', () => {
+	it('keeps the objective order and orders each objective by the leaf order', () => {
+		const ordered = orderTargets(
+			[cell('g', 'b', true), ...targets, cell('g', null, true)],
+			['c', 'a', 'b']
+		);
+		expect(ordered.map((t) => t.symbol)).toEqual([
+			'g',
+			'g_c',
+			'g_a',
+			'g_b',
+			'f_c',
+			'f_a',
+			'f_b',
+			'h'
+		]);
+	});
+
+	it('puts leaves missing from the leaf order last, in their given order', () => {
+		const ordered = orderTargets([cell('f', 'x'), cell('f', 'b'), cell('f', 'y')], ['b']);
+		expect(ordered.map((t) => t.symbol)).toEqual(['f_b', 'f_x', 'f_y']);
 	});
 });
 
