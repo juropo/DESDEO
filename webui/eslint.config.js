@@ -9,7 +9,6 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import svelteConfig from './svelte.config.js';
 import { defineConfig } from 'eslint/config';
-import ts from 'typescript-eslint';
 
 const gitignorePath = fileURLToPath(new URL('./.gitignore', import.meta.url));
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -45,23 +44,23 @@ export default defineConfig(
 		}
 	},
 
-  // Files outside tsconfig.json: lint without type information
-  {
-    files: ['*.{js,mjs,ts}', '.storybook/**', 'e2e/**', 'tests/**'],
-    ...ts.configs.disableTypeChecked
-  },
+	// Files outside tsconfig.json: lint without type information
+	{
+		files: ['*.{js,mjs,ts}', '.storybook/**', 'e2e/**', 'tests/**'],
+		...ts.configs.disableTypeChecked
+	},
 
-  // Make sure Svelte blocks use TS parser
-  {
-    files: ['**/*.svelte', '**/*.svelte.ts', '**/*.svelte.js'],
-    languageOptions: {
-      parserOptions: {
-        parser: ts.parser,
-        extraFileExtensions: ['.svelte'],
-        svelteConfig
-      }
-    }
-  },
+	// Make sure Svelte blocks use TS parser
+	{
+		files: ['**/*.svelte', '**/*.svelte.ts', '**/*.svelte.js'],
+		languageOptions: {
+			parserOptions: {
+				parser: ts.parser,
+				extraFileExtensions: ['.svelte'],
+				svelteConfig
+			}
+		}
+	},
 
 	// Node env for server-only files
 	{
