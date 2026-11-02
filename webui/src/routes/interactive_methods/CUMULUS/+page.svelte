@@ -198,17 +198,33 @@
 
 	// Scenario setup dialog state
 	let show_scenario_setup_dialog = $state(false);
-	// 'initial': shown automatically on first load of a scenario-bearing problem.
+	// 'initial': shown automatically on first load of a problem with scenarios or a graphical model,
+	// including a new hypothetical.
 	// 'reopen': opened later from the "Add uncertainty measures" menu action, either to add
 	// measures that were declined initially, or to rebuild the combined problem with different ones.
-	let scenario_setup_mode: 'initial' | 'reopen' = $state('initial');
-	let pending_scenario_model_id = $state(0);
+	let scenario_setup_mode = $state<'initial' | 'reopen'>('initial');
+	// The problem the measures are applied to; may differ from `problem` for a new hypothetical.
+	let pending_problem_id = $state(0);
+	let pending_source = $state<CumulusScenarioSetupResponseSource>('scenario_model');
+	// Set while the initial setup dialog is open for a new hypothetical; dismissing it keeps the
+	// old problem.
+	let pending_hypothetical = $state(false);
+	// The first-open setup of the current problem must be answered: there is no state without it.
+	let scenario_setup_dismissible = $derived(
+		scenario_setup_mode === 'reopen' || pending_hypothetical
+	);
+	// Null for the graphical source.
+	let pending_scenario_model_id: number | null = $state(null);
 	let pending_objective_symbols: string[] = $state([]);
+	let pending_measure_types: MeasureType[] = $state([]);
 	const AVAILABLE_MEASURES: { value: MeasureType; label: string }[] = [
 		{ value: 'expected_value', label: 'Expected value (E_)' },
 		{ value: 'worst_case_robust', label: 'Worst-case robust (robust_)' },
 		{ value: 'conditional_value_at_risk', label: 'Conditional Value at Risk (CVAR_)' }
 	];
+	let offered_measures = $derived(
+		AVAILABLE_MEASURES.filter((m) => pending_measure_types.includes(m.value))
+	);
 	let selected_measures: MeasureType[] = $state(['expected_value']);
 	let cvar_alpha = $state(0.05);
 	let combined_problem_name = $state('');
@@ -237,6 +253,11 @@
 	let network_real_model = $state<NetworkModel | null>(null);
 	let network_real_evidence = $state<NetworkEvidence>({});
 	let network_real_result = $state<WhatIfResult | null>(null);
+	// Pins belong to one problem; they survive the panel remounting, not a change of problem.
+	$effect.pre(() => {
+		void network_real_model_id;
+		network_real_evidence = {};
+	});
 	function handle_network_real_structure_load(model: NetworkModel) {
 		network_real_model = model;
 		network_real_result = null;
@@ -422,17 +443,46 @@
 				errorMessage.set(null);
 				return;
 			}
-			const initialization = await initializeCumulusStateRequest(new_problem_id, true);
-			if (!initialization) return;
+			const initialization = await initializeCumulusStateRequest(new_problem_id);
+			if (!initialization) {
+				network_real_explore_error = $errorMessage ?? 'Opening the hypothetical failed.';
+				errorMessage.set(null);
+				return;
+			}
+			if (initialization.response_type === 'cumulus.scenario_setup') {
+				// The name only prefills the combined problem's name, so a failed fetch leaves it blank.
+				const name = await getProblemProblemProblemIdGet(new_problem_id)
+					.then((resp) => (resp.status === 200 ? resp.data.name : ''))
+					.catch(() => '');
+				show_network_dialog_real = false;
+				open_initial_scenario_setup(
+					new_problem_id,
+					name,
+					initialization,
+					scenario_availability?.applied_measures ?? []
+				);
+				pending_hypothetical = true;
+				return;
+			}
 			await apply_initialization_result(initialization);
 			await refresh_scenario_availability();
-			network_real_evidence = {};
-			warning_message =
-				'Switched to a new problem under these assumptions. The original problem and its ' +
-				'solutions are unchanged.';
+			switched_to_hypothetical();
 		} finally {
 			network_real_exploring = false;
 		}
+	}
+
+	function switched_to_hypothetical() {
+		network_real_evidence = {};
+		warning_message =
+			'Switched to a new problem under these assumptions. The original problem and its ' +
+			'solutions are unchanged.';
+	}
+
+	// Back to the network dialog, evidence intact, when the hypothetical's setup is not completed.
+	function return_to_network_dialog(error: string | null = null) {
+		network_real_explore_error = error;
+		show_network_dialog_real = true;
 	}
 
 	// Close the dialog if the problem is replaced by one without a graphical model.
@@ -529,13 +579,15 @@
 
 	function open_add_uncertainty_measures() {
 		if (!problem || !scenario_availability?.available) return;
-		pending_scenario_model_id = scenario_availability.scenario_model_id!;
+		pending_problem_id = problem.id;
+		pending_source = scenario_availability.source ?? 'scenario_model';
+		pending_scenario_model_id = scenario_availability.scenario_model_id ?? null;
 		pending_objective_symbols = scenario_availability.objective_symbols ?? [];
-		const applied = scenario_availability.applied_measures ?? [];
-		selected_measures =
-			applied.length > 0
-				? [...(applied as MeasureType[])]
-				: ['expected_value', 'worst_case_robust'];
+		pending_measure_types = scenario_availability.measure_types ?? [];
+		selected_measures = preselectedMeasures(
+			scenario_availability.applied_measures ?? [],
+			pending_measure_types
+		);
 		cvar_alpha = 0.05;
 		combined_problem_name = `${problem.name} (combined)`;
 		scenario_setup_mode = 'reopen';
@@ -649,33 +701,36 @@
 
 	async function confirm_scenario_setup() {
 		show_scenario_setup_dialog = false;
-		if (!problem) return;
 		if (selected_measures.length === 0) {
 			// No measures chosen — treat as "use plain problem". Only meaningful on first load;
 			// reopening from the menu with nothing selected is just a no-op cancel.
-			if (scenario_setup_mode === 'initial') {
-				const plainResult = await initializeCumulusStateRequest(problem.id, true);
-				if (plainResult) await apply_initialization_result(plainResult);
-				await refresh_scenario_availability();
-			}
+			if (scenario_setup_mode === 'initial') await use_problem_as_is();
 			return;
 		}
+		const hypothetical = pending_hypothetical;
+		pending_hypothetical = false;
 		const measure_options: MeasureOptions = { cvar_alpha };
+		// In the order of `AVAILABLE_MEASURES`, whatever order they were picked in.
+		const order = (m: MeasureType) => {
+			const i = AVAILABLE_MEASURES.findIndex((a) => a.value === m);
+			return i < 0 ? AVAILABLE_MEASURES.length : i;
+		};
+		const measures = [...selected_measures].sort((a, b) => order(a) - order(b));
 		const scenarioResult =
 			scenario_setup_mode === 'initial'
 				? await initializeCumulusStateWithScenariosRequest(
-						problem.id,
+						pending_problem_id,
 						pending_scenario_model_id,
 						pending_objective_symbols,
-						selected_measures,
+						measures,
 						measure_options,
 						combined_problem_name.trim() ? combined_problem_name.trim() : undefined
 					)
 				: await applyScenarioMeasuresRequest(
-						problem.id,
+						pending_problem_id,
 						pending_scenario_model_id,
 						pending_objective_symbols,
-						selected_measures,
+						measures,
 						measure_options,
 						combined_problem_name.trim() ? combined_problem_name.trim() : undefined
 					);
@@ -684,16 +739,38 @@
 			show_objectives_dialog = true;
 			await refresh_scenario_availability();
 		}
+		if (hypothetical) finish_hypothetical_setup(scenarioResult !== null);
 	}
 
 	async function cancel_scenario_setup() {
 		show_scenario_setup_dialog = false;
-		if (!problem) return;
-		if (scenario_setup_mode === 'initial') {
-			const plainResult = await initializeCumulusStateRequest(problem.id, true);
-			if (plainResult) await apply_initialization_result(plainResult);
-			await refresh_scenario_availability();
+		if (scenario_setup_mode === 'initial') await use_problem_as_is();
+	}
+
+	async function use_problem_as_is() {
+		const hypothetical = pending_hypothetical;
+		pending_hypothetical = false;
+		const plainResult = await initializeCumulusStateRequest(pending_problem_id, true);
+		if (plainResult) await apply_initialization_result(plainResult);
+		await refresh_scenario_availability();
+		if (hypothetical) finish_hypothetical_setup(plainResult !== null);
+	}
+
+	function finish_hypothetical_setup(succeeded: boolean) {
+		if (succeeded) {
+			switched_to_hypothetical();
+			return;
 		}
+		return_to_network_dialog($errorMessage ?? 'Setting up the new problem failed.');
+		errorMessage.set(null);
+	}
+
+	// Called only for user dismissal (Esc, outside click, close button), which is blocked unless
+	// `scenario_setup_dismissible`.
+	function handle_scenario_setup_dismissed(open: boolean) {
+		if (open || !pending_hypothetical) return;
+		pending_hypothetical = false;
+		return_to_network_dialog();
 	}
 
 	function confirm_finish() {
@@ -741,11 +818,16 @@
 		create_hypothetical as createHypotheticalRequest,
 		default_solution_name,
 		get_objective_constraints as getObjectiveConstraintsRequest,
+		only_available_measures as onlyAvailableMeasures,
+		preselected_measures as preselectedMeasures,
 		type MeasureType,
 		type MeasureOptions
 	} from './handlers';
 	import { getProblemProblemProblemIdGet } from '$lib/gen/endpoints/DESDEOFastAPI';
-	import type { CumulusScenarioAvailabilityResponse } from '$lib/gen/endpoints/DESDEOFastAPI';
+	import type {
+		CumulusScenarioAvailabilityResponse,
+		CumulusScenarioSetupResponseSource
+	} from '$lib/gen/endpoints/DESDEOFastAPI';
 	import EndStateView from '../GNIMBUS/components/EndStateView.svelte';
 
 	async function handle_intermediate() {
@@ -1023,18 +1105,32 @@
 		if (!result) return;
 
 		if (result.response_type === 'cumulus.scenario_setup') {
-			pending_scenario_model_id = result.scenario_model_id!;
-			pending_objective_symbols = result.objective_symbols!;
-			selected_measures = ['expected_value', 'worst_case_robust'];
-			cvar_alpha = 0.05;
-			combined_problem_name = problem ? `${problem.name} (combined)` : '';
-			scenario_setup_mode = 'initial';
-			show_scenario_setup_dialog = true;
+			open_initial_scenario_setup(problem_id, problem?.name ?? '', result);
 			return;
 		}
 
 		await apply_initialization_result(result);
 		await refresh_scenario_availability();
+	}
+
+	// Opens the setup dialog for a problem that has scenarios but no measures chosen yet.
+	// `applied` are the measures to preselect, e.g. the ones on the problem a hypothetical came from.
+	function open_initial_scenario_setup(
+		problem_id: number,
+		problem_name: string,
+		result: Response,
+		applied: string[] = []
+	) {
+		pending_problem_id = problem_id;
+		pending_source = result.source ?? 'scenario_model';
+		pending_scenario_model_id = result.scenario_model_id ?? null;
+		pending_objective_symbols = result.objective_symbols ?? [];
+		pending_measure_types = result.measure_types ?? [];
+		selected_measures = preselectedMeasures(applied, pending_measure_types);
+		cvar_alpha = 0.05;
+		combined_problem_name = problem_name ? `${problem_name} (combined)` : '';
+		scenario_setup_mode = 'initial';
+		show_scenario_setup_dialog = true;
 	}
 
 	async function apply_initialization_result(result: Response) {
@@ -1465,21 +1561,35 @@
 {/if}
 
 <!-- Scenario setup dialog -->
-<Dialog.Root bind:open={show_scenario_setup_dialog}>
+<Dialog.Root bind:open={show_scenario_setup_dialog} onOpenChange={handle_scenario_setup_dismissed}>
 	<Dialog.Portal>
 		<Dialog.Overlay />
-		<Dialog.Content class="max-w-sm">
+		<Dialog.Content
+			class={scenario_setup_dismissible ? 'max-w-sm' : 'max-w-sm [&_[data-dialog-close]]:hidden'}
+			escapeKeydownBehavior={scenario_setup_dismissible ? 'close' : 'ignore'}
+			interactOutsideBehavior={scenario_setup_dismissible ? 'close' : 'ignore'}
+		>
 			<Dialog.Header>
 				<Dialog.Title>
-					{scenario_setup_mode === 'initial'
-						? 'Scenario-based Problem Detected'
-						: 'Add Uncertainty Measures'}
+					{scenario_setup_mode === 'reopen'
+						? 'Add Uncertainty Measures'
+						: pending_source === 'graphical'
+							? 'Problem with Uncertain Outcomes Detected'
+							: 'Scenario-based Problem Detected'}
 				</Dialog.Title>
 				<Dialog.Description>
-					{scenario_setup_mode === 'initial'
-						? 'This problem has associated scenarios. Select which uncertainty measures to include in the combined problem. At least one measure is recommended.'
-						: 'Select which uncertainty measures to include. Rebuilding replaces the current combined problem and restarts the method against it; your earlier solutions stay available under the previous problem.'}
+					{scenario_setup_mode === 'reopen'
+						? 'Select which uncertainty measures to include. Rebuilding replaces the current combined problem and restarts the method against it; your earlier solutions stay available under the previous problem.'
+						: pending_source === 'graphical'
+							? 'This problem was compiled from a graphical model with uncertain outcomes. Select which uncertainty measures to include. At least one measure is recommended.'
+							: 'This problem has associated scenarios. Select which uncertainty measures to include in the combined problem. At least one measure is recommended.'}
 				</Dialog.Description>
+				{#if pending_source === 'graphical'}
+					<p class="text-muted-foreground text-xs">
+						The chosen measures replace the original objectives, including any compiled risk-measure
+						objectives.
+					</p>
+				{/if}
 			</Dialog.Header>
 			<div class="space-y-3 py-4">
 				<div class="flex flex-col gap-1">
@@ -1491,7 +1601,7 @@
 						class="rounded border px-2 py-1 text-sm"
 					/>
 				</div>
-				{#each AVAILABLE_MEASURES as measure (measure.value)}
+				{#each offered_measures as measure (measure.value)}
 					{@const isChecked = selected_measures.includes(measure.value)}
 					{@const checkboxId = `measure-checkbox-${measure.value}`}
 					<div class="flex items-center gap-3">
@@ -1530,9 +1640,8 @@
 					{scenario_setup_mode === 'initial' ? 'Use problem as-is' : 'Cancel'}
 				</Button>
 				<Button variant="default" onclick={confirm_scenario_setup}>
-					{scenario_setup_mode === 'initial'
-						? 'Build combined problem'
-						: 'Rebuild combined problem'}
+					{scenario_setup_mode === 'initial' ? 'Build' : 'Rebuild'}
+					{pending_source === 'graphical' ? 'problem with these measures' : 'combined problem'}
 				</Button>
 			</Dialog.Footer>
 		</Dialog.Content>

@@ -97,6 +97,11 @@ def parse_gurobipy_optimizer_results(problem: Problem, evaluator: GurobipyEvalua
     )
 
 
+# Gurobi output is suppressed. IntegralityFocus keeps MIP solutions feasible after rounding
+# binaries, so that big-M formulations cannot pass flow through nearly-zero binaries.
+_DEFAULT_GUROBI_OPTIONS: dict[str, any] = {"OutputFlag": 0, "LogToConsole": 0, "IntegralityFocus": 1}
+
+
 class GurobipySolver(BaseSolver):
     """Creates a gurobipy solver that utilizes gurobi's own Python implementation."""
 
@@ -110,19 +115,14 @@ class GurobipySolver(BaseSolver):
         Args:
             problem (Problem): the problem to be solved.
             options (dict[str,any]): Dictionary of Gurobi parameters to set.
-                You probably don't need to set any of these and can just use the defaults.
+                These override the defaults in `_DEFAULT_GUROBI_OPTIONS`, which are applied otherwise.
                 For available parameters see https://www.gurobi.com/documentation/current/refman/parameters.html
         """
         self.evaluator = GurobipyEvaluator(problem)
         self.problem = problem
 
-        if options is not None:
-            for key, value in options.items():
-                self.evaluator.model.setParam(key, value)
-        else:
-            # Set some default parameters that are good for most problems.
-            self.evaluator.model.setParam("OutputFlag", 0)  # Suppress Gurobi output
-            self.evaluator.model.setParam("LogToConsole", 0)  # Suppress Gurobi logging to console
+        for key, value in (_DEFAULT_GUROBI_OPTIONS | (options or {})).items():
+            self.evaluator.model.setParam(key, value)
 
     def solve(self, target: str) -> SolverResults:
         """Solve the problem for the given target.
@@ -154,14 +154,13 @@ class PersistentGurobipySolver(PersistentSolver):
         Args:
             problem (Problem): the problem to be transformed in a GurobipyModel.
             options (dict[str,any]): Dictionary of Gurobi parameters to set.
-                You probably don't need to set any of these and can just use the defaults.
+                These override the defaults in `_DEFAULT_GUROBI_OPTIONS`, which are applied otherwise.
                 For available parameters see https://www.gurobi.com/documentation/current/refman/parameters.html
         """
         self.problem = problem
         self.evaluator = GurobipyEvaluator(problem)
-        if options is not None:
-            for key, value in options.items():
-                self.evaluator.model.setParam(key, value)
+        for key, value in (_DEFAULT_GUROBI_OPTIONS | (options or {})).items():
+            self.evaluator.model.setParam(key, value)
 
     def add_constraint(self, constraint: Constraint | list[Constraint]) -> gp.Constr | list[gp.Constr]:
         """Add one or more constraint expressions to the solver.

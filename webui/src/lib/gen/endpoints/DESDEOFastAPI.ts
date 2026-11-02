@@ -632,28 +632,34 @@ export const UncertaintyMeasureSpecMeasureType = {
 } as const;
 
 /**
- * Leaf-name → weight mapping. Required for weighted_scenarios.
+ * Leaf-name → weight mapping. Required for weighted_scenarios; not available for a graphical model.
  */
 export type UncertaintyMeasureSpecLeafWeights = { [key: string]: number } | null;
 
 /**
- * Specification for adding a scenario-based uncertainty aggregate to the problem.
+ * Specification for adding an uncertainty aggregate to the problem.
  *
- * All measures in a single request must reference the same ``scenario_model_id``.
- * The resulting combined (multi-scenario) problem replaces the current problem.
+ * The aggregate is taken over either a scenario model (``scenario_model_id`` set) or, when
+ * ``scenario_model_id`` is None, the outcome distributions of the problem's graphical model.
+ * All measures in a single request must reference the same source. With a scenario model, the
+ * resulting combined (multi-scenario) problem replaces the current problem. With a graphical
+ * model, the aggregates replace the problem's objectives.
  */
 export interface UncertaintyMeasureSpec {
 	/** Which uncertainty aggregate to apply. */
 	measure_type: UncertaintyMeasureSpecMeasureType;
-	/** DB id of the ScenarioModelDB that defines the scenario structure. */
-	scenario_model_id: number;
-	/** Symbols of objectives or functions to aggregate. */
+	/** DB id of the ScenarioModelDB that defines the scenario structure, or None to aggregate over the problem's graphical model. */
+	scenario_model_id?: number | null;
+	/**
+	 * Symbols of objectives or functions to aggregate.
+	 * @minItems 1
+	 */
 	symbols: string[];
 	/** Prefix for the new aggregate symbols. Defaults vary by measure_type. */
 	prefix?: string | null;
 	/** Probability mass of the averaged tail of worst outcomes in the element's own direction, e.g. 0.05 for the worst 5 % (often called CVaR 95 %). Required for conditional_value_at_risk. */
 	alpha?: number | null;
-	/** Leaf-name → weight mapping. Required for weighted_scenarios. */
+	/** Leaf-name → weight mapping. Required for weighted_scenarios; not available for a graphical model. */
 	leaf_weights?: UncertaintyMeasureSpecLeafWeights;
 }
 
@@ -844,15 +850,39 @@ export interface CumulusSaveResponse {
 }
 
 /**
+ * Where the scenarios come from, if available.
+ */
+export type CumulusScenarioAvailabilityResponseSource =
+	| (typeof CumulusScenarioAvailabilityResponseSource)[keyof typeof CumulusScenarioAvailabilityResponseSource]
+	| null;
+
+export const CumulusScenarioAvailabilityResponseSource = {
+	scenario_model: 'scenario_model',
+	graphical: 'graphical'
+} as const;
+
+export type CumulusScenarioAvailabilityResponseMeasureTypesItem =
+	(typeof CumulusScenarioAvailabilityResponseMeasureTypesItem)[keyof typeof CumulusScenarioAvailabilityResponseMeasureTypesItem];
+
+export const CumulusScenarioAvailabilityResponseMeasureTypesItem = {
+	expected_value: 'expected_value',
+	worst_case_robust: 'worst_case_robust',
+	conditional_value_at_risk: 'conditional_value_at_risk',
+	weighted_scenarios: 'weighted_scenarios'
+} as const;
+
+/**
  * Whether uncertainty measures can be added to (or changed on) the given problem.
  *
  * Lets the frontend decide whether to show the "Add uncertainty measures" action at all,
  * independently of whether CUMULUS has already been initialized for the problem.
  */
 export interface CumulusScenarioAvailabilityResponse {
-	/** Whether the problem has an associated scenario model. */
+	/** Whether the problem has an associated scenario model or graphical model. */
 	available: boolean;
-	/** Id of the problem actually carrying the scenario model, found by walking parent_problem_id. */
+	/** Where the scenarios come from, if available. */
+	source?: CumulusScenarioAvailabilityResponseSource;
+	/** Id of the problem the measures are applied to, found by walking parent_problem_id: the one carrying the scenario model, or the nearest one whose objectives are not yet aggregated. */
 	base_problem_id?: number | null;
 	/** DB id of the ScenarioModelDB, if available. */
 	scenario_model_id?: number | null;
@@ -860,20 +890,48 @@ export interface CumulusScenarioAvailabilityResponse {
 	objective_symbols?: string[];
 	/** Measure types already present on the current problem's objectives, detected by symbol prefix. */
 	applied_measures?: string[];
+	/** The uncertainty measure types available for this source. */
+	measure_types?: CumulusScenarioAvailabilityResponseMeasureTypesItem[];
 }
+
+/**
+ * Where the scenarios come from.
+ */
+export type CumulusScenarioSetupResponseSource =
+	(typeof CumulusScenarioSetupResponseSource)[keyof typeof CumulusScenarioSetupResponseSource];
+
+export const CumulusScenarioSetupResponseSource = {
+	scenario_model: 'scenario_model',
+	graphical: 'graphical'
+} as const;
+
+export type CumulusScenarioSetupResponseMeasureTypesItem =
+	(typeof CumulusScenarioSetupResponseMeasureTypesItem)[keyof typeof CumulusScenarioSetupResponseMeasureTypesItem];
+
+export const CumulusScenarioSetupResponseMeasureTypesItem = {
+	expected_value: 'expected_value',
+	worst_case_robust: 'worst_case_robust',
+	conditional_value_at_risk: 'conditional_value_at_risk',
+	weighted_scenarios: 'weighted_scenarios'
+} as const;
 
 /**
  * Response when the problem has scenarios but no uncertainty measures have been chosen yet.
  *
- * The frontend should present this to the decision maker and let them choose which
- * uncertainty aggregates to include, then re-call get-or-initialize with the chosen measures.
+ * The scenarios come from a scenario model or from the problem's graphical model. The frontend
+ * should present this to the decision maker and let them choose which uncertainty aggregates to
+ * include, then re-call get-or-initialize with the chosen measures.
  */
 export interface CumulusScenarioSetupResponse {
 	response_type?: 'cumulus.scenario_setup';
-	/** DB id of the ScenarioModelDB associated with this problem. */
-	scenario_model_id: number;
+	/** Where the scenarios come from. */
+	source?: CumulusScenarioSetupResponseSource;
+	/** DB id of the ScenarioModelDB associated with this problem; None for 'graphical'. */
+	scenario_model_id?: number | null;
 	/** Symbols of the objectives available for aggregation. */
 	objective_symbols: string[];
+	/** The uncertainty measure types available for this source. */
+	measure_types?: CumulusScenarioSetupResponseMeasureTypesItem[];
 }
 
 /**
@@ -6040,10 +6098,11 @@ export const getGetOrInitializeMethodCumulusGetOrInitializePostUrl = (
 /**
  * Get the latest CUMULUS state if it exists, or initialize a new one if it doesn't.
  *
- * If the problem has associated scenarios and no uncertainty measures have been specified, a
+ * If the problem has associated scenarios (a scenario model, or a graphical model whose
+ * objectives are not yet aggregated) and no uncertainty measures have been specified, a
  * ``CumulusScenarioSetupResponse`` is returned so the frontend can ask the decision maker which
  * aggregates to include.  When the frontend re-calls with ``uncertainty_measures`` populated, a
- * combined multi-scenario problem is built, saved to the database, and used for initialization.
+ * combined problem is built, saved to the database, and used for initialization.
  * @summary Get Or Initialize
  */
 export const getOrInitializeMethodCumulusGetOrInitializePost = async (
@@ -6106,7 +6165,7 @@ export const getGetScenarioAvailabilityMethodCumulusScenarioAvailabilityGetUrl =
 /**
  * Report whether uncertainty measures can be added to (or changed on) a problem.
  *
- * Looks past any combined scenario problem already built from it (via `parent_problem_id`),
+ * Looks past any combined problem already built from it (via `parent_problem_id`),
  * so this stays accurate whether `problem_id` is the original problem or one already combined
  * from it. Used to decide whether to show the "Add uncertainty measures" UI action at all.
  * @summary Get Scenario Availability

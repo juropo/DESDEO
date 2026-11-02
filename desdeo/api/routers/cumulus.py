@@ -46,16 +46,24 @@ from desdeo.api.models.cumulus import (
     CumulusScenarioAvailabilityResponse,
     CumulusScenarioSetupResponse,
     ProblemModification,
+    UncertaintyMeasureSpec,
     UncertaintyMeasureType,
     UncertaintySource,
 )
 from desdeo.api.models.generic import SolutionInfo
 from desdeo.api.models.generic_states import SolutionReference, SolutionReferenceResponse, StateKind
-from desdeo.api.models.problem import ConstraintDB, GraphicalModelMetaData, ProblemDB
+from desdeo.api.models.problem import (
+    ConstraintDB,
+    DescriptionPart,
+    GraphicalModelMetaData,
+    ProblemDB,
+    SolutionDescriptionMetaData,
+)
 from desdeo.api.models.scenario import ScenarioModelDB
 from desdeo.api.models.state import CumulusClassificationState
 from desdeo.api.routers.graphical import _fetch_graphical_metadata
 from desdeo.api.routers.problem import check_solver
+from desdeo.api.routers.solution_description import _substitute_values, validate_description_parts
 from desdeo.api.routers.user_authentication import get_current_user
 from desdeo.mcdm.cumulus import (
     CumulusScalarization,
@@ -118,6 +126,11 @@ def _get_scenario_model_id(
 
 
 _MAX_PARENT_HOPS = 10
+
+_SCALARIZATION_NAMES = {
+    CumulusScalarization.CUMULONIMBUS: "Cumulonimbus",
+    CumulusScalarization.ASF_PARTIAL: "ASF (partial)",
+}
 
 _MEASURE_PREFIXES = {
     "E_": "expected_value",
@@ -196,6 +209,77 @@ def _detect_applied_measures(problem_db: ProblemDB) -> list[str]:
     return sorted(found)
 
 
+def _retarget_description_parts(raw_parts: list[dict], problem: Problem, renamed: dict[str, str]) -> list[dict]:
+    """Point a solution description's parts at `problem`, renaming symbols by `renamed`.
+
+    Parts still referring to symbols the problem lacks are left out, and so is a text part all
+    of whose value parts (up to the next text part) are left out.
+    """
+    parts: list[dict] = []
+    # Whether a value part since the last text part was left out.
+    dropped = False
+    for raw in raw_parts:
+        part = DescriptionPart.model_validate(raw)
+        if part.text is not None:
+            if dropped and parts and parts[-1]["text"] is not None:
+                parts.pop()
+            dropped = False
+            parts.append(part.model_dump())
+            continue
+        part = part.model_copy(
+            update={
+                "symbol": renamed.get(part.symbol, part.symbol),
+                "expression": _substitute_values(part.expression, renamed),
+            }
+        )
+        try:
+            validate_description_parts([part], problem)
+        except ValueError:
+            dropped = True
+            continue
+        parts.append(part.model_dump())
+    if dropped and parts and parts[-1]["text"] is not None:
+        parts.pop()
+    return parts
+
+
+def _retargeted_solution_descriptions(
+    base_problem_db: ProblemDB, problem: Problem, specs: list[UncertaintyMeasureSpec], db_session: Session
+) -> list[tuple[list[dict], str]]:
+    """Solution descriptions for a graphical aggregate `problem` built from `base_problem_db`.
+
+    The description is taken from the problem the aggregates are built on, so parts left out of
+    an earlier aggregate problem come back. A replaced objective is the expected value of its
+    outcome, so a part on it reads the objective's expected-value aggregate where there is one.
+    """
+    source = _resolve_uncertainty_source(base_problem_db, db_session)
+    source_metadata = source.base_problem_db.problem_metadata if source is not None else None
+    metadata = source_metadata or base_problem_db.problem_metadata
+    source_items = (metadata.solution_description_metadata or []) if metadata is not None else []
+    renamed = {
+        symbol: f"{spec.prefix or 'E_'}{symbol}"
+        for spec in specs
+        if spec.measure_type == "expected_value"
+        for symbol in spec.symbols
+    }
+    return [(_retarget_description_parts(item.parts or [], problem, renamed), item.separator) for item in source_items]
+
+
+def _replace_solution_descriptions(
+    problem_db: ProblemDB, descriptions: list[tuple[list[dict], str]], db_session: Session
+) -> None:
+    """Replace the solution descriptions of `problem_db` with `descriptions`."""
+    db_session.refresh(problem_db)
+    metadata = problem_db.problem_metadata
+    if metadata is None:
+        return
+    for item in metadata.solution_description_metadata or []:
+        db_session.delete(item)
+    for parts, separator in descriptions:
+        db_session.add(SolutionDescriptionMetaData(metadata_id=metadata.id, parts=parts, separator=separator))
+    db_session.commit()
+
+
 def _build_combined_problem_and_initialize(
     request: CumulusInitializationRequest,
     context: SessionContext,
@@ -209,10 +293,9 @@ def _build_combined_problem_and_initialize(
 
     problem = Problem.from_problemdb(base_problem_db)
     mods = ProblemModification(uncertainty_measures=request.uncertainty_measures)
+    graphical_meta = find_graphical_metadata(base_problem_db.id, db_session)
     try:
-        combined_problem = apply_problem_modifications(
-            problem, mods, db_session, find_graphical_metadata(base_problem_db.id, db_session)
-        )
+        combined_problem = apply_problem_modifications(problem, mods, db_session, graphical_meta)
     except HTTPException:
         raise
     except Exception as e:
@@ -229,6 +312,12 @@ def _build_combined_problem_and_initialize(
     except Exception:  # noqa: S110
         pass  # proceed without ideal/nadir if payoff table fails
 
+    descriptions = (
+        _retargeted_solution_descriptions(base_problem_db, combined_problem, request.uncertainty_measures, db_session)
+        if graphical_meta is not None
+        else None
+    )
+
     new_problem_db = ProblemDB.from_problem(combined_problem, user=user)
     new_problem_db.parent_problem_id = base_problem_db.id
     if request.name:
@@ -242,6 +331,8 @@ def _build_combined_problem_and_initialize(
     db_session.refresh(new_problem_db)
     copy_problem_metadata(base_problem_db, new_problem_db, db_session)
     db_session.commit()
+    if descriptions is not None:
+        _replace_solution_descriptions(new_problem_db, descriptions, db_session)
 
     new_context = SessionContext(
         user=user,
@@ -330,20 +421,27 @@ def solve_solutions(
     solver_results: list[SolverResults] = [r for r in results_by_scalarization.values() if r is not None]
 
     warnings: list[str] = []
-    if (
-        CumulusScalarization.CUMULONIMBUS in scalarizations
-        and results_by_scalarization.get(CumulusScalarization.CUMULONIMBUS) is None
-        and soft_ids
-    ):
-        # Cumulonimbus keeps every objective within what the classification allows, so it fails
-        # when no solution there meets the soft constraints as closely as they can be met at all.
-        warnings.append(
-            "Cumulonimbus found no solution. Your reference point does not let some objectives get "
-            "worse than in the current solution, and no solution within those limits meets your "
-            f"{len(soft_ids)} soft objective constraint(s) as closely as they can be met. To get a "
-            "Cumulonimbus solution, allow those objectives to get worse in the reference point, or "
-            "loosen or remove the constraints."
-        )
+    for sf in scalarizations:
+        if results_by_scalarization.get(sf) is not None:
+            continue
+        if sf == CumulusScalarization.CUMULONIMBUS and soft_ids:
+            # Cumulonimbus keeps every objective within what the classification allows, so it fails
+            # when no solution there meets the soft constraints as closely as they can be met at all.
+            warnings.append(
+                "Cumulonimbus found no solution. Your reference point does not let some objectives get "
+                "worse than in the current solution, and no solution within those limits meets your "
+                f"{len(soft_ids)} soft objective constraint(s) as closely as they can be met. To get a "
+                "Cumulonimbus solution, allow those objectives to get worse in the reference point, or "
+                "loosen or remove the constraints."
+            )
+        else:
+            warning = (
+                f"The {_SCALARIZATION_NAMES[sf]} scalarization found no solution: the solver could not solve it, "
+                "so it may be infeasible or unbounded for this reference point."
+            )
+            if sf == CumulusScalarization.CUMULONIMBUS:
+                warning += " If every objective may worsen freely, ask at least one objective to improve."
+            warnings.append(warning)
 
     # The largest relaxation of each soft constraint over the returned solutions.
     violated: dict[str, float] = {}
@@ -1383,9 +1481,8 @@ def modify_problem(
     parent_state = context.parent_state
 
     problem = Problem.from_problemdb(problem_db)
-    modified_problem = apply_problem_modifications(
-        problem, request.modifications, db_session, find_graphical_metadata(problem_db.id, db_session)
-    )
+    graphical_meta = find_graphical_metadata(problem_db.id, db_session)
+    modified_problem = apply_problem_modifications(problem, request.modifications, db_session, graphical_meta)
 
     changed_constraints, only_constraints_changed = _changed_by_modification(problem, modified_problem)
 
@@ -1399,6 +1496,14 @@ def modify_problem(
         and parent_state is not None
         and parent_state.problem_id == problem_db.id
         and _some_current_solution_satisfies(modified_problem, parent_state, changed_constraints)
+    )
+
+    descriptions = (
+        _retargeted_solution_descriptions(
+            problem_db, modified_problem, request.modifications.uncertainty_measures, db_session
+        )
+        if graphical_meta is not None and request.modifications.uncertainty_measures
+        else None
     )
 
     # Save the modified problem immediately (ideal/nadir will be updated by the background task).
@@ -1417,6 +1522,8 @@ def modify_problem(
     db_session.refresh(new_problem_db)
     copy_problem_metadata(problem_db, new_problem_db, db_session)
     db_session.commit()
+    if descriptions is not None:
+        _replace_solution_descriptions(new_problem_db, descriptions, db_session)
 
     original_problem_id = request.original_problem_id if request.original_problem_id is not None else problem_db.id
 

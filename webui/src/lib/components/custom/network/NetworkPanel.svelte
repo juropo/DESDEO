@@ -125,7 +125,8 @@
 		 *  follows in what-if requests. Refetches when it changes. */
 		policySolution?: NetworkSolutionRef | null;
 		/** Current evidence, including pinned decisions in `decisionMode: 'manual'`. Bindable, e.g.
-		 *  so the host can list the pins. */
+		 *  so the host can list the pins. Kept on mount, so a host can restore it after a remount;
+		 *  reset when `modelId` changes. */
 		evidence?: NetworkEvidence;
 		/** A solved solution to decode the policy from (via `POST /graphical/{id}/policy`) on every
 		 *  evidence change, overriding the live-inference policy from `fetchWhatIf`. */
@@ -242,6 +243,8 @@
 
 	// Bumped on every `loadStructure` call, so responses for a superseded model are discarded.
 	let structureRequestId = 0;
+	// Whether a model has been loaded since mount; the first load keeps the given `evidence`.
+	let hasLoadedStructure = false;
 	// Discards out-of-order responses in `seedPrior`.
 	let priorRequestId = 0;
 
@@ -299,7 +302,9 @@
 		structureError = null;
 		whatIfError = null;
 		// Reset all state tied to the previous model.
-		evidence = {};
+		const keepEvidence = !hasLoadedStructure;
+		hasLoadedStructure = true;
+		if (!keepEvidence) evidence = {};
 		posteriors = undefined;
 		policy = undefined;
 		utilities = undefined;
@@ -340,6 +345,7 @@
 					}
 				}
 			})();
+		if (keepEvidence && Object.keys(evidence).length > 0) handleEvidenceChange(evidence);
 		await seedPrior(requestId, priorFetcher);
 	}
 

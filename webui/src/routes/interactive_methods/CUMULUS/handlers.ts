@@ -392,9 +392,29 @@ export interface MeasureOptions {
 	cvar_alpha?: number;
 }
 
+/** Keeps only the measures the uncertainty source offers. */
+export function only_available_measures(
+	measures: MeasureType[],
+	measure_types: MeasureType[]
+): MeasureType[] {
+	return measures.filter((m) => measure_types.includes(m));
+}
+
+/** The measures to preselect: the already-applied ones the source offers, else E and robust. */
+export function preselected_measures(
+	applied: string[],
+	measure_types: MeasureType[]
+): MeasureType[] {
+	const kept = only_available_measures(applied as MeasureType[], measure_types);
+	return kept.length > 0
+		? kept
+		: only_available_measures(['expected_value', 'worst_case_robust'], measure_types);
+}
+
+/** A null `scenario_model_id` aggregates over the problem's graphical model. */
 function build_uncertainty_measures_request(
 	problem_id: number,
-	scenario_model_id: number,
+	scenario_model_id: number | null,
 	objective_symbols: string[],
 	selected_measures: MeasureType[],
 	measure_options: MeasureOptions,
@@ -405,7 +425,7 @@ function build_uncertainty_measures_request(
 		name: blankToNull(name),
 		uncertainty_measures: selected_measures.map((measure_type) => ({
 			measure_type,
-			scenario_model_id,
+			...(scenario_model_id !== null && { scenario_model_id }),
 			symbols: objective_symbols,
 			...(measure_type === 'conditional_value_at_risk' && {
 				alpha: measure_options.cvar_alpha ?? 0.05
@@ -416,11 +436,11 @@ function build_uncertainty_measures_request(
 
 /**
  * Re-calls get-or-initialize with the DM-chosen uncertainty measures applied,
- * building a combined multi-scenario problem before starting the method.
+ * building a combined problem before starting the method.
  */
 export async function initialize_cumulus_state_with_scenarios(
 	problem_id: number,
-	scenario_model_id: number,
+	scenario_model_id: number | null,
 	objective_symbols: string[],
 	selected_measures: MeasureType[],
 	measure_options: MeasureOptions = {},
@@ -459,7 +479,8 @@ export async function initialize_cumulus_state_with_scenarios(
 
 /**
  * Checks whether a problem (or the base problem it was combined from) has an associated
- * scenario model, so the "Add uncertainty measures" action can be shown or hidden accordingly.
+ * scenario model or graphical model, so the "Add uncertainty measures" action can be shown or
+ * hidden accordingly.
  */
 export async function check_scenario_availability(
 	problem_id: number
@@ -484,14 +505,14 @@ export async function check_scenario_availability(
 }
 
 /**
- * Builds (or rebuilds) a combined scenario problem with the given uncertainty measures,
+ * Builds (or rebuilds) a combined problem with the given uncertainty measures,
  * regardless of whether CUMULUS has already been initialized for the current problem.
  * Used by the "Add uncertainty measures" menu action, which can be used both before the
  * method has started and later, to change which measures are included.
  */
 export async function apply_scenario_measures(
 	problem_id: number,
-	scenario_model_id: number,
+	scenario_model_id: number | null,
 	objective_symbols: string[],
 	selected_measures: MeasureType[],
 	measure_options: MeasureOptions = {},

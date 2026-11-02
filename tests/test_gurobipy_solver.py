@@ -232,3 +232,16 @@ def test_objective_referencing_unknown_symbol_still_raises():
 
     with pytest.raises(GurobipyEvaluatorError, match="f_nonexistent"):
         GurobipyEvaluator(broken)
+
+
+@pytest.mark.gurobipy
+@pytest.mark.parametrize("solver_class", [GurobipySolver, PersistentGurobipySolver])
+def test_custom_options_keep_defaults(solver_class):
+    """Custom options are set alongside the defaults, and override them where they overlap."""
+    solver = solver_class(simple_linear_test_problem(), options={"TimeLimit": 30, "OutputFlag": 1})
+    params = solver.evaluator.model.Params
+
+    assert params.IntegralityFocus == 1
+    assert params.LogToConsole == 0
+    assert params.TimeLimit == 30
+    assert params.OutputFlag == 1

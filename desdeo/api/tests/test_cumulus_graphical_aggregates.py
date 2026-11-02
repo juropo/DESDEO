@@ -7,6 +7,7 @@ from sqlmodel import Session
 
 from desdeo.api.models import ProblemDB, StateDB
 from desdeo.api.models.cumulus import UncertaintyMeasureSpec
+from desdeo.api.routers.cumulus import _retarget_description_parts
 from desdeo.api.routers.utils import _apply_graphical_uncertainty_measures, find_graphical_metadata
 from desdeo.problem import Problem
 from desdeo.problem.graphical import RiskMeasure
@@ -496,3 +497,167 @@ def test_reopen_aggregated_in_fresh_session(client: TestClient, session_and_user
     d = resp.json()
     assert d["response_type"] == "cumulus.initialization"
     assert d["problem_id"] == agg_id
+
+
+def _solve(client: TestClient, token: str, init: dict, reference_point: dict[str, float]) -> dict:
+    resp = post_json(
+        client,
+        "/method/cumulus/solve",
+        {
+            "problem_id": init["problem_id"],
+            "preference": {"preference_type": "reference_point", "aspiration_levels": reference_point},
+            "current_objectives": init["current_solutions"][0]["objective_values"],
+            "scalarizations": ["cumulonimbus"],
+            "parent_state_id": init["state_id"],
+        },
+        token,
+    )
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+@pytest.mark.gurobipy
+def test_solve_with_cvar_aggregates(client: TestClient, session_and_user: dict) -> None:
+    """Cumulonimbus finds a solution on an E + worst-case + CVaR build of the oil wildcatter."""
+    session = session_and_user["session"]
+    token = login(client)
+    problem_id = _compile_oil_wildcatter(client, token)
+    symbols = ["investment", "oil_produced", "profit"]
+    measures = [
+        {"measure_type": "expected_value", "symbols": symbols},
+        {"measure_type": "worst_case_robust", "symbols": symbols},
+        {"measure_type": "conditional_value_at_risk", "symbols": symbols, "alpha": 0.05},
+    ]
+    init = _aggregate(client, token, problem_id, measures)
+    reference_point = dict.fromkeys(_objective_symbols(session, init["problem_id"]), 0.0)
+    reference_point |= {"E_oil_produced": 900.0, "E_profit": 20286.0}
+    data = _solve(client, token, init, reference_point)
+    assert len(data["current_solutions"]) >= 1
+    assert data["warnings"] == []
+
+
+@pytest.mark.gurobipy
+def test_solve_failure_warns(client: TestClient, session_and_user: dict) -> None:
+    """A cumulonimbus solve that finds no solution says so in the warnings."""
+    session = session_and_user["session"]
+    token = login(client)
+    problem_id = _compile_oil_wildcatter(client, token)
+    init = _aggregate(client, token, problem_id, [{"measure_type": "expected_value", "symbols": ["profit"]}])
+    session.expire_all()
+    nadir = {o.symbol: o.nadir for o in session.get(ProblemDB, init["problem_id"]).objectives}
+    data = _solve(client, token, init, nadir)
+    assert data["current_solutions"] == []
+    assert any("Cumulonimbus scalarization" in w for w in data["warnings"])
+
+
+@pytest.mark.cvxpy
+def test_aggregate_solution_description(client: TestClient, session_and_user: dict) -> None:
+    """A replaced objective's description part reads its expected value, or is left out without one."""
+    token = login(client)
+    problem_id = _compile_oil_wildcatter(client, token)
+    parts = [
+        {"text": "Expected outcomes:"},
+        {"label": "Profit", "symbol": "profit", "format_spec": ".0f"},
+        {"label": "Investment", "expression": ["Multiply", 2, "investment"], "format_spec": ".0f"},
+    ]
+    resp = post_json(client, "/solution-description/update_metadata", {"problem_id": problem_id, "parts": parts}, token)
+    assert resp.status_code == 200, resp.text
+    init = _aggregate(
+        client,
+        token,
+        problem_id,
+        [
+            {"measure_type": "expected_value", "symbols": ["profit"]},
+            {"measure_type": "worst_case_robust", "symbols": ["investment"]},
+        ],
+    )
+    resp = post_json(
+        client,
+        "/solution-description/get",
+        {"problem_id": init["problem_id"], "solution": {"state_id": init["state_id"], "solution_index": 0}},
+        token,
+    )
+    assert resp.status_code == 200, resp.text
+    profit = init["current_solutions"][0]["objective_values"]["E_profit"]
+    assert resp.json()["description"] == f"Expected outcomes:\nProfit: {profit:.0f}"
+
+    # Without any value part left, the header goes too; a later rebuild still has the parts.
+    robust = _aggregate(client, token, problem_id, [{"measure_type": "worst_case_robust", "symbols": ["profit"]}])
+    resp = post_json(
+        client,
+        "/solution-description/get",
+        {"problem_id": robust["problem_id"], "solution": {"state_id": robust["state_id"], "solution_index": 0}},
+        token,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["description"] == ""
+    resp = post_json(
+        client,
+        "/method/cumulus/apply-scenario-measures",
+        {
+            "problem_id": robust["problem_id"],
+            "uncertainty_measures": [{"measure_type": "expected_value", "symbols": ["profit"]}],
+        },
+        token,
+    )
+    assert resp.status_code == 200, resp.text
+    reopened = resp.json()
+    resp = post_json(
+        client,
+        "/solution-description/get",
+        {"problem_id": reopened["problem_id"], "solution": {"state_id": reopened["state_id"], "solution_index": 0}},
+        token,
+    )
+    assert resp.status_code == 200, resp.text
+    profit = reopened["current_solutions"][0]["objective_values"]["E_profit"]
+    assert resp.json()["description"] == f"Expected outcomes:\nProfit: {profit:.0f}"
+
+
+@pytest.mark.parametrize(
+    "parts",
+    [
+        [{"label": "Investment", "symbol": "investment"}],
+        [{"label": "Investment", "symbol": "investment"}, {"text": "Outcomes follow."}],
+    ],
+)
+def test_aggregate_solution_description_without_header(
+    client: TestClient, session_and_user: dict, parts: list[dict]
+) -> None:
+    """A description whose first part is a value part left out is rebuilt without error."""
+    token = login(client)
+    problem_id = _compile_oil_wildcatter(client, token)
+    resp = post_json(client, "/solution-description/update_metadata", {"problem_id": problem_id, "parts": parts}, token)
+    assert resp.status_code == 200, resp.text
+    robust = _aggregate(client, token, problem_id, [{"measure_type": "worst_case_robust", "symbols": ["investment"]}])
+    resp = post_json(
+        client,
+        "/solution-description/get",
+        {"problem_id": robust["problem_id"], "solution": {"state_id": robust["state_id"], "solution_index": 0}},
+        token,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["description"] == ("Outcomes follow." if len(parts) > 1 else "")
+
+
+def test_retarget_description_parts(client: TestClient, session_and_user: dict) -> None:
+    """Value parts on missing symbols are left out, with a text part whose value parts all are."""
+    token = login(client)
+    problem_id = _compile_oil_wildcatter(client, token)
+    robust = _aggregate(client, token, problem_id, [{"measure_type": "worst_case_robust", "symbols": ["investment"]}])
+    session = session_and_user["session"]
+    session.expire_all()
+    problem = Problem.from_problemdb(session.get(ProblemDB, robust["problem_id"]))
+
+    def texts(raw_parts: list[dict], renamed: dict[str, str] | None = None) -> list[str | None]:
+        return [p["text"] or p["symbol"] for p in _retarget_description_parts(raw_parts, problem, renamed or {})]
+
+    investment = {"symbol": "investment"}
+    robust_investment = {"symbol": "robust_investment"}
+    assert texts([]) == []
+    assert texts([investment]) == []
+    assert texts([investment, {"text": "a"}]) == ["a"]
+    assert texts([{"text": "a"}, investment]) == []
+    assert texts([{"text": "a"}, investment, {"text": "b"}, robust_investment]) == ["b", "robust_investment"]
+    assert texts([{"text": "a"}, investment, robust_investment]) == ["a", "robust_investment"]
+    assert texts([{"text": "a"}, {"text": "b"}]) == ["a", "b"]
+    assert texts([{"text": "a"}, {"symbol": "x"}], {"x": "robust_investment"}) == ["a", "robust_investment"]

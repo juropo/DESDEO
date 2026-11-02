@@ -38,11 +38,14 @@ const {
 	check_scenario_availability,
 	apply_scenario_measures,
 	create_hypothetical,
-	default_solution_name
+	default_solution_name,
+	only_available_measures,
+	preselected_measures
 } = await import('./handlers');
 const { errorMessage } = await import('../../../stores/uiState');
 
 import type { ProblemInfo } from '$lib/gen/endpoints/DESDEOFastAPI';
+import type { MeasureType } from './handlers';
 
 /** A problem stub carrying only what the constraint handlers actually read. */
 function make_problem(): ProblemInfo {
@@ -196,6 +199,31 @@ describe('apply_scenario_measures', () => {
 		});
 	});
 
+	it('omits scenario_model_id for the graphical source', async () => {
+		applyScenarioMeasures.mockResolvedValue({ status: 200, data: { problem_id: 9 } });
+
+		await apply_scenario_measures(
+			7,
+			null,
+			['f_1'],
+			['expected_value', 'conditional_value_at_risk'],
+			{ cvar_alpha: 0.1 }
+		);
+
+		expect(applyScenarioMeasures).toHaveBeenCalledWith({
+			problem_id: 7,
+			name: null,
+			uncertainty_measures: [
+				{ measure_type: 'expected_value', symbols: ['f_1'] },
+				{ measure_type: 'conditional_value_at_risk', symbols: ['f_1'], alpha: 0.1 }
+			]
+		});
+		const [request] = applyScenarioMeasures.mock.calls[0] as [{ uncertainty_measures: object[] }];
+		for (const measure of request.uncertainty_measures) {
+			expect(measure).not.toHaveProperty('scenario_model_id');
+		}
+	});
+
 	it('reports an error and returns null when the endpoint rejects the measures', async () => {
 		applyScenarioMeasures.mockResolvedValue({ status: 422, data: { detail: 'no scenario model' } });
 
@@ -203,6 +231,51 @@ describe('apply_scenario_measures', () => {
 
 		expect(result).toBeNull();
 		expect(get(errorMessage)).toContain('422');
+	});
+});
+
+describe('only_available_measures', () => {
+	it('drops measures the source does not offer, keeping the given order', () => {
+		expect(
+			only_available_measures(
+				['weighted_scenarios', 'expected_value', 'worst_case_robust'],
+				['expected_value', 'worst_case_robust', 'conditional_value_at_risk']
+			)
+		).toEqual(['expected_value', 'worst_case_robust']);
+	});
+
+	it('returns nothing when the source offers no measures', () => {
+		expect(only_available_measures(['expected_value'], [])).toEqual([]);
+	});
+});
+
+describe('preselected_measures', () => {
+	const offered: MeasureType[] = [
+		'expected_value',
+		'worst_case_robust',
+		'conditional_value_at_risk'
+	];
+
+	it('keeps the applied measures the source offers', () => {
+		expect(preselected_measures(['expected_value', 'conditional_value_at_risk'], offered)).toEqual([
+			'expected_value',
+			'conditional_value_at_risk'
+		]);
+	});
+
+	it('falls back to E and robust when nothing is applied', () => {
+		expect(preselected_measures([], offered)).toEqual(['expected_value', 'worst_case_robust']);
+	});
+
+	it('falls back when no applied measure is offered', () => {
+		expect(preselected_measures(['weighted_scenarios'], offered)).toEqual([
+			'expected_value',
+			'worst_case_robust'
+		]);
+	});
+
+	it('limits the fallback to the offered measures', () => {
+		expect(preselected_measures([], ['expected_value'])).toEqual(['expected_value']);
 	});
 });
 

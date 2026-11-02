@@ -6816,10 +6816,14 @@ export const InitializeMethodCumulusInitializePostBody = zod
 								])
 								.describe('Which uncertainty aggregate to apply.'),
 							scenario_model_id: zod
-								.number()
-								.describe('DB id of the ScenarioModelDB that defines the scenario structure.'),
+								.union([zod.number(), zod.null()])
+								.optional()
+								.describe(
+									"DB id of the ScenarioModelDB that defines the scenario structure, or None to aggregate over the problem's graphical model."
+								),
 							symbols: zod
 								.array(zod.string())
+								.min(1)
 								.describe('Symbols of objectives or functions to aggregate.'),
 							prefix: zod
 								.union([zod.string(), zod.null()])
@@ -6834,10 +6838,12 @@ export const InitializeMethodCumulusInitializePostBody = zod
 							leaf_weights: zod
 								.union([zod.record(zod.string(), zod.number()), zod.null()])
 								.optional()
-								.describe('Leaf-name → weight mapping. Required for weighted_scenarios.')
+								.describe(
+									'Leaf-name → weight mapping. Required for weighted_scenarios; not available for a graphical model.'
+								)
 						})
 						.describe(
-							'Specification for adding a scenario-based uncertainty aggregate to the problem.\n\nAll measures in a single request must reference the same ``scenario_model_id``.\nThe resulting combined (multi-scenario) problem replaces the current problem.'
+							"Specification for adding an uncertainty aggregate to the problem.\n\nThe aggregate is taken over either a scenario model (``scenario_model_id`` set) or, when\n``scenario_model_id`` is None, the outcome distributions of the problem's graphical model.\nAll measures in a single request must reference the same source. With a scenario model, the\nresulting combined (multi-scenario) problem replaces the current problem. With a graphical\nmodel, the aggregates replace the problem's objectives."
 						)
 				),
 				zod.null()
@@ -6954,10 +6960,11 @@ export const SaveMethodCumulusSavePostResponse = zod
 /**
  * Get the latest CUMULUS state if it exists, or initialize a new one if it doesn't.
  *
- * If the problem has associated scenarios and no uncertainty measures have been specified, a
+ * If the problem has associated scenarios (a scenario model, or a graphical model whose
+ * objectives are not yet aggregated) and no uncertainty measures have been specified, a
  * ``CumulusScenarioSetupResponse`` is returned so the frontend can ask the decision maker which
  * aggregates to include.  When the frontend re-calls with ``uncertainty_measures`` populated, a
- * combined multi-scenario problem is built, saved to the database, and used for initialization.
+ * combined problem is built, saved to the database, and used for initialization.
  * @summary Get Or Initialize
  */
 export const GetOrInitializeMethodCumulusGetOrInitializePostQueryParams = zod.object({
@@ -7030,10 +7037,14 @@ export const GetOrInitializeMethodCumulusGetOrInitializePostBody = zod
 								])
 								.describe('Which uncertainty aggregate to apply.'),
 							scenario_model_id: zod
-								.number()
-								.describe('DB id of the ScenarioModelDB that defines the scenario structure.'),
+								.union([zod.number(), zod.null()])
+								.optional()
+								.describe(
+									"DB id of the ScenarioModelDB that defines the scenario structure, or None to aggregate over the problem's graphical model."
+								),
 							symbols: zod
 								.array(zod.string())
+								.min(1)
 								.describe('Symbols of objectives or functions to aggregate.'),
 							prefix: zod
 								.union([zod.string(), zod.null()])
@@ -7048,10 +7059,12 @@ export const GetOrInitializeMethodCumulusGetOrInitializePostBody = zod
 							leaf_weights: zod
 								.union([zod.record(zod.string(), zod.number()), zod.null()])
 								.optional()
-								.describe('Leaf-name → weight mapping. Required for weighted_scenarios.')
+								.describe(
+									'Leaf-name → weight mapping. Required for weighted_scenarios; not available for a graphical model.'
+								)
 						})
 						.describe(
-							'Specification for adding a scenario-based uncertainty aggregate to the problem.\n\nAll measures in a single request must reference the same ``scenario_model_id``.\nThe resulting combined (multi-scenario) problem replaces the current problem.'
+							"Specification for adding an uncertainty aggregate to the problem.\n\nThe aggregate is taken over either a scenario model (``scenario_model_id`` set) or, when\n``scenario_model_id`` is None, the outcome distributions of the problem's graphical model.\nAll measures in a single request must reference the same source. With a scenario model, the\nresulting combined (multi-scenario) problem replaces the current problem. With a graphical\nmodel, the aggregates replace the problem's objectives."
 						)
 				),
 				zod.null()
@@ -7065,6 +7078,7 @@ export const getOrInitializeMethodCumulusGetOrInitializePostResponseTwoResponseT
 export const getOrInitializeMethodCumulusGetOrInitializePostResponseTwoPreviousPreferencePreferenceTypeDefault = `reference_point`;
 export const getOrInitializeMethodCumulusGetOrInitializePostResponseThreeResponseTypeDefault = `cumulus.finalize`;
 export const getOrInitializeMethodCumulusGetOrInitializePostResponseFourResponseTypeDefault = `cumulus.scenario_setup`;
+export const getOrInitializeMethodCumulusGetOrInitializePostResponseFourSourceDefault = `scenario_model`;
 
 export const GetOrInitializeMethodCumulusGetOrInitializePostResponse = zod.union([
 	zod
@@ -7271,22 +7285,40 @@ export const GetOrInitializeMethodCumulusGetOrInitializePostResponse = zod.union
 			response_type: zod
 				.literal('cumulus.scenario_setup')
 				.default(getOrInitializeMethodCumulusGetOrInitializePostResponseFourResponseTypeDefault),
+			source: zod
+				.enum(['scenario_model', 'graphical'])
+				.default(getOrInitializeMethodCumulusGetOrInitializePostResponseFourSourceDefault)
+				.describe('Where the scenarios come from.'),
 			scenario_model_id: zod
-				.number()
-				.describe('DB id of the ScenarioModelDB associated with this problem.'),
+				.union([zod.number(), zod.null()])
+				.optional()
+				.describe(
+					"DB id of the ScenarioModelDB associated with this problem; None for 'graphical'."
+				),
 			objective_symbols: zod
 				.array(zod.string())
-				.describe('Symbols of the objectives available for aggregation.')
+				.describe('Symbols of the objectives available for aggregation.'),
+			measure_types: zod
+				.array(
+					zod.enum([
+						'expected_value',
+						'worst_case_robust',
+						'conditional_value_at_risk',
+						'weighted_scenarios'
+					])
+				)
+				.optional()
+				.describe('The uncertainty measure types available for this source.')
 		})
 		.describe(
-			'Response when the problem has scenarios but no uncertainty measures have been chosen yet.\n\nThe frontend should present this to the decision maker and let them choose which\nuncertainty aggregates to include, then re-call get-or-initialize with the chosen measures.'
+			"Response when the problem has scenarios but no uncertainty measures have been chosen yet.\n\nThe scenarios come from a scenario model or from the problem's graphical model. The frontend\nshould present this to the decision maker and let them choose which uncertainty aggregates to\ninclude, then re-call get-or-initialize with the chosen measures."
 		)
 ]);
 
 /**
  * Report whether uncertainty measures can be added to (or changed on) a problem.
  *
- * Looks past any combined scenario problem already built from it (via `parent_problem_id`),
+ * Looks past any combined problem already built from it (via `parent_problem_id`),
  * so this stays accurate whether `problem_id` is the original problem or one already combined
  * from it. Used to decide whether to show the "Add uncertainty measures" UI action at all.
  * @summary Get Scenario Availability
@@ -7298,12 +7330,18 @@ export const GetScenarioAvailabilityMethodCumulusScenarioAvailabilityGetQueryPar
 
 export const GetScenarioAvailabilityMethodCumulusScenarioAvailabilityGetResponse = zod
 	.object({
-		available: zod.boolean().describe('Whether the problem has an associated scenario model.'),
+		available: zod
+			.boolean()
+			.describe('Whether the problem has an associated scenario model or graphical model.'),
+		source: zod
+			.union([zod.enum(['scenario_model', 'graphical']), zod.null()])
+			.optional()
+			.describe('Where the scenarios come from, if available.'),
 		base_problem_id: zod
 			.union([zod.number(), zod.null()])
 			.optional()
 			.describe(
-				'Id of the problem actually carrying the scenario model, found by walking parent_problem_id.'
+				'Id of the problem the measures are applied to, found by walking parent_problem_id: the one carrying the scenario model, or the nearest one whose objectives are not yet aggregated.'
 			),
 		scenario_model_id: zod
 			.union([zod.number(), zod.null()])
@@ -7318,7 +7356,18 @@ export const GetScenarioAvailabilityMethodCumulusScenarioAvailabilityGetResponse
 			.optional()
 			.describe(
 				"Measure types already present on the current problem's objectives, detected by symbol prefix."
+			),
+		measure_types: zod
+			.array(
+				zod.enum([
+					'expected_value',
+					'worst_case_robust',
+					'conditional_value_at_risk',
+					'weighted_scenarios'
+				])
 			)
+			.optional()
+			.describe('The uncertainty measure types available for this source.')
 	})
 	.describe(
 		'Whether uncertainty measures can be added to (or changed on) the given problem.\n\nLets the frontend decide whether to show the \"Add uncertainty measures\" action at all,\nindependently of whether CUMULUS has already been initialized for the problem.'
@@ -7403,10 +7452,14 @@ export const ApplyScenarioMeasuresMethodCumulusApplyScenarioMeasuresPostBody = z
 								])
 								.describe('Which uncertainty aggregate to apply.'),
 							scenario_model_id: zod
-								.number()
-								.describe('DB id of the ScenarioModelDB that defines the scenario structure.'),
+								.union([zod.number(), zod.null()])
+								.optional()
+								.describe(
+									"DB id of the ScenarioModelDB that defines the scenario structure, or None to aggregate over the problem's graphical model."
+								),
 							symbols: zod
 								.array(zod.string())
+								.min(1)
 								.describe('Symbols of objectives or functions to aggregate.'),
 							prefix: zod
 								.union([zod.string(), zod.null()])
@@ -7421,10 +7474,12 @@ export const ApplyScenarioMeasuresMethodCumulusApplyScenarioMeasuresPostBody = z
 							leaf_weights: zod
 								.union([zod.record(zod.string(), zod.number()), zod.null()])
 								.optional()
-								.describe('Leaf-name → weight mapping. Required for weighted_scenarios.')
+								.describe(
+									'Leaf-name → weight mapping. Required for weighted_scenarios; not available for a graphical model.'
+								)
 						})
 						.describe(
-							'Specification for adding a scenario-based uncertainty aggregate to the problem.\n\nAll measures in a single request must reference the same ``scenario_model_id``.\nThe resulting combined (multi-scenario) problem replaces the current problem.'
+							"Specification for adding an uncertainty aggregate to the problem.\n\nThe aggregate is taken over either a scenario model (``scenario_model_id`` set) or, when\n``scenario_model_id`` is None, the outcome distributions of the problem's graphical model.\nAll measures in a single request must reference the same source. With a scenario model, the\nresulting combined (multi-scenario) problem replaces the current problem. With a graphical\nmodel, the aggregates replace the problem's objectives."
 						)
 				),
 				zod.null()
@@ -7898,10 +7953,14 @@ export const ModifyProblemMethodCumulusModifyProblemPostBody = zod
 										])
 										.describe('Which uncertainty aggregate to apply.'),
 									scenario_model_id: zod
-										.number()
-										.describe('DB id of the ScenarioModelDB that defines the scenario structure.'),
+										.union([zod.number(), zod.null()])
+										.optional()
+										.describe(
+											"DB id of the ScenarioModelDB that defines the scenario structure, or None to aggregate over the problem's graphical model."
+										),
 									symbols: zod
 										.array(zod.string())
+										.min(1)
 										.describe('Symbols of objectives or functions to aggregate.'),
 									prefix: zod
 										.union([zod.string(), zod.null()])
@@ -7918,10 +7977,12 @@ export const ModifyProblemMethodCumulusModifyProblemPostBody = zod
 									leaf_weights: zod
 										.union([zod.record(zod.string(), zod.number()), zod.null()])
 										.optional()
-										.describe('Leaf-name → weight mapping. Required for weighted_scenarios.')
+										.describe(
+											'Leaf-name → weight mapping. Required for weighted_scenarios; not available for a graphical model.'
+										)
 								})
 								.describe(
-									'Specification for adding a scenario-based uncertainty aggregate to the problem.\n\nAll measures in a single request must reference the same ``scenario_model_id``.\nThe resulting combined (multi-scenario) problem replaces the current problem.'
+									"Specification for adding an uncertainty aggregate to the problem.\n\nThe aggregate is taken over either a scenario model (``scenario_model_id`` set) or, when\n``scenario_model_id`` is None, the outcome distributions of the problem's graphical model.\nAll measures in a single request must reference the same source. With a scenario model, the\nresulting combined (multi-scenario) problem replaces the current problem. With a graphical\nmodel, the aggregates replace the problem's objectives."
 								)
 						),
 						zod.null()
