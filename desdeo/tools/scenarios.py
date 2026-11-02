@@ -309,6 +309,7 @@ def append_aggregated_elem(
     func: Any,
     description: "str | None" = None,
     maximize: bool = False,
+    unit: "str | None" = None,
     is_linear: bool = False,
     is_convex: bool = False,
     is_twice_differentiable: bool = False,
@@ -317,7 +318,7 @@ def append_aggregated_elem(
 
     Appends an Objective if found_type is 'objectives', a ScalarizationFunction if
     'scalarization_funcs', and an ExtraFunction for everything else.
-    ``description`` and ``maximize`` are only used for objectives.
+    ``description``, ``maximize`` and ``unit`` are only used for objectives.
     """
     if found_type == "objectives":
         new_objectives.append(
@@ -327,6 +328,7 @@ def append_aggregated_elem(
                 symbol=symbol,
                 func=func,
                 maximize=maximize,
+                unit=unit,
                 is_linear=is_linear,
                 is_convex=is_convex,
                 is_twice_differentiable=is_twice_differentiable,
@@ -537,6 +539,7 @@ def _combine_elements(
     scenario_problems: dict[str, Problem],
     var_maps: dict[str, dict[str, str]],
     const_maps: dict[str, dict[str, str]],
+    *,
     get_list: callable,
     make_update: callable,
     extra_leaf_maps: "dict[str, dict[str, str]] | None" = None,
@@ -749,7 +752,13 @@ def build_combined_scenario_problem(
 
     def _combine(get_list, extra_maps=None):
         return _combine_elements(
-            leaf_scenarios, scenario_problems, var_maps, const_maps, get_list, _name_update, extra_maps
+            leaf_scenarios,
+            scenario_problems,
+            var_maps,
+            const_maps,
+            get_list=get_list,
+            make_update=_name_update,
+            extra_leaf_maps=extra_maps,
         )
 
     def _renames(symbol_map, *, with_min: bool = False) -> dict[str, dict[str, str]]:

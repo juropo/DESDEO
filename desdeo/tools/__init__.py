@@ -9,6 +9,7 @@ __all__ = [
     "IpoptOptions",
     "NevergradGenericOptions",
     "NevergradGenericSolver",
+    "OutcomeDistribution",
     "PersistentGurobipySolver",
     "ProximalSolver",
     "PyomoBonminSolver",
@@ -28,9 +29,11 @@ __all__ = [
     "add_asf_partial_nondiff",
     "add_conditional_value_at_risk",
     "add_cumulonimbus_diff",
+    "add_cvar_dd",
     "add_epsilon_constraints",
     "add_expected_asf",
     "add_expected_value",
+    "add_expected_value_dd",
     "add_group_asf",
     "add_group_asf_agg",
     "add_group_asf_agg_diff",
@@ -57,6 +60,7 @@ __all__ = [
     "add_stom_sf_nondiff",
     "add_weighted_scenarios",
     "add_weighted_sums",
+    "add_worst_case_dd",
     "add_worst_case_robust",
     "available_nevergrad_optimizers",
     "available_solvers",
@@ -104,6 +108,12 @@ from desdeo.tools.ng_solver_interfaces import (
     NevergradGenericOptions,
     NevergradGenericSolver,
     available_nevergrad_optimizers,
+)
+from desdeo.tools.outcome_distribution import (
+    OutcomeDistribution,
+    add_cvar_dd,
+    add_expected_value_dd,
+    add_worst_case_dd,
 )
 from desdeo.tools.partial_scalarization import add_asf_partial_diff, add_asf_partial_nondiff, add_cumulonimbus_diff
 from desdeo.tools.proximal_solver import ProximalSolver
