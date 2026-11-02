@@ -755,6 +755,7 @@ def _build_objective(
         symbol=objective.symbol,
         func=func,
         maximize=objective.maximize,
+        unit=objective.unit,
         is_linear=True,
         is_convex=True,
         is_twice_differentiable=True,
@@ -1046,6 +1047,7 @@ def _build_risk_measure(
         symbol=risk_measure.symbol,
         func=cvar_expr,
         maximize=objective.maximize,
+        unit=objective.unit,
         is_linear=True,
         is_convex=True,
         is_twice_differentiable=True,
@@ -1187,7 +1189,7 @@ def _substitute_at_nodes(
             if operator in nodes:
                 msg = (
                     f"DiagramConstraint '{constraint_symbol}': func references node '{operator}' in "
-                    "operator position, an unsupported form. Only [\"At\", \"<node>\", k] (a single "
+                    'operator position, an unsupported form. Only ["At", "<node>", k] (a single '
                     "1-based own-state index) is supported for referencing a node's state -- combine "
                     "several such At terms with Add/Multiply/Subtract for anything more complex."
                 )

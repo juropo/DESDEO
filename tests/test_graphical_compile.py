@@ -748,9 +748,7 @@ def test_malformed_root_cluster_separator_raises():
     )
     annotation = DecisionAnnotation(
         objectives=[
-            ObjectiveNode(
-                symbol="fA", parents=["A"], utility=Potential(variables=["A"], shape=[2], values=[1.0, 2.0])
-            )
+            ObjectiveNode(symbol="fA", parents=["A"], utility=Potential(variables=["A"], shape=[2], values=[1.0, 2.0]))
         ]
     )
     bad_rjt = RootedJunctionTree(
@@ -1165,6 +1163,38 @@ def test_constraint_referencing_colliding_objective_symbol_raises():
     )
     with pytest.raises(ValueError, match="not declared in this constraint's nodes"):
         compile_diagram(network, annotation)
+
+
+def test_objective_unit_carries_over_to_objective_and_risk_measure():
+    """`ObjectiveNode.unit` becomes `Objective.unit`, also for a `RiskMeasure` on it; it defaults to `None`."""
+    network = DiscreteNetwork(
+        variables=[DiscreteVariable(name="W", labels=["lose", "win"])],
+        arcs=[],
+        potentials={"W": Potential(variables=["W"], shape=[2], values=[0.5, 0.5])},
+    )
+    annotation = DecisionAnnotation(
+        decisions=[DecisionNode(symbol="D", states=["safe", "gamble"])],
+        objectives=[
+            ObjectiveNode(
+                symbol="payoff",
+                parents=["D", "W"],
+                utility=Potential(variables=["D", "W"], shape=[2, 2], values=[[5.0, 5.0], [0.0, 12.0]]),
+                maximize=True,
+                unit="EUR",
+            ),
+            ObjectiveNode(
+                symbol="effort",
+                parents=["D"],
+                utility=Potential(variables=["D"], shape=[2], values=[1.0, 3.0]),
+            ),
+        ],
+        risk_measures=[RiskMeasure(symbol="cvar_payoff", target="payoff", alpha=0.5)],
+    )
+
+    problem, _ = compile_diagram(network, annotation)
+
+    units = {objective.symbol: objective.unit for objective in problem.objectives}
+    assert units == {"payoff": "EUR", "effort": None, "cvar_payoff": "EUR"}
 
 
 def test_constraint_referencing_risk_measure_symbol_raises():

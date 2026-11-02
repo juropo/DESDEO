@@ -6,6 +6,7 @@ __all__ = [  # noqa: RUF022
     "ConstrainedVariantResponse",
     "ConstantDB",
     "ConstraintDB",
+    "ActivateSessionRequest",
     "CreateSessionRequest",
     "DiscreteRepresentationDB",
     "EMOSaveState",
@@ -58,6 +59,7 @@ __all__ = [  # noqa: RUF022
     "CumulusInitializationResponse",
     "CumulusInitializationState",
     "CumulusIntermediateSolutionResponse",
+    "CumulusHypotheticalRequest",
     "CumulusModificationRequest",
     "CumulusModificationResponse",
     "CumulusModificationState",
@@ -194,6 +196,7 @@ from .cumulus import (
     CumulusInitializationRequest,
     CumulusInitializationResponse,
     CumulusIntermediateSolutionResponse,
+    CumulusHypotheticalRequest,
     CumulusModificationRequest,
     CumulusModificationResponse,
     CumulusActiveObjectiveConstraintsResponse,
@@ -349,6 +352,7 @@ from .problem import (
 from .reference_point_method import RPMSolveRequest
 from .scenario import ScenarioModelDB, ScenarioModelInfo
 from .session import (
+    ActivateSessionRequest,
     CreateSessionRequest,
     InteractiveSessionBase,
     InteractiveSessionDB,

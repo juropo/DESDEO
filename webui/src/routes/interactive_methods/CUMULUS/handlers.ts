@@ -14,7 +14,9 @@ import {
 	getObjectiveConstraintsMethodCumulusObjectiveConstraintGet,
 	getSolutionDescriptionSolutionDescriptionGetPost,
 	getScenarioAvailabilityMethodCumulusScenarioAvailabilityGet,
-	applyScenarioMeasuresMethodCumulusApplyScenarioMeasuresPost
+	applyScenarioMeasuresMethodCumulusApplyScenarioMeasuresPost,
+	createHypotheticalMethodCumulusHypotheticalPost,
+	modifyProblemStatusMethodCumulusModifyProblemStatusStateIdGet
 } from '$lib/gen/endpoints/DESDEOFastAPI';
 import type {
 	CumulusClassificationRequest,
@@ -26,6 +28,8 @@ import type {
 	SolutionInfo,
 	CumulusObjectiveConstraintRequest,
 	CumulusScenarioAvailabilityResponse,
+	CumulusModificationResponse,
+	DiagramAssumptions,
 	SolutionDescriptionRequest,
 	ConstraintTypeEnum,
 	ProblemInfo,
@@ -34,6 +38,13 @@ import type {
 } from '$lib/gen/endpoints/DESDEOFastAPI';
 import type { MapOptions, Response } from './types';
 import { errorMessage, isLoading } from '../../../stores/uiState';
+
+/** Name of an unnamed solution: the id of the state that produced it, and its index there. */
+export function default_solution_name(
+	solution: Pick<Solution, 'state_id' | 'solution_index'>
+): string {
+	return `Solution ${solution.state_id}.${(solution.solution_index ?? 0) + 1}`;
+}
 
 /** `value`, or null when it is missing or empty. */
 export function blankToNull(value: string | null | undefined): string | null {
@@ -517,26 +528,100 @@ export async function apply_scenario_measures(
 	}
 }
 
+/** Poll cadence and give-up point for the background checks of a new problem. */
+const MODIFICATION_POLL_INTERVAL_MS = 1000;
+const MODIFICATION_POLL_TIMEOUT_MS = 10 * 60 * 1000;
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const DISCARDED_MESSAGE = 'The new problem could not be used and was discarded.';
+
+export type ModificationOutcome =
+	/** The background checks passed and the new problem is ready to be used. */
+	| { kind: 'accepted'; response: CumulusModificationResponse }
+	/** The checks failed and the new problem was discarded. */
+	| { kind: 'rejected'; reason: string }
+	/** Neither could be established: polling itself failed or ran out of time. */
+	| { kind: 'failed' };
+
 /**
- * Applies the ideal/nadir bounds from `<NetworkPanel>`'s `onCommitEvidence` (keyed by objective
- * symbol) to `problem`'s objectives. Local only; the backend has already persisted them.
+ * Polls /modify-problem/status until the background checks settle.
  *
- * Returns `problem` itself when nothing changed, which is the common case since the backend
- * sends the full bounds on every commit, so reactive dependents don't re-run needlessly.
+ * `is_ready` only means the checks have finished, so a ready response still has to be read for
+ * the verdict.
  */
-export function apply_network_bounds(
-	problem: ProblemInfo,
-	bounds: { ideal?: Record<string, number>; nadir?: Record<string, number> }
-): ProblemInfo {
-	let changed = false;
-	const objectives = problem.objectives.map((o) => {
-		const ideal = bounds.ideal?.[o.symbol] ?? o.ideal;
-		const nadir = bounds.nadir?.[o.symbol] ?? o.nadir;
-		if (ideal === o.ideal && nadir === o.nadir) return o;
-		changed = true;
-		return { ...o, ideal, nadir };
+export async function poll_modification_status(
+	state_id: number,
+	{
+		interval_ms = MODIFICATION_POLL_INTERVAL_MS,
+		timeout_ms = MODIFICATION_POLL_TIMEOUT_MS
+	}: { interval_ms?: number; timeout_ms?: number } = {}
+): Promise<ModificationOutcome> {
+	const deadline = Date.now() + timeout_ms;
+
+	for (;;) {
+		const response = await modifyProblemStatusMethodCumulusModifyProblemStatusStateIdGet(state_id);
+
+		// A discarded problem can take its state with it, so a missing state means rejection.
+		if ((response.status as number) === 404) {
+			return { kind: 'rejected', reason: DISCARDED_MESSAGE };
+		}
+
+		if (response.status !== 200) {
+			errorMessage.set(
+				errorDetail(response.data) ??
+					`Checking the new problem failed with status ${response.status}`
+			);
+			return { kind: 'failed' };
+		}
+
+		if (response.data.is_ready) {
+			if (response.data.problem_deleted || response.data.error) {
+				return { kind: 'rejected', reason: response.data.error ?? DISCARDED_MESSAGE };
+			}
+			return { kind: 'accepted', response: response.data };
+		}
+
+		if (Date.now() >= deadline) {
+			errorMessage.set(
+				'Checking the new problem is taking longer than expected; try again in a moment.'
+			);
+			return { kind: 'failed' };
+		}
+
+		await sleep(interval_ms);
+	}
+}
+
+/**
+ * Creates a hypothetical problem from a graphical-model problem under `assumptions` and waits
+ * for its background checks. Returns the new problem's id, or null after reporting an error.
+ */
+export async function create_hypothetical(
+	problem_id: number,
+	parent_state_id: number | null,
+	assumptions: DiagramAssumptions,
+	{ poll_interval_ms }: { poll_interval_ms?: number } = {}
+): Promise<number | null> {
+	errorMessage.set(null);
+	const response = await createHypotheticalMethodCumulusHypotheticalPost({
+		problem_id,
+		parent_state_id,
+		assumptions
 	});
-	return changed ? { ...problem, objectives } : problem;
+	if (response.status !== 200) {
+		errorMessage.set(
+			errorDetail(response.data) ??
+				`Creating the hypothetical problem failed with status ${response.status}`
+		);
+		return null;
+	}
+
+	const outcome = await poll_modification_status(response.data.state_id, {
+		interval_ms: poll_interval_ms
+	});
+	if (outcome.kind === 'rejected') errorMessage.set(outcome.reason);
+	return outcome.kind === 'accepted' ? response.data.problem_id : null;
 }
 
 type UIConstraintType = '<=0' | '=0';

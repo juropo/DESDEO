@@ -5,6 +5,7 @@
 
 import type {
 	DecisionMode,
+	NetworkAssumptions,
 	NetworkEvidence,
 	NetworkModel,
 	NetworkNodeKind,
@@ -169,4 +170,46 @@ export function mergeHighlightSets(
 	if (external == null) return internal;
 	const ext = new Set(external);
 	return internal ? new Set([...internal, ...ext]) : ext;
+}
+
+/** Result of `assumableEvidence`. */
+export interface AssumableEvidence {
+	/** The evidence a new hypothetical would add to what the model already assumes. */
+	assumptions: NetworkAssumptions;
+	/** Chance nodes with evidence that can't be assumed, since they have parents. */
+	blocking: string[];
+	/** Nodes whose evidence contradicts what the model already assumes, as `"id = state"`. */
+	conflicts: string[];
+}
+
+/**
+ * Splits `evidence` into what a hypothetical can assume (pinned decisions in 'manual' mode, and
+ * chance nodes without parents) and the nodes that block it. What the model already assumes is
+ * left out.
+ */
+export function assumableEvidence(
+	model: NetworkModel,
+	evidence: NetworkEvidence,
+	decisionMode: DecisionMode
+): AssumableEvidence {
+	const withParents = new Set(model.edges.map((e) => e.target));
+	const assumed = model.assumptions ?? { chance: {}, decisions: {} };
+	const chance: Record<string, string> = {};
+	const blocking: string[] = [];
+	const conflicts: string[] = [];
+	for (const [id, state] of Object.entries(filterChanceEvidence(model, evidence))) {
+		if (assumed.chance[id] === state) continue;
+		if (id in assumed.chance) conflicts.push(`${id} = ${assumed.chance[id]}`);
+		else if (withParents.has(id)) blocking.push(id);
+		else chance[id] = state;
+	}
+	const decisions: Record<string, string> = {};
+	if (decisionMode === 'manual') {
+		for (const [id, state] of Object.entries(filterDecisionEvidence(model, evidence))) {
+			if (assumed.decisions[id] === state) continue;
+			if (id in assumed.decisions) conflicts.push(`${id} = ${assumed.decisions[id]}`);
+			else decisions[id] = state;
+		}
+	}
+	return { assumptions: { chance, decisions }, blocking, conflicts };
 }

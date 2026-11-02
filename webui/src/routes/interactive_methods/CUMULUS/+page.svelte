@@ -27,6 +27,10 @@
 	import VisualizationsPanel from '$lib/components/custom/visualizations-panel/visualizations-panel.svelte';
 	import UtopiaMap from '$lib/components/custom/nimbus/utopia-map.svelte';
 	import SolutionDescriptionPanel from '$lib/components/custom/nimbus/solution-description-panel.svelte';
+	import {
+		VisualizationTabs,
+		type VisualizationTab
+	} from '$lib/components/custom/visualization-tabs';
 	import { PREFERENCE_TYPES } from '$lib/constants';
 
 	import {
@@ -43,6 +47,7 @@
 	} from '$lib/components/custom/network';
 	import type {
 		DecisionMode,
+		NetworkAssumptions,
 		NetworkEvidence,
 		NetworkModel,
 		NetworkPolicySource,
@@ -227,6 +232,8 @@
 	let show_network_dialog_real = $state(false);
 
 	// The real dialog's side panel: per-objective utilities and each decision's state.
+	// Derived, so replacing `problem` with the same id doesn't reload (and reset) the panel.
+	let network_real_model_id = $derived.by(() => problem?.id);
 	let network_real_model = $state<NetworkModel | null>(null);
 	let network_real_evidence = $state<NetworkEvidence>({});
 	let network_real_result = $state<WhatIfResult | null>(null);
@@ -395,15 +402,37 @@
 		reset_network_demo();
 	}
 
-	// Apply the ideal/nadir the backend ratcheted on commit, unless `problem` has changed since the
-	// request was made (e.g. replaced by a combined scenario problem).
-	function handle_network_real_commit_evidence(
-		_evidence: NetworkEvidence,
-		bounds?: { ideal?: Record<string, number>; nadir?: Record<string, number> },
-		modelId?: string | number
-	) {
-		if (!bounds || !problem || problem.id !== modelId) return;
-		problem = apply_network_bounds(problem, bounds);
+	// Branches the session onto a new problem under the DM's assumptions, as hard objective bounds
+	// used to: the original problem and its solutions stay as they were.
+	let network_real_exploring = $state(false);
+	// Shown inside the dialog, where the page-level error alert may be hidden.
+	let network_real_explore_error = $state<string | null>(null);
+	async function handle_network_real_explore(assumptions: NetworkAssumptions) {
+		if (!problem) return;
+		network_real_exploring = true;
+		network_real_explore_error = null;
+		try {
+			const new_problem_id = await createHypotheticalRequest(
+				problem.id,
+				current_state.state_id ?? null,
+				assumptions
+			);
+			if (new_problem_id === null) {
+				network_real_explore_error = $errorMessage ?? 'Creating the hypothetical failed.';
+				errorMessage.set(null);
+				return;
+			}
+			const initialization = await initializeCumulusStateRequest(new_problem_id, true);
+			if (!initialization) return;
+			await apply_initialization_result(initialization);
+			await refresh_scenario_availability();
+			network_real_evidence = {};
+			warning_message =
+				'Switched to a new problem under these assumptions. The original problem and its ' +
+				'solutions are unchanged.';
+		} finally {
+			network_real_exploring = false;
+		}
 	}
 
 	// Close the dialog if the problem is replaced by one without a graphical model.
@@ -550,6 +579,27 @@
 
 	let hasUtopiaMetadata = $state(false);
 	let hasSolutionDescription = $state(false);
+
+	// Problem-specific visualizations beside the main chart, one tab each.
+	let custom_visualization_tab = $state('');
+	let custom_visualization_tabs = $derived.by(() => {
+		const tabs: VisualizationTab[] = [];
+		if (hasUtopiaMetadata) tabs.push({ id: 'map', label: 'Map', content: utopia_map_tab });
+		if (hasSolutionDescription) {
+			tabs.push({ id: 'description', label: 'Explanation', content: solution_description_tab });
+		}
+		if (network_real_available)
+			tabs.push({ id: 'network', label: 'Network', content: network_tab });
+		return tabs;
+	});
+	// The network tab follows the selected solution, else the first current one.
+	let network_tab_solution_ref = $derived.by((): NetworkSolutionRef | null => {
+		const solution =
+			chosen_solutions[selected_iteration_index[0]] ?? current_state.current_solutions?.[0];
+		return solution
+			? { stateId: solution.state_id, solutionIndex: solution.solution_index ?? 0 }
+			: null;
+	});
 	let solutionDescription = $state<string | null>(null);
 
 	let mapStates: MapState[] = $state([]);
@@ -650,7 +700,7 @@
 		const selectedSolution = chosen_solutions[selectedIndexes[0]];
 		const final_solution = { ...selectedSolution };
 		const solutionName =
-			blankToNull(selectedSolution.name) ?? `Solution #${selectedIndexes[0] + 1}`;
+			blankToNull(selectedSolution.name) ?? default_solution_name(selectedSolution);
 
 		openConfirmDialog({
 			title: 'Confirm Final Choice',
@@ -688,7 +738,8 @@
 		check_scenario_availability as checkScenarioAvailabilityRequest,
 		apply_scenario_measures as applyScenarioMeasuresRequest,
 		set_objective_constraints as setObjectiveConstraintsRequest,
-		apply_network_bounds,
+		create_hypothetical as createHypotheticalRequest,
+		default_solution_name,
 		get_objective_constraints as getObjectiveConstraintsRequest,
 		type MeasureType,
 		type MeasureOptions
@@ -960,7 +1011,7 @@
 
 			if (problem) {
 				hasUtopiaMetadata = checkUtopiaMetadata(problem);
-				hasSolutionDescription = !hasUtopiaMetadata && checkSolutionDescription(problem);
+				hasSolutionDescription = checkSolutionDescription(problem);
 
 				await initialize_cumulus_state(problem.id);
 			}
@@ -999,7 +1050,7 @@
 			if (resp.status === 200 && resp.data) {
 				problem = resp.data;
 				hasUtopiaMetadata = checkUtopiaMetadata(problem);
-				hasSolutionDescription = !hasUtopiaMetadata && checkSolutionDescription(problem);
+				hasSolutionDescription = checkSolutionDescription(problem);
 				active_objective_symbols = new Set(problem.objectives.map((o) => o.symbol));
 			}
 		}
@@ -1077,6 +1128,44 @@
 	/>
 {/if}
 
+{#snippet utopia_map_tab()}
+	<UtopiaMap
+		mapOptions={mapState.mapOptions}
+		bind:selectedPeriod={mapState.selectedPeriod}
+		yearlist={mapState.yearlist}
+		geoJSON={mapState.geoJSON}
+		mapName={mapState.mapName}
+		mapDescription={mapState.mapDescription}
+	/>
+{/snippet}
+
+{#snippet solution_description_tab()}
+	<SolutionDescriptionPanel description={solutionDescription} />
+{/snippet}
+
+{#snippet network_tab()}
+	{#if problem}
+		<div class="flex h-full min-h-0 flex-col gap-2 p-2">
+			<div class="flex items-center justify-between gap-2 text-xs">
+				<span class="text-muted-foreground"
+					>Policy and expected utilities of the selected solution.</span
+				>
+				<Button variant="outline" size="sm" onclick={() => (show_network_dialog_real = true)}>
+					Explore
+				</Button>
+			</div>
+			<div class="min-h-0 flex-1">
+				<NetworkPanel
+					modelId={network_real_model_id ?? problem.id}
+					decisionMode="manual"
+					policySolution={network_tab_solution_ref}
+					readonly
+				/>
+			</div>
+		</div>
+	{/if}
+{/snippet}
+
 {#if mode === 'final'}
 	<BaseLayout showLeftSidebar={false} showRightSidebar={false} bottomPanelTitle="Final Solution">
 		{#snippet visualizationArea()}
@@ -1098,22 +1187,13 @@
 							/>
 						</Resizable.Pane>
 
-						{#if hasUtopiaMetadata}
+						{#if custom_visualization_tabs.length > 0}
 							<ResizableHandle withHandle class="border-l border-gray-200 shadow-sm" />
 							<Resizable.Pane defaultSize={35} minSize={20} class="h-full">
-								<UtopiaMap
-									mapOptions={mapState.mapOptions}
-									bind:selectedPeriod={mapState.selectedPeriod}
-									yearlist={mapState.yearlist}
-									geoJSON={mapState.geoJSON}
-									mapName={mapState.mapName}
-									mapDescription={mapState.mapDescription}
+								<VisualizationTabs
+									tabs={custom_visualization_tabs}
+									bind:value={custom_visualization_tab}
 								/>
-							</Resizable.Pane>
-						{:else if hasSolutionDescription}
-							<ResizableHandle withHandle class="border-l border-gray-200 shadow-sm" />
-							<Resizable.Pane defaultSize={35} minSize={20} class="h-full">
-								<SolutionDescriptionPanel description={solutionDescription} />
 							</Resizable.Pane>
 						{/if}
 					</Resizable.PaneGroup>
@@ -1284,22 +1364,13 @@
 							/>
 						</Resizable.Pane>
 
-						{#if mode === 'iterate' && hasUtopiaMetadata}
-							<ResizableHandle withHandle class=" border-4 border-gray-200 shadow-sm" />
-							<Resizable.Pane defaultSize={35} minSize={20} class="h-full">
-								<UtopiaMap
-									mapOptions={mapState.mapOptions}
-									bind:selectedPeriod={mapState.selectedPeriod}
-									yearlist={mapState.yearlist}
-									geoJSON={mapState.geoJSON}
-									mapName={mapState.mapName}
-									mapDescription={mapState.mapDescription}
-								/>
-							</Resizable.Pane>
-						{:else if mode === 'iterate' && hasSolutionDescription}
+						{#if mode === 'iterate' && custom_visualization_tabs.length > 0}
 							<ResizableHandle withHandle class="border-4 border-gray-200 shadow-sm" />
 							<Resizable.Pane defaultSize={35} minSize={20} class="h-full">
-								<SolutionDescriptionPanel description={solutionDescription} />
+								<VisualizationTabs
+									tabs={custom_visualization_tabs}
+									bind:value={custom_visualization_tab}
+								/>
 							</Resizable.Pane>
 						{/if}
 					</Resizable.PaneGroup>
@@ -1322,6 +1393,8 @@
 					handle_row_click={handle_solution_click}
 					{isSaved}
 					{selected_type_solutions}
+					defaultName={default_solution_name}
+					showIterationColumn={false}
 					secondaryObjectiveValues={selected_type_solutions === 'current'
 						? problem
 							? [
@@ -1778,88 +1851,94 @@
 					The graphical model (Bayesian network / influence diagram) this problem was compiled from,
 					read live via the same `/graphical/*` endpoints the demo above uses -- structure,
 					evidence-driven what-if inference, and saved evidence sets, against the problem currently
-					loaded in this session rather than a fixed sample diagram. Committing evidence here can
-					widen this problem's own ideal/nadir bounds (never narrow them) when a what-if result
-					beats what was previously known achievable.
+					loaded in this session rather than a fixed sample diagram. Exploring evidence here changes
+					nothing; "Explore in CUMULUS" creates a new problem under the evidence on decisions and
+					chance nodes without parents, and switches the method to it.
 				</Dialog.Description>
 			</Dialog.Header>
-			<div class="flex min-h-0 flex-1 gap-3">
-				<div class="min-h-0 flex-1">
-					{#if problem}
-						<NetworkPanel
-							modelId={problem.id}
-							decisionMode="manual"
-							policySolution={network_real_solution_ref}
-							bind:evidence={network_real_evidence}
-							onWhatIfResult={handle_network_real_whatif_result}
-							onStructureLoad={handle_network_real_structure_load}
-							onCommitEvidence={handle_network_real_commit_evidence}
-						/>
-					{/if}
-				</div>
-				<div class="w-48 shrink-0 space-y-3 overflow-auto text-sm">
-					<div class="space-y-1">
-						<p class="text-muted-foreground text-xs font-medium">Expected utilities</p>
-						{#if network_real_unpinned.length > 0}
-							<p class="text-muted-foreground text-xs">
-								Pin every decision to see utilities; unpinned: {network_real_unpinned.join(', ')}.
-							</p>
-						{:else if network_real_off_policy_labels.length > 0}
-							<p class="text-muted-foreground text-xs">
-								Your pins moved {network_real_off_policy_labels.join(', ')} off the solution's path; pin
-								{network_real_off_policy_labels.join(', ')} too to see utilities.
-							</p>
-						{:else}
-							{#each network_real_objectives as { node, maximize } (node.id)}
-								{@const mean = network_real_result?.utilities?.[node.id]}
-								<div class="rounded-md border px-2 py-1">
-									<div class="flex items-center gap-1">
-										{#if maximize === true}
-											<IconArrowUp class="size-3 shrink-0" />
-										{:else if maximize === false}
-											<IconArrowDown class="size-3 shrink-0" />
-										{/if}
-										<span class="truncate" title={node.label}>{node.label}</span>
+			<div class="min-h-0 flex-1">
+				{#if problem}
+					<NetworkPanel
+						modelId={network_real_model_id ?? problem.id}
+						decisionMode="manual"
+						policySolution={network_real_solution_ref}
+						bind:evidence={network_real_evidence}
+						onWhatIfResult={handle_network_real_whatif_result}
+						onStructureLoad={handle_network_real_structure_load}
+						onExploreAssumptions={handle_network_real_explore}
+						exploreLabel="Explore in CUMULUS"
+						exploring={network_real_exploring}
+						exploreError={network_real_explore_error}
+						aside={network_real_aside}
+						asideAutoSaveId="cumulus-network-aside"
+					/>
+				{/if}
+				{#snippet network_real_aside()}
+					<div class="space-y-3 text-sm">
+						<div class="space-y-1">
+							<p class="text-muted-foreground text-xs font-medium">Expected utilities</p>
+							{#if network_real_unpinned.length > 0}
+								<p class="text-muted-foreground text-xs">
+									Pin every decision to see utilities; unpinned: {network_real_unpinned.join(', ')}.
+								</p>
+							{:else if network_real_off_policy_labels.length > 0}
+								<p class="text-muted-foreground text-xs">
+									Your pins moved {network_real_off_policy_labels.join(', ')} off the solution's path;
+									pin
+									{network_real_off_policy_labels.join(', ')} too to see utilities.
+								</p>
+							{:else}
+								{#each network_real_objectives as { node, maximize } (node.id)}
+									{@const mean = network_real_result?.utilities?.[node.id]}
+									<div class="rounded-md border px-2 py-1">
+										<div class="flex items-center gap-1">
+											{#if maximize === true}
+												<IconArrowUp class="size-3 shrink-0" />
+											{:else if maximize === false}
+												<IconArrowDown class="size-3 shrink-0" />
+											{/if}
+											<span class="truncate" title={node.label}>{node.label}</span>
+										</div>
+										<div class="text-muted-foreground text-xs tabular-nums">
+											{mean != null
+												? formatUtility(mean, network_real_result?.utilityStdDevs?.[node.id])
+												: '–'}
+										</div>
 									</div>
-									<div class="text-muted-foreground text-xs tabular-nums">
-										{mean != null
-											? formatUtility(mean, network_real_result?.utilityStdDevs?.[node.id])
-											: '–'}
+								{/each}
+							{/if}
+						</div>
+						{#if network_real_decisions.length > 0}
+							<div class="space-y-1">
+								<p class="text-muted-foreground text-xs font-medium">Decisions</p>
+								{#each network_real_decisions as decision (decision.id)}
+									<div class="rounded-md border px-2 py-1">
+										<div class="truncate" title={decision.label}>
+											{decision.label}{decision.state
+												? `: ${decision.state}`
+												: network_real_possible_states[decision.id]
+													? `: ${network_real_possible_states[decision.id]}`
+													: ''}
+										</div>
+										<div class="text-muted-foreground text-xs">
+											{#if decision.source === 'pinned'}
+												pinned
+											{:else if decision.source === 'off-policy'}
+												off the solution's path — pin it
+											{:else if decision.source === 'solution'}
+												from solution {network_real_solution?.name ?? ''}
+											{:else if decision.dependsOn.length > 0}
+												unresolved — depends on {decision.dependsOn.join(', ')}
+											{:else}
+												unresolved
+											{/if}
+										</div>
 									</div>
-								</div>
-							{/each}
+								{/each}
+							</div>
 						{/if}
 					</div>
-					{#if network_real_decisions.length > 0}
-						<div class="space-y-1">
-							<p class="text-muted-foreground text-xs font-medium">Decisions</p>
-							{#each network_real_decisions as decision (decision.id)}
-								<div class="rounded-md border px-2 py-1">
-									<div class="truncate" title={decision.label}>
-										{decision.label}{decision.state
-											? `: ${decision.state}`
-											: network_real_possible_states[decision.id]
-												? `: ${network_real_possible_states[decision.id]}`
-												: ''}
-									</div>
-									<div class="text-muted-foreground text-xs">
-										{#if decision.source === 'pinned'}
-											pinned
-										{:else if decision.source === 'off-policy'}
-											off the solution's path — pin it
-										{:else if decision.source === 'solution'}
-											from solution {network_real_solution?.name ?? ''}
-										{:else if decision.dependsOn.length > 0}
-											unresolved — depends on {decision.dependsOn.join(', ')}
-										{:else}
-											unresolved
-										{/if}
-									</div>
-								</div>
-							{/each}
-						</div>
-					{/if}
-				</div>
+				{/snippet}
 			</div>
 			<Dialog.Footer>
 				<Dialog.Close>

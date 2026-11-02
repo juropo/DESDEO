@@ -90,6 +90,8 @@ class ObjectiveNode(BaseModel):
     its shape is checked by `DecisionAnnotation.validate_against`."""
     maximize: bool = False
     """Whether this objective is to be maximized or minimized, as in `Objective.maximize`."""
+    unit: str | None = None
+    """The utility's unit, as in `Objective.unit`."""
 
     @model_validator(mode="after")
     def _check_utility_matches_parents(self) -> Self:

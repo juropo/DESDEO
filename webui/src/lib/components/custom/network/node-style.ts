@@ -1,7 +1,7 @@
 /** Per-kind visual conventions, shared between the custom node components and the table view so
  *  the two stay in sync without duplicating the mapping. Shapes follow the usual influence-diagram
- *  convention: chance = ellipse, decision = rectangle, objective/utility = diamond, deterministic
- *  = double-bordered rectangle. */
+ *  convention: chance = ellipse, decision = rectangle, deterministic = double-bordered rectangle;
+ *  objectives are hexagons rather than diamonds, which leave little room for a label. */
 
 import type { Component } from 'svelte';
 import IconDices from '@lucide/svelte/icons/dices';
@@ -10,7 +10,7 @@ import IconTarget from '@lucide/svelte/icons/target';
 import IconSigma from '@lucide/svelte/icons/sigma';
 import type { NetworkNodeKind } from './types';
 
-export type NodeShape = 'ellipse' | 'rect' | 'diamond' | 'double-rect';
+export type NodeShape = 'ellipse' | 'rect' | 'hexagon' | 'double-rect';
 
 export interface NodeKindStyle {
 	shape: NodeShape;
@@ -34,7 +34,7 @@ export const NODE_KIND_STYLE: Record<NetworkNodeKind, NodeKindStyle> = {
 		label: 'Decision',
 		icon: IconSquareCheck
 	},
-	objective: { shape: 'diamond', colorVar: 'var(--chart-1)', label: 'Objective', icon: IconTarget },
+	objective: { shape: 'hexagon', colorVar: 'var(--chart-1)', label: 'Objective', icon: IconTarget },
 	deterministic: {
 		shape: 'double-rect',
 		colorVar: 'var(--chart-3)',

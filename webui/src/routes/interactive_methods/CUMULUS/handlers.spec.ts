@@ -5,6 +5,8 @@ const setObjectiveConstraints = vi.fn<(...args: unknown[]) => unknown>();
 const getObjectiveConstraints = vi.fn<(...args: unknown[]) => unknown>();
 const getScenarioAvailability = vi.fn<(...args: unknown[]) => unknown>();
 const applyScenarioMeasures = vi.fn<(...args: unknown[]) => unknown>();
+const createHypothetical = vi.fn<(...args: unknown[]) => unknown>();
+const modifyProblemStatus = vi.fn<(...args: unknown[]) => unknown>();
 
 vi.mock('$lib/gen/endpoints/DESDEOFastAPI', () => ({
 	setObjectiveConstraintsMethodCumulusObjectiveConstraintPost: (...args: unknown[]) =>
@@ -15,6 +17,10 @@ vi.mock('$lib/gen/endpoints/DESDEOFastAPI', () => ({
 		getScenarioAvailability(...args),
 	applyScenarioMeasuresMethodCumulusApplyScenarioMeasuresPost: (...args: unknown[]) =>
 		applyScenarioMeasures(...args),
+	createHypotheticalMethodCumulusHypotheticalPost: (...args: unknown[]) =>
+		createHypothetical(...args),
+	modifyProblemStatusMethodCumulusModifyProblemStatusStateIdGet: (...args: unknown[]) =>
+		modifyProblemStatus(...args),
 	// The module is imported wholesale, so every other endpoint the handlers pull in has to exist.
 	solveSolutionsMethodCumulusSolvePost: vi.fn(),
 	getOrInitializeMethodCumulusGetOrInitializePost: vi.fn(),
@@ -31,7 +37,8 @@ const {
 	get_objective_constraints,
 	check_scenario_availability,
 	apply_scenario_measures,
-	apply_network_bounds
+	create_hypothetical,
+	default_solution_name
 } = await import('./handlers');
 const { errorMessage } = await import('../../../stores/uiState');
 
@@ -180,78 +187,64 @@ describe('apply_scenario_measures', () => {
 	});
 });
 
-describe('apply_network_bounds', () => {
-	/** A problem stub carrying only what this pure fold actually reads/writes. */
-	function make_bounded_problem(): ProblemInfo {
-		return {
-			id: 7,
-			objectives: [
-				{ symbol: 'f_1', ideal: 0, nadir: 10 },
-				{ symbol: 'f_2', ideal: -5, nadir: 5 }
-			]
-		} as unknown as ProblemInfo;
-	}
+describe('create_hypothetical', () => {
+	const assumptions = { chance: { structure: 'soaking' }, decisions: {} };
 
-	it('widens ideal/nadir for an objective the bounds mention', () => {
-		const result = apply_network_bounds(make_bounded_problem(), {
-			ideal: { f_1: -2 },
-			nadir: { f_1: 12 }
+	beforeEach(() => {
+		createHypothetical.mockReset();
+		modifyProblemStatus.mockReset();
+	});
+
+	it('creates the problem, polls until ready, and returns its id', async () => {
+		createHypothetical.mockResolvedValue({ status: 200, data: { state_id: 3, problem_id: 12 } });
+		modifyProblemStatus
+			.mockResolvedValueOnce({ status: 200, data: { is_ready: false } })
+			.mockResolvedValueOnce({ status: 200, data: { is_ready: true, problem_id: 12 } });
+
+		const result = await create_hypothetical(7, 2, assumptions, { poll_interval_ms: 0 });
+
+		expect(createHypothetical).toHaveBeenCalledWith({
+			problem_id: 7,
+			parent_state_id: 2,
+			assumptions
+		});
+		expect(modifyProblemStatus).toHaveBeenCalledWith(3);
+		expect(result).toBe(12);
+	});
+
+	it('reports the reason and returns null when the new problem is discarded', async () => {
+		createHypothetical.mockResolvedValue({ status: 200, data: { state_id: 3, problem_id: 12 } });
+		modifyProblemStatus.mockResolvedValue({
+			status: 200,
+			data: { is_ready: true, problem_deleted: true, error: 'infeasible' }
 		});
 
-		expect(result.objectives.find((o) => o.symbol === 'f_1')).toMatchObject({
-			ideal: -2,
-			nadir: 12
-		});
+		const result = await create_hypothetical(7, null, assumptions, { poll_interval_ms: 0 });
+
+		expect(result).toBeNull();
+		expect(get(errorMessage)).toBe('infeasible');
 	});
 
-	it('leaves an objective the bounds do not mention untouched', () => {
-		const original = make_bounded_problem();
-		const result = apply_network_bounds(original, { ideal: { f_1: -2 } });
-
-		expect(result.objectives.find((o) => o.symbol === 'f_2')).toEqual(
-			original.objectives.find((o) => o.symbol === 'f_2')
-		);
-	});
-
-	it('only overwrites the direction the bounds actually mention for a touched objective', () => {
-		const result = apply_network_bounds(make_bounded_problem(), { ideal: { f_1: -2 } });
-
-		expect(result.objectives.find((o) => o.symbol === 'f_1')).toMatchObject({
-			ideal: -2,
-			nadir: 10 // unchanged -- bounds carried no `nadir.f_1` entry
-		});
-	});
-
-	it('does not mutate the input problem', () => {
-		const original = make_bounded_problem();
-		const snapshot = structuredClone(original);
-		apply_network_bounds(original, { ideal: { f_1: -2 } });
-
-		expect(original).toEqual(snapshot);
-	});
-
-	it('returns the identical problem reference when bounds carry nothing new', () => {
-		const original = make_bounded_problem();
-		const result = apply_network_bounds(original, {
-			ideal: { f_1: 0, f_2: -5 },
-			nadir: { f_1: 10, f_2: 5 }
+	it('reports the backend detail and does not poll when creation is refused', async () => {
+		createHypothetical.mockResolvedValue({
+			status: 400,
+			data: { detail: 'Already assumed differently: structure = dry.' }
 		});
 
-		expect(result).toBe(original);
+		const result = await create_hypothetical(7, null, assumptions);
+
+		expect(result).toBeNull();
+		expect(modifyProblemStatus).not.toHaveBeenCalled();
+		expect(get(errorMessage)).toContain('structure = dry');
+	});
+});
+
+describe('default_solution_name', () => {
+	it('names a solution by its state id and 1-based index', () => {
+		expect(default_solution_name({ state_id: 57, solution_index: 1 })).toBe('Solution 57.2');
 	});
 
-	it('returns the identical problem reference for an empty bounds object', () => {
-		const original = make_bounded_problem();
-		expect(apply_network_bounds(original, {})).toBe(original);
-	});
-
-	it('returns a new problem reference, but reuses untouched objective references, when something actually moves', () => {
-		const original = make_bounded_problem();
-		const result = apply_network_bounds(original, { ideal: { f_1: -2 } });
-
-		expect(result).not.toBe(original);
-		expect(result.objectives.find((o) => o.symbol === 'f_2')).toBe(
-			original.objectives.find((o) => o.symbol === 'f_2')
-		);
+	it('treats a missing index as the first solution', () => {
+		expect(default_solution_name({ state_id: 3, solution_index: null })).toBe('Solution 3.1');
 	});
 });

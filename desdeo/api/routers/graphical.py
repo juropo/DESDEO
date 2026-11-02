@@ -29,7 +29,7 @@ from typing import Annotated, Literal
 import numpy as np
 import pyagrum as gum
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlmodel import Session, select
 
 from desdeo.api.db import get_session
@@ -50,10 +50,11 @@ from desdeo.api.routers.utils import (
     fetch_problem_with_role_check,
     get_solver_results_at,
 )
-from desdeo.problem import Problem, VariableDomainTypeEnum
+from desdeo.problem import Problem
 from desdeo.problem.graphical import (
     DecisionAnnotation,
     DecisionPolicy,
+    DiagramAssumptions,
     DiscreteNetwork,
     DiscreteVariable,
     IndexMap,
@@ -66,8 +67,6 @@ from desdeo.problem.graphical.adapters.pyagrum import to_pyagrum, to_pyagrum_inf
 from desdeo.problem.graphical.demo import build_irrigation_demo
 from desdeo.problem.graphical.index_map import mixed_radix_encode
 from desdeo.tools import find_compatible_solvers, guess_best_solver
-from desdeo.tools.gurobipy_solver_interfaces import GurobipySolver
-from desdeo.tools.pyomo_solver_interfaces import PyomoBonminSolver, PyomoCBCSolver, PyomoGurobiSolver
 
 router = APIRouter(prefix="/graphical", tags=["Graphical models"])
 
@@ -117,6 +116,8 @@ class StructureResponse(BaseModel):
 
     nodes: list[StructureNode]
     edges: list[StructureEdge]
+    assumptions: DiagramAssumptions = Field(default_factory=DiagramAssumptions)
+    """What a hypothetical problem assumes; empty otherwise."""
 
 
 class SolutionRef(BaseModel):
@@ -139,9 +140,6 @@ class WhatIfRequest(BaseModel):
     solution: SolutionRef | None = None
     """A solved solution of this problem. Every decision not in `decision_evidence` then follows
     that solution's decoded policy (see `_compute_utilities_with_decision_pins`)."""
-    commit: bool = False
-    """Widen the persisted ideal/nadir to cover the computed utilities (`_ratchet_ideal_nadir`) and
-    return them."""
 
 
 class WhatIfResponse(BaseModel):
@@ -157,18 +155,14 @@ class WhatIfResponse(BaseModel):
     """Objective symbol -> expected utility under the given evidence."""
     utility_std_devs: dict[str, float]
     """Objective symbol -> standard deviation of the utility under the given evidence."""
-    ideal: dict[str, float] | None = None
-    """Objective symbol -> the problem's ideal value after any ratchet. Only set when `commit` is
-    `True`. Can be wider than what any actual solution attains."""
-    nadir: dict[str, float] | None = None
-    """Objective symbol -> the problem's current nadir value, same population rule as `ideal`."""
     off_policy_decisions: list[str] = []
     """With `solution`: followed decisions that the pins/evidence put in an information state the
     solution never reaches, so its choice there is arbitrary (see `_off_policy_decisions`). When
     non-empty, `utilities`/`utility_std_devs` are empty and `policy` holds only the pins."""
     decision_posteriors: dict[str, list[float]] = {}
     """With `solution`: followed decision symbol -> per-state probability under the solution's policy,
-    in the decision's `states` order. Omits pinned and off-policy decisions."""
+    in the decision's `states` order. Omits decisions pinned by the request and off-policy ones. Also
+    holds, one-hot, the decisions a hypothetical problem assumes."""
 
 
 # --- POST /graphical/compile ----------------------------------------------------------------------
@@ -222,6 +216,15 @@ def compile_graphical_model(
         rjt = build_rooted_junction_tree(
             request.network, request.annotation, max_cluster_size=max_cluster_size, on_exceed=on_exceed
         )
+        # A stricter cap with `on_exceed="warn"` only warns, so enforce the ceiling here too.
+        if rjt.max_cluster_size > _SERVER_MAX_CLUSTER_SIZE:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"Largest cluster state space ({rjt.max_cluster_size}) exceeds the server "
+                    f"limit of {_SERVER_MAX_CLUSTER_SIZE}."
+                ),
+            )
         total_cluster_size = sum(cluster.state_space_size for cluster in rjt.clusters.values())
         if total_cluster_size > _SERVER_MAX_TOTAL_CLUSTER_SIZE:
             raise HTTPException(
@@ -282,6 +285,36 @@ def _fetch_graphical_metadata(problem_id: int, db_session: Session) -> Graphical
             detail=f"No graphical model metadata found for problem {problem_id}.",
         )
     return row
+
+
+def _assumptions(meta: GraphicalModelMetaData) -> DiagramAssumptions:
+    """What `meta`'s problem assumes; empty unless it is a hypothetical."""
+    if meta.assumptions_json is None:
+        return DiagramAssumptions()
+    return DiagramAssumptions.model_validate_json(meta.assumptions_json)
+
+
+def _with_assumed_decisions(meta: GraphicalModelMetaData, decision_evidence: dict[str, str]) -> dict[str, str]:
+    """`decision_evidence` plus the decisions `meta`'s problem assumes; 400 if a pin contradicts one."""
+    assumed = _assumptions(meta).decisions
+    conflicts = sorted(
+        symbol for symbol in assumed.keys() & decision_evidence.keys() if assumed[symbol] != decision_evidence[symbol]
+    )
+    if conflicts:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"This problem assumes {', '.join(f'{symbol} = {assumed[symbol]}' for symbol in conflicts)}.",
+        )
+    return {**decision_evidence, **assumed}
+
+
+def _reject_assumed_decisions(meta: GraphicalModelMetaData) -> None:
+    """501 if `meta`'s problem assumes a decision, which pyAgrum's `MEU()` would optimize freely."""
+    if _assumptions(meta).decisions:
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail="Not implemented for a hypothetical problem that assumes a decision.",
+        )
 
 
 @router.get("/{problem_id}/structure")
@@ -346,7 +379,7 @@ def get_structure(
         for parent in objective.parents:
             _add_edge(parent, objective_id)
 
-    return StructureResponse(nodes=nodes, edges=edges)
+    return StructureResponse(nodes=nodes, edges=edges, assumptions=_assumptions(meta))
 
 
 # --- Session-scoped inference engine cache --------------------------------------------------------
@@ -809,8 +842,7 @@ def _validate_decision_evidence(annotation: DecisionAnnotation, decision_evidenc
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=(
-                f"decision_evidence references node(s) that aren't DecisionAnnotation decisions: "
-                f"{unknown_decisions}."
+                f"decision_evidence references node(s) that aren't DecisionAnnotation decisions: {unknown_decisions}."
             ),
         )
     for symbol, label in decision_evidence.items():
@@ -822,51 +854,6 @@ def _validate_decision_evidence(annotation: DecisionAnnotation, decision_evidenc
                     f"own states {decision_states[symbol]}."
                 ),
             )
-
-
-def _ratchet_ideal_nadir(problem_db: ProblemDB, utilities: dict[str, float], db_session: Session) -> bool:
-    """Widen `problem_db`'s persisted ideal/nadir to cover `utilities`, never narrow them.
-
-    For a maximized objective, `ideal` only increases and `nadir` only decreases (reversed when
-    minimizing). Since the bounds can never be narrowed again:
-
-    - Non-finite values are skipped.
-    - Objectives with neither bound set are skipped, since adopting the value for both would
-      give a zero-width range. The initial range must come from e.g. a payoff table.
-    - If only one bound is set, the missing one is adopted directly.
-
-    Changed rows are added to `db_session`; committing is left to the caller. Not safe against
-    concurrent commits on the same problem (lost updates are possible).
-
-    Returns:
-        bool: whether any `ObjectiveDB` row was changed.
-    """
-    any_changed = False
-    for obj_db in problem_db.objectives:
-        if obj_db.symbol not in utilities:
-            continue
-        value = utilities[obj_db.symbol]
-        if not isfinite(value):
-            continue
-        if obj_db.ideal is None and obj_db.nadir is None:
-            # No range to widen yet.
-            continue
-
-        # A `None` bound (with the other set) is always adopted.
-        if obj_db.maximize:
-            better_ideal = obj_db.ideal is None or value > obj_db.ideal
-            worse_nadir = obj_db.nadir is None or value < obj_db.nadir
-        else:
-            better_ideal = obj_db.ideal is None or value < obj_db.ideal
-            worse_nadir = obj_db.nadir is None or value > obj_db.nadir
-        if better_ideal:
-            obj_db.ideal = value
-        if worse_nadir:
-            obj_db.nadir = value
-        if better_ideal or worse_nadir:
-            db_session.add(obj_db)
-            any_changed = True
-    return any_changed
 
 
 def _fetch_solution_policies(
@@ -912,29 +899,21 @@ def whatif(
     """Set hard evidence, run inference, and return posteriors/policy/utilities in one payload.
 
     Uses a cached engine (see `_engine_cache`), except with `request.solution` and some decision
-    unpinned, which uses a fresh one where unpinned decisions follow that solution's policy. With
-    `request.commit=True`, also ratchets the problem's ideal/nadir (see `_ratchet_ideal_nadir`) and
-    returns them.
+    unpinned, which uses a fresh one where unpinned decisions follow that solution's policy. The
+    decisions a hypothetical problem assumes are always pinned.
 
     Raises:
         HTTPException: 404 if the problem or session isn't found or visible, or the problem has no
             `GraphicalModelMetaData`, or for an unusable `solution` (see
-            `_fetch_solution_policies`); 403 if `commit` is `True` and `user` is neither the owner
-            nor an admin/analyst; 400 for invalid evidence/decision_evidence/solution or a diagram
-            pyAgrum rejects; 501 for several objectives with decisions, unless `decision_evidence`
-            pins every decision or `solution` is given (see `_compute_utilities`).
+            `_fetch_solution_policies`); 400 for invalid evidence/decision_evidence/solution, a pin
+            contradicting an assumed decision, or a diagram pyAgrum rejects; 501 for several
+            objectives with decisions, unless `decision_evidence` pins every decision or
+            `solution` is given (see `_compute_utilities`).
     """
     problem_db = fetch_problem_with_role_check(user, request.problem_id, db_session)
     if problem_db is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=f"Problem with id={request.problem_id} not found."
-        )
-
-    if request.commit and problem_db.user_id != user.id and user.role not in (UserRole.analyst, UserRole.admin):
-        # Visibility (e.g. via a group) is not enough to write to the problem.
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only the problem's owner (or an admin/analyst) may commit a what-if result.",
         )
 
     meta = _fetch_graphical_metadata(request.problem_id, db_session)
@@ -943,24 +922,25 @@ def whatif(
 
     _validate_chance_evidence(network, request.evidence)
     _validate_decision_evidence(annotation, request.decision_evidence)
+    decision_evidence = _with_assumed_decisions(meta, request.decision_evidence)
     # Resolved on both branches below, since it also checks `session_id` ownership.
     cache_key = _resolve_cache_key(user, request.session_id, request.problem_id, db_session)
 
     off_policy: list[str] = []
     decision_posteriors: dict[str, list[float]] = {}
-    unpinned = {decision.symbol for decision in annotation.decisions} - set(request.decision_evidence)
+    unpinned = {decision.symbol for decision in annotation.decisions} - set(decision_evidence)
     if request.solution is not None and unpinned:
         # Every decision is pinned or follows the solution, so the cached LIMID engine isn't used.
         policies = _fetch_solution_policies(request.solution, request.problem_id, meta, user, db_session)
         utilities, utility_std_devs, posteriors, decision_posteriors = _compute_utilities_with_decision_pins(
-            network, annotation, request.evidence, request.decision_evidence, policies
+            network, annotation, request.evidence, decision_evidence, policies
         )
-        off_policy = _off_policy_decisions(network, annotation, request.evidence, request.decision_evidence, policies)
+        off_policy = _off_policy_decisions(network, annotation, request.evidence, decision_evidence, policies)
         if off_policy:
             utilities, utility_std_devs, decision_posteriors = {}, {}, {}
-            policy = dict(request.decision_evidence)
+            policy = dict(decision_evidence)
         else:
-            policy = _decode_solved_policy(policies, network, annotation, request.evidence, request.decision_evidence)
+            policy = _decode_solved_policy(policies, network, annotation, request.evidence, decision_evidence)
     else:
         entry = _get_or_build_entry(cache_key, meta.network_json, meta.annotation_json, network, annotation)
         with entry.lock:
@@ -969,9 +949,9 @@ def whatif(
                 entry.engine.setEvidence(request.evidence)
                 entry.engine.makeInference()
                 posteriors = _read_posteriors(entry.engine, network)
-                policy = _read_policy(entry.engine, annotation, request.decision_evidence)
+                policy = _read_policy(entry.engine, annotation, decision_evidence)
                 utilities, utility_std_devs, posteriors_override = _compute_utilities(
-                    entry.engine, annotation, network, request.evidence, request.decision_evidence
+                    entry.engine, annotation, network, request.evidence, decision_evidence
                 )
             except gum.GumException as e:
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
@@ -985,21 +965,15 @@ def whatif(
                 # The pinned-decision branch's own engine reflects the actual pins.
                 posteriors = posteriors_override
 
-    ideal: dict[str, float] | None = None
-    nadir: dict[str, float] | None = None
-    if request.commit:
-        if _ratchet_ideal_nadir(problem_db, utilities, db_session):
-            db_session.commit()
-        ideal = {obj_db.symbol: obj_db.ideal for obj_db in problem_db.objectives if obj_db.ideal is not None}
-        nadir = {obj_db.symbol: obj_db.nadir for obj_db in problem_db.objectives if obj_db.nadir is not None}
+    decision_states = {decision.symbol: decision.states for decision in annotation.decisions}
+    for symbol, state in _assumptions(meta).decisions.items():
+        decision_posteriors[symbol] = [1.0 if label == state else 0.0 for label in decision_states[symbol]]
 
     return WhatIfResponse(
         posteriors=posteriors,
         policy=policy,
         utilities=utilities,
         utility_std_devs=utility_std_devs,
-        ideal=ideal,
-        nadir=nadir,
         off_policy_decisions=off_policy,
         decision_posteriors=decision_posteriors,
     )
@@ -1424,7 +1398,8 @@ def sensitivity(
         HTTPException: 401 for a guest user; 404 if the problem isn't found or visible, or has no
             `GraphicalModelMetaData`; 400 for invalid evidence, `target`, `target_state` or
             `nodes`, or too many nodes to sweep; 501 if `target` is an objective of a diagram
-            with several objectives and a decision (see `_compute_utilities`).
+            with several objectives and a decision (see `_compute_utilities`), or the problem
+            assumes a decision.
     """
     if user.role == UserRole.guest:
         raise HTTPException(
@@ -1439,6 +1414,7 @@ def sensitivity(
         )
 
     meta = _fetch_graphical_metadata(request.problem_id, db_session)
+    _reject_assumed_decisions(meta)
     network = DiscreteNetwork.model_validate_json(meta.network_json)
     annotation = DecisionAnnotation.model_validate_json(meta.annotation_json)
 
@@ -1566,7 +1542,8 @@ def value_of_information(
         HTTPException: 404 if the problem isn't found or visible, or has no
             `GraphicalModelMetaData`; 400 if the diagram has no decisions, or for an invalid
             `target`, `node` (or one already in `evidence`), or evidence; 501 for several
-            objectives with a decision (see `_compute_utilities`).
+            objectives with a decision (see `_compute_utilities`), or if the problem assumes a
+            decision.
     """
     problem_db = fetch_problem_with_role_check(user, request.problem_id, db_session)
     if problem_db is None:
@@ -1575,6 +1552,7 @@ def value_of_information(
         )
 
     meta = _fetch_graphical_metadata(request.problem_id, db_session)
+    _reject_assumed_decisions(meta)
     network = DiscreteNetwork.model_validate_json(meta.network_json)
     annotation = DecisionAnnotation.model_validate_json(meta.annotation_json)
 
@@ -1617,10 +1595,19 @@ def value_of_information(
             marginal_probs = np.asarray(entry.engine.posterior(request.node).toarray())
             marginal = dict(zip(labels, marginal_probs.tolist(), strict=True))
 
+            # Pinning an impossible state makes the utilities NaN; its weight is zero anyway.
+            possible_states = [state for state in labels if marginal[state] >= _SENSITIVITY_NEGLIGIBLE_MARGINAL]
             values = _sweep_node(
-                entry.engine, network, annotation, request.evidence, request.node, request.target, None
+                entry.engine,
+                network,
+                annotation,
+                request.evidence,
+                request.node,
+                request.target,
+                None,
+                states=possible_states,
             )
-            expected_with_observation = sum(marginal[state] * values[state] for state in labels)
+            expected_with_observation = sum(marginal[state] * values[state] for state in possible_states)
         except gum.GumException as e:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
         finally:
@@ -1753,24 +1740,11 @@ def solve_graphical_model(
             status_code=status.HTTP_400_BAD_REQUEST, detail=f"No compatible solver found for problem {problem_id}."
         )
 
-    # The `z` variables are binary, but `find_compatible_solvers` may still offer `CVXPYSolver`,
-    # which may lack a MIP-capable backend. Keep only solvers known to handle MILPs.
-    if problem.variable_domain in (VariableDomainTypeEnum.integer, VariableDomainTypeEnum.mixed):
-        mip_capable_solvers = {GurobipySolver, PyomoGurobiSolver, PyomoCBCSolver, PyomoBonminSolver}
-        solvers = [solver for solver in solvers if solver in mip_capable_solvers]
-        if not solvers:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"No compatible MIP-capable solver found for problem {problem_id}.",
-            )
-
-    # `guess_best_solver` always returns something, so only use it if it passed the filters above.
     solver_class = guess_best_solver(problem)
-    if solver_class not in solvers:
-        solver_class = solvers[0]
 
     try:
-        result = solver_class(problem).solve(request.objective_symbol)
+        # The `_min` form, since not every solver respects `maximize` on the raw symbol.
+        result = solver_class(problem).solve(f"{request.objective_symbol}_min")
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

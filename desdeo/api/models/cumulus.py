@@ -5,6 +5,8 @@ from typing import Any, Literal
 from pydantic import BaseModel
 from sqlmodel import JSON, Column, Field, SQLModel
 
+from desdeo.problem.graphical import DiagramAssumptions
+
 from .generic import SolutionInfo
 from .generic_states import SolutionReferenceResponse, SolutionReferenceResponseLite
 from .preference import ReferencePoint
@@ -268,6 +270,20 @@ class CumulusModificationRequest(SQLModel):
     name: str | None = Field(default=None, description="Optional name for the newly created modified problem.")
 
     modifications: ProblemModification = Field(sa_column=Column(JSON))
+
+
+class CumulusHypotheticalRequest(SQLModel):
+    """Request model for the CUMULUS hypothetical endpoint.
+
+    Creates a new problem from a graphical-model problem under `assumptions`, on top of whatever
+    it already assumes. The response and status polling are those of modify-problem.
+    """
+
+    problem_id: int
+    session_id: int | None = Field(default=None)
+    parent_state_id: int | None = Field(default=None)
+
+    assumptions: DiagramAssumptions = Field(sa_column=Column(JSON))
 
 
 class CumulusModificationResponse(SQLModel):

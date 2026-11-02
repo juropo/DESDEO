@@ -108,24 +108,30 @@
 		return `${state}: ${pct}% (baseline ${Math.round(ghost * 100)}%, ${sign}${deltaPct}pp)`;
 	}
 
-	// Diamond clips a background layer rather than rotating the node, so the label stays upright.
+	let hexagon = $derived(style.shape === 'hexagon');
+	let active = $derived(nodeData.highlight === 'active' || selected);
+	// The hexagon is drawn by clipped layers behind the content, so the content itself is never
+	// clipped; the points are a fixed width, so a longer label only widens the middle.
+	const HEXAGON_CLIP =
+		'clip-path: polygon(14px 0, calc(100% - 14px) 0, 100% 50%, calc(100% - 14px) 100%, 14px 100%, 0 50%);';
 	let bgStyle = $derived(
-		style.shape === 'diamond'
-			? 'clip-path: polygon(50% 0%, 100% 50%, 50% 100%, 0% 50%);'
-			: style.shape === 'ellipse'
-				? 'border-radius: 9999px;'
-				: 'border-radius: 0.5rem;'
+		hexagon ? '' : style.shape === 'ellipse' ? 'border-radius: 9999px;' : 'border-radius: 0.5rem;'
 	);
 </script>
 
 <Handle type="target" position={Position.Top} class="!bg-background !h-2 !w-2 !border-2" />
 <div
-	class="network-node group bg-card relative flex min-h-14 min-w-28 flex-col items-center justify-center gap-1 border-2 px-3 py-2 shadow-sm transition-opacity"
+	class="network-node group relative isolate flex min-h-14 min-w-28 flex-col items-center justify-center gap-1 py-2 transition-opacity"
+	class:bg-card={!hexagon}
+	class:border-2={!hexagon}
+	class:shadow-sm={!hexagon}
+	class:px-3={!hexagon}
+	class:px-6={hexagon}
 	class:opacity-35={nodeData.highlight === 'dimmed'}
-	class:shadow-lg={nodeData.highlight === 'active' || selected}
-	class:ring-2={nodeData.highlight === 'active' || selected}
-	class:ring-offset-2={nodeData.highlight === 'active' || selected}
-	class:ring-offset-background={nodeData.highlight === 'active' || selected}
+	class:shadow-lg={active && !hexagon}
+	class:ring-2={active && !hexagon}
+	class:ring-offset-2={active && !hexagon}
+	class:ring-offset-background={active && !hexagon}
 	style:border-color={style.colorVar}
 	style:--tw-ring-color={style.colorVar}
 	style={style.shape !== 'double-rect' ? bgStyle : 'border-radius: 0.5rem;'}
@@ -135,6 +141,19 @@
 		<div
 			class="pointer-events-none absolute -inset-1 rounded-[0.6rem] ring-2 ring-amber-500/50"
 		></div>
+	{/if}
+	{#if hexagon}
+		{#if active}
+			<div
+				class="pointer-events-none absolute -inset-1 -z-10 opacity-50"
+				style="{HEXAGON_CLIP} background: {style.colorVar};"
+			></div>
+		{/if}
+		<div
+			class="pointer-events-none absolute inset-0 -z-10"
+			style="{HEXAGON_CLIP} background: {style.colorVar};"
+		></div>
+		<div class="bg-card pointer-events-none absolute inset-[2px] -z-10" style={HEXAGON_CLIP}></div>
 	{/if}
 	{#if style.shape === 'double-rect'}
 		<div
@@ -169,7 +188,7 @@
 			<IconCheck class="size-2.5" />
 			{nodeData.policyState}
 		</span>
-	{:else if kind === 'decision' && nodeData.detail === 'compact' && solutionChoice !== undefined}
+	{:else if kind === 'decision' && nodeData.detail !== 'expanded' && solutionChoice !== undefined}
 		<span class="text-muted-foreground flex items-center gap-0.5 text-[10px] leading-none">
 			{#if solutionChoice !== null}
 				<IconCheck class="size-2.5" />
@@ -279,7 +298,8 @@
 					></button>
 				{/each}
 			</div>
-		{:else}
+		{:else if !(kind === 'decision' && solutionChoice !== undefined)}
+			<!-- A followed decision shows its choice above instead. -->
 			<span class="text-muted-foreground text-[10px] leading-none">
 				{nodeData.states.length} states
 			</span>
@@ -313,4 +333,7 @@
 		{/if}
 	{/if}
 </div>
-<Handle type="source" position={Position.Bottom} class="!bg-background !h-2 !w-2 !border-2" />
+{#if kind !== 'objective'}
+	<!-- Objectives have no children. -->
+	<Handle type="source" position={Position.Bottom} class="!bg-background !h-2 !w-2 !border-2" />
+{/if}

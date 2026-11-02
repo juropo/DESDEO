@@ -1640,8 +1640,8 @@ def test_cumulus_initialize_skips_nonfinite_payoff_table_estimate(client: TestCl
 
     original_payoff_table_method = cumulus_router.payoff_table_method
 
-    def _poisoned_payoff_table_method(problem, solver=None):
-        estimated_ideal, estimated_nadir = original_payoff_table_method(problem, solver)
+    def _poisoned_payoff_table_method(problem, solver=None, **kwargs):
+        estimated_ideal, estimated_nadir = original_payoff_table_method(problem, solver, **kwargs)
         estimated_ideal = {**estimated_ideal, "f_2": float("nan")}
         return estimated_ideal, estimated_nadir
 
@@ -1913,6 +1913,14 @@ def test_cumulus_get_or_initialize_after_save(client: TestClient):
     assert result.state_id == solve_result.state_id
     assert len(result.current_solutions) == len(solve_result.current_solutions)
     assert [s.name for s in result.saved_solutions] == ["Kept"]
+
+    # A new session starts a fresh run that doesn't see the earlier session's saves.
+    assert post_json(client, "/session/new", {"info": "second run"}, access_token).status_code == 200
+    response = post_json(client, "/method/cumulus/get-or-initialize", init_request.model_dump(), access_token)
+    assert response.status_code == status.HTTP_200_OK
+    fresh = CumulusInitializationResponse.model_validate(json.loads(response.content))
+    assert fresh.state_id != solve_result.state_id
+    assert fresh.saved_solutions == []
 
 
 def test_cumulus_get_or_initialize_after_finalize(client: TestClient):

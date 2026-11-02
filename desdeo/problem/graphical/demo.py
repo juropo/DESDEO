@@ -269,6 +269,7 @@ def build_oil_wildcatter_annotation() -> DecisionAnnotation:
                 parents=parents,
                 utility=Potential(variables=parents, shape=objective_shape, values=investment_values.tolist()),
                 maximize=False,
+                unit="USD",
             ),
             ObjectiveNode(
                 symbol="oil_produced",
@@ -276,6 +277,7 @@ def build_oil_wildcatter_annotation() -> DecisionAnnotation:
                 parents=parents,
                 utility=Potential(variables=parents, shape=objective_shape, values=oil_produced_values.tolist()),
                 maximize=True,
+                unit="barrels",
             ),
             ObjectiveNode(
                 symbol="profit",
@@ -283,6 +285,7 @@ def build_oil_wildcatter_annotation() -> DecisionAnnotation:
                 parents=parents,
                 utility=Potential(variables=parents, shape=objective_shape, values=profit_values.tolist()),
                 maximize=True,
+                unit="USD",
             ),
         ],
         decision_order=["test", "drill"],

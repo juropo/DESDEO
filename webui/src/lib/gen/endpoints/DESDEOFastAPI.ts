@@ -6,6 +6,14 @@
  * OpenAPI spec version: 0.1.0
  */
 import { customFetch } from '../../api/new-client';
+/**
+ * Model of the request to change the user's active session.
+ */
+export interface ActivateSessionRequest {
+	/** One of the user's own sessions, or None for none. */
+	session_id?: number | null;
+}
+
 export interface BodyAddNewAnalystAddNewAnalystPost {
 	grant_type?: string | null;
 	username: string;
@@ -166,11 +174,8 @@ export const DiscreteVariableKind = {
 /**
  * A discrete chance node's domain, mirroring one pyAgrum `DiscreteVariable` subclass.
  *
- * `labels` always holds the domain in state-index order (what pyAgrum's own `.labels()`
- * returns for any of its variable subclasses, regardless of kind) and is what CPT/`Potential`
- * indexing refers to. The kind-specific fields below carry exactly what's needed to
- * reconstruct the same pyAgrum subclass rather than always falling back to a generic
- * labelized variable.
+ * `labels` holds the domain in state-index order; the kind-specific fields allow reconstructing
+ * the same pyAgrum subclass.
  */
 export interface DiscreteVariable {
 	name: string;
@@ -187,11 +192,8 @@ export interface DiscreteVariable {
 /**
  * A conditional probability table over one or more `DiscreteVariable`s.
  *
- * `variables` follows pyAgrum's own per-CPT ordering: the node itself first, then its parents
- * in the order pyAgrum lists them (arc-insertion order). `values`'s axes match `variables`
- * 1:1 in that same order -- note this is the *reverse* of pyAgrum's own `Tensor.toarray()`,
- * whose axis order is reversed relative to its `variablesSequence()`; the adapter transposes
- * between the two conventions so this schema's axis order stays intuitive to read.
+ * `variables` is the node itself first, then its parents in arc-insertion order. `values`'s axes
+ * match `variables` (the reverse of pyAgrum's `Tensor.toarray()`).
  */
 export interface Potential {
 	variables: string[];
@@ -204,9 +206,7 @@ export type DiscreteNetworkPotentials = { [key: string]: Potential };
 /**
  * A discrete Bayesian network: chance nodes, arcs between them, and one CPT per node.
  *
- * Near-isomorphic to pyAgrum's `BayesNet` -- see `adapters/pyagrum.py` for the conversion.
- * Nodes are addressed by name throughout, mirroring how the rest of DESDEO addresses `Problem`
- * elements by `symbol` rather than by a separate integer id.
+ * Near-isomorphic to pyAgrum's `BayesNet`; see `adapters/pyagrum.py`. Nodes are addressed by name.
  */
 export interface DiscreteNetwork {
 	name?: string;
@@ -232,11 +232,7 @@ export interface DecisionNode {
 /**
  * A utility node: one linear objective, valued over its parents' joint state.
  *
- * Deliberately kept singular and vector-friendly -- `DecisionAnnotation` holds a *list* of
- * these rather than following pyAgrum's influence-diagram convention of implicitly summing
- * every utility node into one scalar (`ShaferShenoyLIMIDInference.MEU()` does exactly that;
- * confirmed empirically -- see the plan's Phase 2 findings). Multiobjective handling stays with
- * DESDEO's existing methods, one objective per `ObjectiveNode` (design decisions table).
+ * Objectives are kept separate rather than summed into one utility as pyAgrum does.
  */
 export interface ObjectiveNode {
 	symbol: string;
@@ -244,13 +240,11 @@ export interface ObjectiveNode {
 	parents: string[];
 	utility: Potential;
 	maximize?: boolean;
+	unit?: string | null;
 }
 
 /**
- * Which quantity a `DiagramConstraint` is linear in, per the Phase 5 constraint taxonomy.
- *
- * Recorded here (Phase 2) so it can be surfaced in the API ahead of Phase 5 actually compiling
- * against it; the taxonomy itself doesn't change.
+ * Which quantity a `DiagramConstraint` is linear in.
  */
 export type DiagramConstraintKind =
 	(typeof DiagramConstraintKind)[keyof typeof DiagramConstraintKind];
@@ -275,9 +269,7 @@ export const ConstraintTypeEnum = {
 /**
  * A diagram-level constraint, expressed in terms of node symbols rather than compiled variables.
  *
- * mu/z variables only exist once Phase 4 compiles a specific `RootedJunctionTree`. `kind` fixes
- * which of the Phase 5 taxonomy rows this constraint belongs to; `func` is resolved against that
- * taxonomy at compile time.
+ * `kind` determines how `func` is compiled.
  */
 export interface DiagramConstraint {
 	symbol: string;
@@ -289,10 +281,7 @@ export interface DiagramConstraint {
 }
 
 /**
- * Which risk measure to apply.
- *
- * Only `cvar` is implemented end to end (Phase 6); kept as an enum so the schema doesn't need
- * to change shape when a second risk measure is added.
+ * Which risk measure to apply. Only `cvar` is implemented.
  */
 export type RiskMeasureKind = (typeof RiskMeasureKind)[keyof typeof RiskMeasureKind];
 
@@ -301,11 +290,7 @@ export const RiskMeasureKind = {
 } as const;
 
 /**
- * A risk transform recorded against one objective, applied before Phase 4 emits variables.
- *
- * Applied as a transformation of the diagram/RJT, not as a constraint appended afterward -- see
- * the plan's Phase 6 section. This schema only records intent; the transformation itself is
- * Phase 6 work.
+ * A risk transform recorded against one objective, applied to the diagram before compiling.
  */
 export interface RiskMeasure {
 	symbol: string;
@@ -317,15 +302,8 @@ export interface RiskMeasure {
 /**
  * The full decision/objective overlay for one `DiscreteNetwork`.
  *
- * Contains nothing the network already provides -- no chance-node domains or CPTs, only what
- * turns a Bayesian network into an influence diagram: decisions, objectives, diagram-level
- * constraints, and risk measures, plus the temporal/memory assumptions governing them.
- *
- * Construction validates internal consistency only (symbol uniqueness, cross-references among
- * this annotation's own decisions/objectives/constraints/risk measures). Cross-references into
- * a `DiscreteNetwork` -- existence and state-set matching -- are deliberately *not* checked
- * here; see `validate_against`, which is the entry point the "relearn CPTs, reapply the same
- * annotation" round trip depends on.
+ * Construction checks internal consistency only; references into a network are checked by
+ * `validate_against`.
  */
 export interface DecisionAnnotation {
 	schema_version?: number;
@@ -605,6 +583,31 @@ export interface CumulusFinalizeResponse {
 	saved_solutions: SolutionReferenceResponseLite[];
 	/** All solutions generated by CUMULUS across all iterations. */
 	all_solutions: SolutionReferenceResponseLite[];
+}
+
+export type DiagramAssumptionsChance = { [key: string]: string };
+
+export type DiagramAssumptionsDecisions = { [key: string]: string };
+
+/**
+ * States assumed for some of a diagram's parentless chance nodes and decisions.
+ */
+export interface DiagramAssumptions {
+	chance?: DiagramAssumptionsChance;
+	decisions?: DiagramAssumptionsDecisions;
+}
+
+/**
+ * Request model for the CUMULUS hypothetical endpoint.
+ *
+ * Creates a new problem from a graphical-model problem under `assumptions`, on top of whatever
+ * it already assumes. The response and status polling are those of modify-problem.
+ */
+export interface CumulusHypotheticalRequest {
+	problem_id: number;
+	session_id?: number | null;
+	parent_state_id?: number | null;
+	assumptions: DiagramAssumptions;
 }
 
 export type CumulusInitializationRequestScalarizationOptions = {
@@ -1884,6 +1887,8 @@ export interface GraphicalModelMetaData {
 	rjt_json?: string | null;
 	/** JSON-serialised `IndexMap` (Phase 4), once the diagram has been compiled */
 	index_map_json?: string | null;
+	/** JSON-serialised `desdeo.problem.graphical.DiagramAssumptions` of a hypothetical problem; `network_json` is then already conditioned on them */
+	assumptions_json?: string | null;
 }
 
 /**
@@ -2770,6 +2775,14 @@ export interface SolutionDescriptionResponse {
 }
 
 /**
+ * One solution stored in a `StateDB` row, e.g. a CUMULUS `SolutionReferenceResponseLite`.
+ */
+export interface SolutionRef {
+	state_id: number;
+	solution_index: number;
+}
+
+/**
  * Body for `POST /graphical/{problem_id}/solve`.
  */
 export interface SolveRequest {
@@ -2833,6 +2846,7 @@ export interface StructureNode {
 export interface StructureResponse {
 	nodes: StructureNode[];
 	edges: StructureEdge[];
+	assumptions?: DiagramAssumptions;
 }
 
 /**
@@ -2873,6 +2887,7 @@ export interface UserPublic {
 	id: number;
 	role: UserRole;
 	group_ids: number[] | null;
+	active_session_id?: number | null;
 }
 
 /**
@@ -2940,6 +2955,8 @@ export interface VoiResponse {
 
 export type WhatIfRequestEvidence = { [key: string]: string };
 
+export type WhatIfRequestDecisionEvidence = { [key: string]: string };
+
 /**
  * Body for `POST /graphical/whatif`.
  */
@@ -2947,7 +2964,8 @@ export interface WhatIfRequest {
 	problem_id: number;
 	session_id?: number | null;
 	evidence?: WhatIfRequestEvidence;
-	commit?: boolean;
+	decision_evidence?: WhatIfRequestDecisionEvidence;
+	solution?: SolutionRef | null;
 }
 
 export type WhatIfResponsePosteriors = { [key: string]: number[] };
@@ -2958,9 +2976,7 @@ export type WhatIfResponseUtilities = { [key: string]: number };
 
 export type WhatIfResponseUtilityStdDevs = { [key: string]: number };
 
-export type WhatIfResponseIdeal = { [key: string]: number } | null;
-
-export type WhatIfResponseNadir = { [key: string]: number } | null;
+export type WhatIfResponseDecisionPosteriors = { [key: string]: number[] };
 
 /**
  * Response for `POST /graphical/whatif`.
@@ -2970,8 +2986,8 @@ export interface WhatIfResponse {
 	policy?: WhatIfResponsePolicy;
 	utilities: WhatIfResponseUtilities;
 	utility_std_devs: WhatIfResponseUtilityStdDevs;
-	ideal?: WhatIfResponseIdeal;
-	nadir?: WhatIfResponseNadir;
+	off_policy_decisions?: string[];
+	decision_posteriors?: WhatIfResponseDecisionPosteriors;
 }
 
 export type LoginLoginPostParams = {
@@ -3143,6 +3159,10 @@ export type SetObjectiveConstraintsMethodCumulusObjectiveConstraintPostParams = 
 };
 
 export type ModifyProblemMethodCumulusModifyProblemPostParams = {
+	problem_id?: number | null;
+};
+
+export type CreateHypotheticalMethodCumulusHypotheticalPostParams = {
 	problem_id?: number | null;
 };
 
@@ -4564,6 +4584,55 @@ export const createNewSessionSessionNewPost = async (
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json', ...options?.headers },
 			body: JSON.stringify(createSessionRequest)
+		}
+	);
+};
+
+export type activateSessionSessionActivatePostResponse200 = {
+	data: InteractiveSessionBase | null;
+	status: 200;
+};
+
+export type activateSessionSessionActivatePostResponse422 = {
+	data: HTTPValidationError;
+	status: 422;
+};
+
+export type activateSessionSessionActivatePostResponseSuccess =
+	activateSessionSessionActivatePostResponse200 & {
+		headers: Headers;
+	};
+export type activateSessionSessionActivatePostResponseError =
+	activateSessionSessionActivatePostResponse422 & {
+		headers: Headers;
+	};
+
+export type activateSessionSessionActivatePostResponse =
+	| activateSessionSessionActivatePostResponseSuccess
+	| activateSessionSessionActivatePostResponseError;
+
+export const getActivateSessionSessionActivatePostUrl = () => {
+	return `http://localhost:8000/session/activate`;
+};
+
+/**
+ * Make one of the user's own sessions the active one, or clear it with `session_id=None`.
+ *
+ * Methods resume and record their states in the active session. Analysts and admins can see
+ * other users' sessions but not activate them, so their own work never lands in someone else's.
+ * @summary Activate Session
+ */
+export const activateSessionSessionActivatePost = async (
+	activateSessionRequest: ActivateSessionRequest,
+	options?: RequestInit
+): Promise<activateSessionSessionActivatePostResponse> => {
+	return customFetch<activateSessionSessionActivatePostResponse>(
+		getActivateSessionSessionActivatePostUrl(),
+		{
+			...options,
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json', ...options?.headers },
+			body: JSON.stringify(activateSessionRequest)
 		}
 	);
 };
@@ -6490,6 +6559,76 @@ export const modifyProblemMethodCumulusModifyProblemPost = async (
 	);
 };
 
+export type createHypotheticalMethodCumulusHypotheticalPostResponse200 = {
+	data: CumulusModificationResponse;
+	status: 200;
+};
+
+export type createHypotheticalMethodCumulusHypotheticalPostResponse422 = {
+	data: HTTPValidationError;
+	status: 422;
+};
+
+export type createHypotheticalMethodCumulusHypotheticalPostResponseSuccess =
+	createHypotheticalMethodCumulusHypotheticalPostResponse200 & {
+		headers: Headers;
+	};
+export type createHypotheticalMethodCumulusHypotheticalPostResponseError =
+	createHypotheticalMethodCumulusHypotheticalPostResponse422 & {
+		headers: Headers;
+	};
+
+export type createHypotheticalMethodCumulusHypotheticalPostResponse =
+	| createHypotheticalMethodCumulusHypotheticalPostResponseSuccess
+	| createHypotheticalMethodCumulusHypotheticalPostResponseError;
+
+export const getCreateHypotheticalMethodCumulusHypotheticalPostUrl = (
+	params?: CreateHypotheticalMethodCumulusHypotheticalPostParams
+) => {
+	const normalizedParams = new URLSearchParams();
+
+	Object.entries(params || {}).forEach(([key, value]) => {
+		if (value !== undefined) {
+			normalizedParams.append(key, value === null ? 'null' : String(value));
+		}
+	});
+
+	const stringifiedParams = normalizedParams.toString();
+
+	return stringifiedParams.length > 0
+		? `http://localhost:8000/method/cumulus/hypothetical?${stringifiedParams}`
+		: `http://localhost:8000/method/cumulus/hypothetical`;
+};
+
+/**
+ * Create a new problem from a graphical-model problem under hypothetical assumptions.
+ *
+ * The new problem is recompiled from the conditioned diagram and gets its own copy of the
+ * graphical metadata; the original problem is left as it is. Like a modification, it stays
+ * temporary until the background checks confirm it is feasible and set its ideal and nadir.
+ * Poll `/modify-problem/status/{state_id}` for the outcome.
+ *
+ * Raises:
+ *     HTTPException: 404 if the problem has no graphical model; 400 if the assumptions are
+ *         invalid, add nothing new, or contradict what the problem already assumes.
+ * @summary Create Hypothetical
+ */
+export const createHypotheticalMethodCumulusHypotheticalPost = async (
+	cumulusHypotheticalRequest: CumulusHypotheticalRequest,
+	params?: CreateHypotheticalMethodCumulusHypotheticalPostParams,
+	options?: RequestInit
+): Promise<createHypotheticalMethodCumulusHypotheticalPostResponse> => {
+	return customFetch<createHypotheticalMethodCumulusHypotheticalPostResponse>(
+		getCreateHypotheticalMethodCumulusHypotheticalPostUrl(params),
+		{
+			...options,
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json', ...options?.headers },
+			body: JSON.stringify(cumulusHypotheticalRequest)
+		}
+	);
+};
+
 export type modifyProblemStatusMethodCumulusModifyProblemStatusStateIdGetResponse200 = {
 	data: CumulusModificationResponse;
 	status: 200;
@@ -7841,22 +7980,13 @@ export const getCompileGraphicalModelGraphicalCompilePostUrl = () => {
 /**
  * Compile a `(DiscreteNetwork, DecisionAnnotation)` pair into a `Problem`, and persist it.
  *
- * Persists the compiled `Problem` (`ProblemDB`) plus a `GraphicalModelMetaData` side-table row
- * carrying the network, annotation, `RootedJunctionTree`, and `IndexMap` -- all four JSON
- * columns, matching Phase 3/4's persistence design (see `GraphicalModelMetaData`'s own
- * docstring), in one atomic commit (a review pass caught an earlier version committing the
- * `ProblemDB`, then the `ProblemMetaDataDB`, then the `GraphicalModelMetaData` as three separate
- * transactions -- a failure on the last one left a permanently-orphaned problem with no graphical
- * metadata and no repair path). Mirrors `routers/problem.py`'s `add_problem` guest check: guest
- * users may not create new problems, graphical or otherwise.
+ * Persists the `ProblemDB` plus a `GraphicalModelMetaData` row holding the network, annotation,
+ * `RootedJunctionTree`, and `IndexMap`, in one commit. Guest users may not compile.
  *
  * Raises:
- *     HTTPException: 401 for a guest user; 400 for a `ValueError` from `validate_against`/
- *         `build_rooted_junction_tree`/`compile_diagram` (bad/inconsistent annotation,
- *         `max_cluster_size` exceeded with `on_exceed="raise"`, an out-of-scope
- *         `DiagramConstraint`, ...) -- translated rather than left as an opaque 500; 400 if the
- *         sum of every cluster's own state space exceeds `_SERVER_MAX_TOTAL_CLUSTER_SIZE` (a
- *         many-small-disjoint-clusters diagram that never trips the single-largest-cluster cap).
+ *     HTTPException: 401 for a guest user; 400 for a `ValueError` from validation or
+ *         compilation (e.g. `max_cluster_size` exceeded), or if the total cluster state space
+ *         exceeds `_SERVER_MAX_TOTAL_CLUSTER_SIZE`.
  * @summary Compile Graphical Model
  */
 export const compileGraphicalModelGraphicalCompilePost = async (
@@ -7902,13 +8032,7 @@ export const getGetStructureGraphicalProblemIdStructureGetUrl = (problemId: numb
 };
 
 /**
- * DAG and node types only -- no inference, no pyAgrum. Serves the frontend's phase A.
- *
- * Ownership is checked via `fetch_problem_with_role_check` rather than `site_selection.py`'s
- * own hand-rolled `_role_rank` dict -- both encode the same admin/analyst-bypass-ownership
- * idea, but `fetch_problem_with_role_check` is the newer, already-shared helper (also used by
- * `SessionContextGuard`) and additionally covers group-shared problems, which this read-only
- * structure view has no reason to exclude.
+ * The DAG and node types of a graphical model, without inference.
  *
  * Raises:
  *     HTTPException: 404 if the problem doesn't exist, isn't visible to `user`, or has no
@@ -7956,23 +8080,17 @@ export const getWhatifGraphicalWhatifPostUrl = () => {
 /**
  * Set hard evidence, run inference, and return posteriors/policy/utilities in one payload.
  *
- * Reuses a session- (or, without a `session_id`, a per-user-per-problem-) scoped cached pyAgrum
- * engine across calls (see `_engine_cache`'s docstring) -- compiling/rebuilding the underlying
- * diagram is comparatively expensive, evidence propagation is cheap, so the model itself is
- * never resent or rebuilt unless it actually changed.
- *
- * `request.commit=True` additionally ratchets the problem's persisted ideal/nadir open against
- * `utilities` (see `_ratchet_ideal_nadir`) and returns the resulting full bounds on `ideal`/
- * `nadir`; `False` (the default) leaves them untouched and `None` on the response.
+ * Uses a cached engine (see `_engine_cache`), except with `request.solution` and some decision
+ * unpinned, which uses a fresh one where unpinned decisions follow that solution's policy. The
+ * decisions a hypothetical problem assumes are always pinned.
  *
  * Raises:
- *     HTTPException: 404 if the problem doesn't exist, isn't visible to `user`, or has no
- *         `GraphicalModelMetaData`; 404 (via `fetch_interactive_session_with_role_check`) if
- *         `session_id` is given but doesn't exist or isn't owned by `user`; 400 if `evidence`
- *         references a node that isn't one of `network`'s chance nodes, or if pyAgrum itself
- *         rejects the evidence/diagram (`gum.GumException` -- an unknown node/label, or an
- *         unsolvable LIMID); 501 for the open multi-objective-with-decisions utilities case
- *         (see `_compute_utilities`).
+ *     HTTPException: 404 if the problem or session isn't found or visible, or the problem has no
+ *         `GraphicalModelMetaData`, or for an unusable `solution` (see
+ *         `_fetch_solution_policies`); 400 for invalid evidence/decision_evidence/solution, a pin
+ *         contradicting an assumed decision, or a diagram pyAgrum rejects; 501 for several
+ *         objectives with decisions, unless `decision_evidence` pins every decision or
+ *         `solution` is given (see `_compute_utilities`).
  * @summary Whatif
  */
 export const whatifGraphicalWhatifPost = async (
@@ -8015,18 +8133,14 @@ export const getGetPolicyGraphicalProblemIdPolicyPostUrl = (problemId: number) =
 };
 
 /**
- * Decode a *solved* `Problem`'s policy against `evidence` -- no live pyAgrum engine involved.
+ * Decode a solved `Problem`'s policy against `evidence`.
  *
  * Raises:
- *     HTTPException: 404 if the problem doesn't exist, isn't visible to `user`, has no
- *         `GraphicalModelMetaData`, has no `index_map_json` yet (compiled via a path that never
- *         ran `compile_diagram`), or `solution_id` doesn't reference a saved solution belonging
- *         to `problem_id`; 403 if `solution_id` references a solution saved by a different user
- *         and `user` is neither its owner nor an admin/analyst (visibility into `problem_id`
- *         alone is not ownership of one specific saved solution); 400 if neither/both of
- *         `variable_values`/`solution_id` are given, if `evidence` references a node that isn't
- *         a chance node, if `variable_values` is missing a required `z_symbol` entry or has one
- *         in the wrong shape, or if an evidence value isn't one of its own node's states.
+ *     HTTPException: 404 if the problem isn't found or visible, has no graphical metadata or
+ *         `IndexMap`, or `solution_id` isn't a saved solution of `problem_id`; 403 if the saved
+ *         solution belongs to another user and `user` is not an admin/analyst; 400 if not
+ *         exactly one of `variable_values`/`solution_id` is given, or for invalid evidence or
+ *         variable values.
  * @summary Get Policy
  */
 export const getPolicyGraphicalProblemIdPolicyPost = async (
@@ -8077,10 +8191,7 @@ export const getCreateEvidenceSetGraphicalProblemIdEvidenceSetsPostUrl = (proble
  *
  * Raises:
  *     HTTPException: 404 if the problem doesn't exist, isn't visible to `user`, or has no
- *         `GraphicalModelMetaData`; 400 if `evidence` references a node that isn't one of the
- *         network's own chance nodes -- validated eagerly here (not deferred to whatever
- *         eventually loads this set) so a bad save fails immediately, at the point the DM can
- *         still fix it.
+ *         `GraphicalModelMetaData`; 400 for invalid evidence.
  * @summary Create Evidence Set
  */
 export const createEvidenceSetGraphicalProblemIdEvidenceSetsPost = async (
@@ -8129,12 +8240,8 @@ export const getListEvidenceSetsGraphicalProblemIdEvidenceSetsGetUrl = (problemI
 /**
  * Every named evidence set saved against `problem_id`, regardless of which user saved it.
  *
- * Listing is deliberately *not* restricted to the requesting user's own saved sets: a saved
- * evidence set is meant to be a reproducible, shareable bookmark ("a figure corresponds to a
- * scenario id, not a click sequence" -- the plan's own rationale) for anyone with visibility
- * into the underlying problem, the same visibility rule `/structure`/`/whatif` already use --
- * not a private-to-the-creator list. Creation/deletion stay owner-restricted (see those
- * endpoints); reading does not.
+ * Evidence sets are shareable: anyone who can see the problem can read them, while deletion is
+ * restricted to the owner.
  *
  * Raises:
  *     HTTPException: 404 if the problem doesn't exist or isn't visible to `user`.
@@ -8183,12 +8290,9 @@ export const getGetEvidenceSetGraphicalEvidenceSetsEvidenceSetIdGetUrl = (
 };
 
 /**
- * Fetch one named evidence set by its own id -- "shareable by URL", literally.
+ * Fetch one named evidence set by id, so it can be shared by URL.
  *
- * Not scoped under `/{problem_id}/...`: the id alone is the stable, addressable handle the plan's
- * checklist asks for ("given the set's id, another request ... can fetch it and get back the
- * same evidence dict, deterministically"); visibility is still checked against the row's own
- * `problem_id`, so sharing the id with someone who can't see the underlying problem still 404s.
+ * Visibility is checked against the set's problem.
  *
  * Raises:
  *     HTTPException: 404 if no such evidence set exists, or its problem isn't visible to `user`.
@@ -8287,24 +8391,15 @@ export const getSensitivityGraphicalSensitivityPostUrl = () => {
 /**
  * Single-node hard-evidence sweep, one node at a time, holding everything else at `evidence`.
  *
- * Every other chance node (not `target` itself, not already pinned by `evidence` -- re-pinning
- * an already-evidenced node to itself is a degenerate single-value "sweep") is swept over its
- * own states via `_sweep_node`, on the same warm cached engine `/whatif` uses -- "Sigma|states|
- * queries on a warm engine", literally: this endpoint issues exactly that many `setEvidence`/
- * `makeInference` calls, none of which rebuild the diagram. Decision nodes are not swept:
- * hard-evidence sweeping is a "what if we also observed this" question, restricted to chance
- * nodes for the same reason `/whatif`'s own evidence is (see `_validate_chance_evidence`).
+ * Sweeps every chance node other than `target` and the evidenced ones (decision nodes are not
+ * swept), using the cached engine.
  *
  * Raises:
- *     HTTPException: 401 for a guest user (this endpoint can trigger `Sigma|states|` expensive
- *         inference calls much like `/compile`'s own concern); 404 if the problem doesn't exist,
- *         isn't visible to `user`, or has no `GraphicalModelMetaData`; 400 if `evidence`
- *         references a non-chance node, if `target` isn't a chance/decision/objective node of
- *         this diagram, if `target` is a chance/decision node and `target_state` is
- *         missing/invalid, if `nodes` references a node that isn't a chance node, or if the
- *         number of nodes to sweep (after `nodes` filtering, if given) exceeds
- *         `_MAX_SENSITIVITY_SWEEP_NODES`; 501 if `target` is an objective and the diagram has
- *         more than one objective and at least one decision (see `_compute_utilities`).
+ *     HTTPException: 401 for a guest user; 404 if the problem isn't found or visible, or has no
+ *         `GraphicalModelMetaData`; 400 for invalid evidence, `target`, `target_state` or
+ *         `nodes`, or too many nodes to sweep; 501 if `target` is an objective of a diagram
+ *         with several objectives and a decision (see `_compute_utilities`), or the problem
+ *         assumes a decision.
  * @summary Sensitivity
  */
 export const sensitivityGraphicalSensitivityPost = async (
@@ -8350,33 +8445,18 @@ export const getValueOfInformationGraphicalVoiPostUrl = () => {
 };
 
 /**
- * Value of information for observing `node` before deciding, framed as EU gain (Phase E).
+ * Value of information for observing `node` before deciding, as a gain in expected utility.
  *
- * `VoI(node) = E[MEU | observe node before deciding] - MEU(no observation)` -- the weighted
- * (by `node`'s own current marginal) average of `target`'s value under each hard-evidence value
- * of `node` in turn, minus `target`'s value under `evidence` alone. Implemented as a thin
- * transform over `_sweep_node` -- the identical "set evidence, run inference, read a scalar"
- * primitive `/sensitivity` uses, reduced to one weighted scalar instead of reported per-state;
- * this held up cleanly (no divergence from the shared primitive needed), matching the plan's own
- * "if it doesn't hold up cleanly, document why and diverge" framing for the case where it does.
- *
- * **Only meaningful for a diagram with at least one decision -- rejected with 400 otherwise.**
- * "EU gain from observing before deciding" (the plan's own framing) presupposes something being
- * decided; a no-decision diagram has nothing whose policy could change in response to the
- * observation, so VoI doesn't type-check for it, not merely evaluate to zero. Returning `0.0` in
- * that case would be a well-formed-looking number for a question that doesn't apply, silently
- * masking the distinction between "meaningfully zero" and "not applicable" -- the explicit
- * 4xx makes the scope cut visible rather than accidental (matching the plan's own precedent, see
- * `DiagramConstraint`'s `kind == "tail"`/multi-objective-with-decision 501, for picking a
- * documented rejection over a guess).
+ * `VoI(node) = sum_s P(node=s) * value(node=s) - value()`, computed with `_sweep_node`. Only
+ * defined for diagrams with at least one decision; otherwise there is nothing the observation
+ * could change, so the request is rejected rather than returning zero.
  *
  * Raises:
- *     HTTPException: 404 if the problem doesn't exist, isn't visible to `user`, or has no
- *         `GraphicalModelMetaData`; 400 if the diagram has no decisions, if `target` isn't an
- *         `ObjectiveNode.symbol`, if `node` isn't a chance node, if `node` is already pinned by
- *         `evidence`, or if `evidence` itself references a non-chance node; 501 if the diagram
- *         has more than one objective and at least one decision (see `_compute_utilities`,
- *         reached via `_resolve_target_value`).
+ *     HTTPException: 404 if the problem isn't found or visible, or has no
+ *         `GraphicalModelMetaData`; 400 if the diagram has no decisions, or for an invalid
+ *         `target`, `node` (or one already in `evidence`), or evidence; 501 for several
+ *         objectives with a decision (see `_compute_utilities`), or if the problem assumes a
+ *         decision.
  * @summary Value Of Information
  */
 export const valueOfInformationGraphicalVoiPost = async (
@@ -8424,37 +8504,14 @@ export const getCompileDemoIrrigationModelGraphicalDemoIrrigationPostUrl = () =>
 /**
  * Compile the canned irrigation demo diagram (`desdeo/problem/graphical/demo.py`).
  *
- * Rather than have the webui hand-construct a `DiscreteNetwork`/`DecisionAnnotation` JSON payload
- * itself (a large, easy-to-get-subtly-wrong duplication of a Python-side model's CPT/utility
- * tensors purely for a demo dialog), this endpoint builds the same canned model server-side and
- * delegates straight to `compile_graphical_model` -- an ordinary Python function call, not a
- * second HTTP round trip -- so persistence stays exactly `/compile`'s own atomic-commit path, not
- * a parallel copy of it. The webui calls this lazily, once, the first time the CUMULUS demo
- * dialog opens, and caches the resulting `problem_id` client-side (see `CUMULUS/+page.svelte`)
- * rather than recompiling on every open.
+ * Builds the model server-side and delegates to `compile_graphical_model`.
  *
- * **Idempotent by default.** Every call used to persist a brand-new ~127 KB `Problem` +
- * metadata into the caller's own problem list unconditionally -- a review pass caught this
- * meaning every browser tab, every reload without a live `sessionStorage` cache, and every
- * "Recompile demo" click accumulated a fresh, never-cleaned-up
- * `"CUMULUS network demo (irrigation)"` entry. Unless `request.force` is set, this now looks for
- * a `ProblemDB` already owned by `user` with that exact name, *and* carrying a
- * `GraphicalModelMetaData` row whose own network actually matches `build_irrigation_demo()`'s
- * (see `_demo_irrigation_metadata_matches`) -- name alone isn't enough: a review pass caught a
- * same-named problem created through the ordinary `/problem/add` path (or a different diagram
- * saved under this exact name) getting silently adopted as if it were the demo. A name match
- * that doesn't also qualify falls through to a fresh compile rather than being adopted. The
- * lookup itself only inspects the single most-recently-created row with this name, not the
- * most-recent *qualifying* one -- so a higher-id, same-named-but-unrelated row (e.g. from
- * `/problem/add`) shadows an older genuine demo copy and forces a redundant fresh compile. This
- * self-heals after that one extra compile, though: the fresh copy is itself the new
- * highest-id row with this name, so it qualifies on every call after. `force=True` bypasses
- * this lookup entirely and always compiles fresh, for the webui's own "Recompile demo" button.
+ * Unless `request.force` is set, returns the caller's most recent problem with the demo name if
+ * its network matches the demo (see `_demo_irrigation_metadata_matches`), and compiles a new
+ * copy otherwise.
  *
  * Raises:
- *     HTTPException: whatever `compile_graphical_model` itself raises (401 for a guest user; a
- *         400 here would mean a bug in `build_irrigation_demo`, since its own `validate_against`
- *         call already checks what `/compile` would otherwise catch on a bad annotation).
+ *     HTTPException: whatever `compile_graphical_model` raises (e.g. 401 for a guest user).
  * @summary Compile Demo Irrigation Model
  */
 export const compileDemoIrrigationModelGraphicalDemoIrrigationPost = async (
@@ -8502,33 +8559,13 @@ export const getSolveGraphicalModelGraphicalProblemIdSolvePostUrl = (problemId: 
 /**
  * Solve a compiled diagram's `Problem` for one objective, via `guess_best_solver`.
  *
- * Minimal, single-objective solve -- not a general-purpose solve API (this repo's method
- * routers, e.g. `cumulus.py`, already own that job for their own problems). Exists so a
- * `decisionMode: 'solver'` UI (the CUMULUS demo dialog, in particular) can drive
- * `POST /graphical/{problem_id}/policy` off a genuinely solved policy instead of a hardcoded demo
- * constant. Calls the general `guess_best_solver`/`find_compatible_solvers` machinery rather than
- * hardcoding `GurobipySolver` directly -- Phase 4's own design decision ("targets gurobipy only,
- * for now") means `guess_best_solver` resolves to `GurobipySolver` for every diagram
- * `compile_diagram` can produce today regardless, but this keeps the endpoint correct unchanged
- * if a second backend is added later (see the plan's own Phase 4 rationale).
- *
- * Only solves *compiled graphical diagrams* -- like every sibling `/graphical/{problem_id}/*`
- * endpoint, `_fetch_graphical_metadata` is called first, so an ordinary (non-graphical)
- * `ProblemDB` the user happens to be able to see is rejected with a 404 rather than solved. A
- * review pass caught an earlier version skipping that check, which doubled this endpoint as an
- * accidental general-purpose solve API for arbitrary visible problems -- with no size/cost bound
- * analogous to `/compile`'s own server-side cluster cap, and no defence against a problem whose
- * `optimal_variables` doesn't fit `SolveResponse`'s declared shape (e.g. a multi-dimensional
- * `TensorVariable`, which a compiled diagram's own `Problem` never has, but an arbitrary ordinary
- * problem might).
+ * A minimal single-objective solve, so the policy of a solved problem can be shown via
+ * `/policy`. Only compiled graphical diagrams are accepted.
  *
  * Raises:
- *     HTTPException: 404 if the problem doesn't exist, isn't visible to `user`, or has no
- *         `GraphicalModelMetaData` (i.e. isn't a compiled graphical diagram); 400 if
- *         `objective_symbol` isn't one of the problem's own objectives, or if no compatible
- *         solver exists for it; 500 if constructing/running the solver itself raises, or if it
- *         reports failure (`SolverResults.success` is `False`) -- surfaced with the solver's own
- *         message rather than an opaque, unhandled exception escaping as a raw 500.
+ *     HTTPException: 404 if the problem isn't found or visible, or isn't a compiled graphical
+ *         diagram; 400 for an unknown `objective_symbol` or if no compatible solver exists;
+ *         500 if the solver raises or reports failure.
  * @summary Solve Graphical Model
  */
 export const solveGraphicalModelGraphicalProblemIdSolvePost = async (

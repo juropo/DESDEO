@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+	assumableEvidence,
 	decisionsBlockingUtilities,
 	describeDecisions,
 	filterChanceEvidence,
@@ -240,5 +241,61 @@ describe('describeDecisions', () => {
 	it('does not list a parent resolved by evidence as a dependency', () => {
 		const [, drill] = describeDecisions(OIL_MODEL, { test_result: 'CS' }, undefined);
 		expect(drill).toMatchObject({ source: 'unresolved', dependsOn: [] });
+	});
+});
+
+describe('assumableEvidence', () => {
+	const model: NetworkModel = {
+		nodes: [
+			{ id: 'structure', label: 'structure', kind: 'chance', states: ['dry', 'soaking'] },
+			{ id: 'test_result', label: 'test_result', kind: 'chance', states: ['NS', 'CS'] },
+			{ id: 'drill', label: 'Drill', kind: 'decision', states: ['yes', 'no'] }
+		],
+		edges: [
+			{ id: 'structure->test_result', source: 'structure', target: 'test_result' },
+			{ id: 'test_result->drill', source: 'test_result', target: 'drill' }
+		]
+	};
+
+	it('assumes parentless chance nodes and, in manual mode, decisions', () => {
+		const result = assumableEvidence(model, { structure: 'soaking', drill: 'yes' }, 'manual');
+		expect(result).toEqual({
+			assumptions: { chance: { structure: 'soaking' }, decisions: { drill: 'yes' } },
+			blocking: [],
+			conflicts: []
+		});
+	});
+
+	it('reports chance nodes with parents as blocking', () => {
+		const result = assumableEvidence(model, { test_result: 'NS', structure: 'dry' }, 'manual');
+		expect(result.blocking).toEqual(['test_result']);
+		expect(result.assumptions.chance).toEqual({ structure: 'dry' });
+	});
+
+	it('ignores decision picks in solver mode', () => {
+		expect(assumableEvidence(model, { drill: 'yes' }, 'solver').assumptions.decisions).toEqual({});
+	});
+
+	it('leaves out what the model already assumes', () => {
+		const hypothetical = {
+			...model,
+			assumptions: { chance: { structure: 'soaking' }, decisions: { drill: 'yes' } }
+		};
+		const result = assumableEvidence(
+			hypothetical,
+			{ structure: 'soaking', drill: 'yes' },
+			'manual'
+		);
+		expect(result.assumptions).toEqual({ chance: {}, decisions: {} });
+	});
+
+	it('reports evidence contradicting an assumption as a conflict', () => {
+		const hypothetical = {
+			...model,
+			assumptions: { chance: { structure: 'soaking' }, decisions: { drill: 'yes' } }
+		};
+		const result = assumableEvidence(hypothetical, { structure: 'dry', drill: 'no' }, 'manual');
+		expect(result.conflicts).toEqual(['structure = soaking', 'drill = yes']);
+		expect(result.assumptions).toEqual({ chance: {}, decisions: {} });
 	});
 });

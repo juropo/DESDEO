@@ -120,7 +120,11 @@ def test_oil_wildcatter_rjt_and_compile_succeeds():
     rjt = build_rooted_junction_tree(network, annotation)
     problem, index_map = compile_diagram(network, annotation, rjt=rjt)
 
-    assert {o.symbol for o in problem.objectives} == {"investment", "oil_produced", "profit"}
+    assert {o.symbol: o.unit for o in problem.objectives} == {
+        "investment": "USD",
+        "oil_produced": "barrels",
+        "profit": "USD",
+    }
     assert set(index_map.decisions) == {"test", "drill"}
 
 
@@ -416,7 +420,8 @@ def test_objectives_conflict_three_ways():
         oil_result.optimal_objectives["investment"] == pytest.approx(80_000.0, abs=1e-6)
     )
     oil_policies = read_policy_from_solution(
-        index_map, {sym: oil_result.optimal_variables[sym] for sym in (dm.z_symbol for dm in index_map.decisions.values())}
+        index_map,
+        {sym: oil_result.optimal_variables[sym] for sym in (dm.z_symbol for dm in index_map.decisions.values())},
     )
     oil_test_policy = oil_policies["test"]
     oil_test_state = oil_test_policy.states[oil_test_policy.policy[0]]

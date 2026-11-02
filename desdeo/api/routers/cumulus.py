@@ -31,6 +31,7 @@ from desdeo.api.models.cumulus import (
     CumulusDeleteSaveResponse,
     CumulusFinalizeRequest,
     CumulusFinalizeResponse,
+    CumulusHypotheticalRequest,
     CumulusInitializationRequest,
     CumulusInitializationResponse,
     CumulusIntermediateSolutionResponse,
@@ -50,6 +51,7 @@ from desdeo.api.models.generic_states import SolutionReference, SolutionReferenc
 from desdeo.api.models.problem import ConstraintDB, ProblemDB
 from desdeo.api.models.scenario import ScenarioModelDB
 from desdeo.api.models.state import CumulusClassificationState
+from desdeo.api.routers.graphical import _fetch_graphical_metadata
 from desdeo.api.routers.problem import check_solver
 from desdeo.api.routers.user_authentication import get_current_user
 from desdeo.mcdm.cumulus import (
@@ -61,6 +63,12 @@ from desdeo.mcdm.cumulus import (
 )
 from desdeo.mcdm.reference_point_method import rpm_intermediate_solutions
 from desdeo.problem import PolarsEvaluator, Problem, ScenarioModel
+from desdeo.problem.graphical import (
+    DecisionAnnotation,
+    DiagramAssumptions,
+    DiscreteNetwork,
+    compile_with_assumptions,
+)
 from desdeo.problem.json_parser import FormatEnum, MathParser
 from desdeo.problem.schema import Constraint, ConstraintTypeEnum, TensorVariable
 from desdeo.tools import SolverResults, guess_best_solver, is_heuristic_solver
@@ -368,7 +376,7 @@ def initialize(
         # result, as `_build_combined_problem_and_initialize` does. The estimate depends only on
         # the problem, so it is persisted regardless of who owns the problem.
         try:
-            estimated_ideal, estimated_nadir = payoff_table_method(problem, solver)
+            estimated_ideal, estimated_nadir = payoff_table_method(problem, solver, require_success=True)
         except Exception:  # noqa: S110
             pass  # proceed without ideal/nadir -- generate_starting_point raises its own clean error
         else:
@@ -1414,6 +1422,108 @@ def modify_problem(
         scenario_model_id=mod_scenario_model_id,
         is_ready=False,
         current_solution_feasible=current_solution_feasible,
+    )
+
+
+@router.post("/hypothetical")
+def create_hypothetical(
+    request: CumulusHypotheticalRequest,
+    background_tasks: BackgroundTasks,
+    context: Annotated[SessionContext, Depends(SessionContextGuard(require=[ContextField.PROBLEM]).post)],
+) -> CumulusModificationResponse:
+    """Create a new problem from a graphical-model problem under hypothetical assumptions.
+
+    The new problem is recompiled from the conditioned diagram and gets its own copy of the
+    graphical metadata; the original problem is left as it is. Like a modification, it stays
+    temporary until the background checks confirm it is feasible and set its ideal and nadir.
+    Poll `/modify-problem/status/{state_id}` for the outcome.
+
+    Raises:
+        HTTPException: 404 if the problem has no graphical model; 400 if the assumptions are
+            invalid, add nothing new, or contradict what the problem already assumes.
+    """
+    db_session = context.db_session
+    problem_db = context.problem_db
+    parent_state = context.parent_state
+
+    meta = _fetch_graphical_metadata(problem_db.id, db_session)
+    network = DiscreteNetwork.model_validate_json(meta.network_json)
+    annotation = DecisionAnnotation.model_validate_json(meta.annotation_json)
+    existing = (
+        DiagramAssumptions.model_validate_json(meta.assumptions_json) if meta.assumptions_json else DiagramAssumptions()
+    )
+
+    try:
+        assumptions = existing.merged_with(request.assumptions)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+    if assumptions == existing:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The assumptions add nothing to what this problem already assumes.",
+        )
+    try:
+        # Re-conditioning on `existing.chance` is a no-op; its decisions still need fixing.
+        problem, index_map, rjt, conditioned = compile_with_assumptions(network, annotation, assumptions)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+
+    problem = problem.model_copy(
+        update={
+            "name": f"{problem_db.name} | {request.assumptions.label()}",
+            "description": problem_db.description,
+        }
+    )
+    new_problem_db = ProblemDB.from_problem(problem, user=context.user)
+    new_problem_db.is_temporary = True
+    new_problem_db.parent_problem_id = problem_db.id
+    db_session.add(new_problem_db)
+    db_session.commit()
+    db_session.refresh(new_problem_db)
+
+    copy_problem_metadata(problem_db, new_problem_db, db_session)
+    db_session.commit()
+    new_meta = _fetch_graphical_metadata(new_problem_db.id, db_session)
+    new_meta.network_json = conditioned.model_dump_json()
+    new_meta.rjt_json = rjt.model_dump_json()
+    new_meta.index_map_json = index_map.model_dump_json()
+    new_meta.assumptions_json = assumptions.model_dump_json()
+    db_session.add(new_meta)
+
+    state = StateDB.create(
+        database_session=db_session,
+        problem_id=new_problem_db.id,
+        session_id=context.interactive_session.id if context.interactive_session is not None else None,
+        parent_id=parent_state.id if parent_state is not None else None,
+        state=CumulusModificationState(
+            problem_id=new_problem_db.id,
+            original_problem_id=problem_db.id,
+            is_ready=False,
+            # The current solutions belong to another problem, so they prove nothing.
+            current_solution_feasible=False,
+        ),
+    )
+    db_session.add(state)
+    db_session.commit()
+    db_session.refresh(state)
+
+    # Probe the assumed decisions; the payoff table catches anything else that fails.
+    assumed_decision_symbols = [c.symbol for c in problem.constraints or [] if c.symbol.startswith("assume_")]
+    background_tasks.add_task(
+        _run_modification_checks_background,
+        new_problem_db.id,
+        state.base_state.id,
+        check_solver(problem_db=problem_db),
+        assumed_decision_symbols,
+        feasibility_witnessed=False,
+    )
+
+    return CumulusModificationResponse(
+        state_id=state.id,
+        problem_id=new_problem_db.id,
+        original_problem_id=problem_db.id,
+        is_ready=False,
+        current_solution_feasible=False,
     )
 
 

@@ -13,8 +13,9 @@
 	 */
 	import { untrack, type Snippet } from 'svelte';
 	import NetworkView from './NetworkView.svelte';
-	import { createWhatIfRunner, fetchCommitBounds, EVIDENCE_DEBOUNCE_MS } from './whatif';
+	import { createWhatIfRunner, EVIDENCE_DEBOUNCE_MS } from './whatif';
 	import {
+		assumableEvidence,
 		decisionsBlockingUtilities,
 		filterChanceEvidence,
 		filterDecisionEvidence
@@ -23,6 +24,7 @@
 	import { defaultFetchEvidenceSets, defaultSaveEvidenceSet } from './evidence-sets';
 	import type {
 		DecisionMode,
+		NetworkAssumptions,
 		NetworkEvidence,
 		NetworkEvidenceSet,
 		NetworkModel,
@@ -46,18 +48,17 @@
 	/**
 	 * Calls `POST /graphical/whatif` and maps the response onto `WhatIfResult`. The backend keys
 	 * `utilities`/`utility_std_devs` by objective symbol, while objective node ids are
-	 * `util_<symbol>`, so the prefix is added here. `ideal`/`nadir` stay keyed by symbol.
+	 * `util_<symbol>`, so the prefix is added here.
 	 *
 	 * `evidence` must already be filtered to chance nodes (`filterChanceEvidence`), and
 	 * `decisionEvidence` to decision nodes (`filterDecisionEvidence`); the endpoint rejects
-	 * anything else in either field. `commit` opts into the backend's ideal/nadir ratchet.
+	 * anything else in either field.
 	 * `solution`: a solved solution that unpinned decisions follow.
 	 */
 	async function defaultFetchWhatIf(
 		modelId: string | number,
 		evidence: NetworkEvidence,
 		signal?: AbortSignal,
-		commit = false,
 		decisionEvidence: NetworkEvidence = {},
 		solution: NetworkSolutionRef | null = null
 	): Promise<WhatIfResult> {
@@ -70,8 +71,7 @@
 				decision_evidence: decisionEvidence,
 				solution: solution
 					? { state_id: solution.stateId, solution_index: solution.solutionIndex }
-					: null,
-				commit
+					: null
 			}),
 			signal
 		});
@@ -88,8 +88,6 @@
 			policy?: NetworkPolicy;
 			utilities?: NetworkUtilities;
 			utility_std_devs?: NetworkUtilityStdDevs;
-			ideal?: Record<string, number> | null;
-			nadir?: Record<string, number> | null;
 			off_policy_decisions?: string[];
 			decision_posteriors?: NetworkPosteriors;
 		};
@@ -104,8 +102,6 @@
 			policy: result.policy,
 			utilities: withUtilPrefix(result.utilities),
 			utilityStdDevs: withUtilPrefix(result.utility_std_devs),
-			ideal: result.ideal,
-			nadir: result.nadir,
 			offPolicyDecisions: result.off_policy_decisions,
 			decisionPosteriors: result.decision_posteriors
 		};
@@ -119,8 +115,6 @@
 			modelId: string | number,
 			evidence: NetworkEvidence,
 			signal?: AbortSignal,
-			/** Opt into the backend's ideal/nadir ratchet. */
-			commit?: boolean,
 			/** Pinned decision states (`decisionMode: 'manual'` only), filtered via
 			 *  `filterDecisionEvidence`. */
 			decisionEvidence?: NetworkEvidence,
@@ -161,19 +155,23 @@
 		 *  list `utilities`. Fired with an empty result when `decisionsBlockingUtilities` skips
 		 *  the request. */
 		onWhatIfResult?: (result: WhatIfResult) => void;
-		/** Fired when the DM commits evidence, or selects a saved evidence set as the baseline.
-		 *
-		 *  `bounds`: the problem's ideal/nadir (keyed by objective symbol) after the backend's
-		 *  ratchet. Absent if the ratchet request failed (the error is shown in the banner) or when
-		 *  loading a saved set, which doesn't run the ratchet.
-		 *
-		 *  `modelId`: the id the bounds were fetched for, so the host can ignore them if its
-		 *  problem has changed in the meantime. */
-		onCommitEvidence?: (
-			evidence: NetworkEvidence,
-			bounds?: { ideal?: Record<string, number>; nadir?: Record<string, number> },
-			modelId?: string | number
-		) => void;
+		/** Fired when the DM commits evidence as the comparison baseline, or selects a saved
+		 *  evidence set as the baseline. Local to the panel; nothing is persisted. */
+		onCommitEvidence?: (evidence: NetworkEvidence) => void;
+		/** Fired when the DM asks to explore the current evidence as a hypothetical problem. The
+		 *  button is only shown when this is set. */
+		onExploreAssumptions?: (assumptions: NetworkAssumptions) => void;
+		/** Label of the explore button. */
+		exploreLabel?: string;
+		/** Disables the explore button while the host is creating the hypothetical. */
+		exploring?: boolean;
+		/** Why the last explore attempt failed, shown next to the button. */
+		exploreError?: string | null;
+		/** Passed to `<NetworkView>`: host content for a resizable sidebar, above the node table. */
+		aside?: Snippet;
+		asideAutoSaveId?: string;
+		/** Passed to `<NetworkView>`; also hides the evidence-set and explore controls. */
+		readonly?: boolean;
 		/** Fired with the loaded `NetworkModel` after a successful structure fetch. */
 		onStructureLoad?: (model: NetworkModel) => void;
 		/** Fired when the structure fetch fails, e.g. so a host can drop a stale cached `modelId`. */
@@ -199,6 +197,13 @@
 		onNodeHover,
 		onWhatIfResult,
 		onCommitEvidence,
+		onExploreAssumptions,
+		exploreLabel = 'Explore these assumptions',
+		exploring = false,
+		exploreError = null,
+		aside,
+		asideAutoSaveId,
+		readonly = false,
 		onStructureLoad,
 		onStructureError
 	}: Props = $props();
@@ -234,8 +239,6 @@
 	let selectedBaselineId = $state('');
 	// Discards out-of-order responses in `loadEvidenceSetAsBaseline`.
 	let baselineRequestId = 0;
-	// Discards out-of-order ratchet responses in `handleCommitEvidence`.
-	let commitRequestId = 0;
 
 	// Bumped on every `loadStructure` call, so responses for a superseded model are discarded.
 	let structureRequestId = 0;
@@ -325,16 +328,18 @@
 			if (requestId === structureRequestId) loading = false;
 		}
 		// Load saved evidence sets in parallel with the prior fetch below; failure is non-fatal.
-		void (async () => {
-			try {
-				const sets = await fetchEvidenceSets(id);
-				if (requestId === structureRequestId) evidenceSets = sets;
-			} catch (e) {
-				if (requestId === structureRequestId) {
-					evidenceSetsError = e instanceof Error ? e.message : 'Failed to load saved evidence sets';
+		if (!readonly)
+			void (async () => {
+				try {
+					const sets = await fetchEvidenceSets(id);
+					if (requestId === structureRequestId) evidenceSets = sets;
+				} catch (e) {
+					if (requestId === structureRequestId) {
+						evidenceSetsError =
+							e instanceof Error ? e.message : 'Failed to load saved evidence sets';
+					}
 				}
-			}
-		})();
+			})();
 		await seedPrior(requestId, priorFetcher);
 	}
 
@@ -442,14 +447,7 @@
 		decisionEvidenceForRequest: NetworkEvidence = {}
 	): Promise<WhatIfResult> {
 		const request = () =>
-			fetchWhatIf(
-				modelId,
-				evidenceForRequest,
-				signal,
-				false,
-				decisionEvidenceForRequest,
-				requestSolution
-			);
+			fetchWhatIf(modelId, evidenceForRequest, signal, decisionEvidenceForRequest, requestSolution);
 		if (!policySource) return request();
 		const [result, solvedPolicy] = await Promise.all([
 			request(),
@@ -490,40 +488,36 @@
 		committedPosteriors = posteriors;
 		// The baseline is no longer a saved set.
 		selectedBaselineId = '';
-		// Re-run the evidence with `commit: true` to trigger the backend's ideal/nadir ratchet, then
-		// call `onCommitEvidence` with the resulting bounds. Chance evidence and pinned decisions
-		// (in 'manual' mode) go through separate fields, same split as `handleEvidenceChange`.
-		const chanceEvidence = model ? filterChanceEvidence(model, committed) : committed;
-		const decisionEvidence =
-			model && decisionMode === 'manual' ? filterDecisionEvidence(model, committed) : {};
-		// Captured now, since `modelId` may change before the request resolves.
-		const commitModelId = modelId;
-		const commitSolution = requestSolution;
-		// Guard against a newer commit or a model change.
-		const requestId = structureRequestId;
-		const ownRequestId = ++commitRequestId;
-		if (model && decisionsBlockingUtilities(model, decisionEvidence, !!commitSolution).length > 0) {
-			// No utilities to ratchet the bounds with (the request would 501).
-			onCommitEvidence?.(committed, undefined, commitModelId);
-			return;
-		}
-		void fetchCommitBounds(
-			fetchWhatIf,
-			commitModelId,
-			chanceEvidence,
-			decisionEvidence,
-			commitSolution
-		).then(({ bounds, error }) => {
-			if (requestId !== structureRequestId || ownRequestId !== commitRequestId) return;
-			if (error) {
-				whatIfError = error;
-				onCommitEvidence?.(committed, undefined, commitModelId);
-				return;
-			}
-			whatIfError = null;
-			onCommitEvidence?.(committed, bounds, commitModelId);
-		});
+		onCommitEvidence?.(committed);
 	}
+
+	let assumable = $derived(model ? assumableEvidence(model, evidence, decisionMode) : null);
+	let assumedLabel = $derived.by(() => {
+		const assumed = model?.assumptions;
+		if (!assumed) return '';
+		return Object.entries({ ...assumed.chance, ...assumed.decisions })
+			.map(([id, state]) => `${id} = ${state}`)
+			.join(', ');
+	});
+	let exploreBlockedReason = $derived.by(() => {
+		if (!assumable) return 'The network is still loading.';
+		if (assumable.conflicts.length > 0) {
+			return `This problem already assumes ${assumable.conflicts.join(', ')}.`;
+		}
+		if (assumable.blocking.length > 0) {
+			return (
+				`Only decisions and chance nodes without parents can be assumed. Clear the evidence on ` +
+				`${assumable.blocking.join(', ')} first.`
+			);
+		}
+		const { chance, decisions } = assumable.assumptions;
+		if (Object.keys(chance).length === 0 && Object.keys(decisions).length === 0) {
+			return decisionMode === 'manual'
+				? 'Set evidence on a chance node without parents, or pin a decision, to assume it.'
+				: 'Set evidence on a chance node without parents to assume it.';
+		}
+		return null;
+	});
 
 	/** Save the current chance evidence as a named set. No-ops without a name or evidence. */
 	let chanceEvidenceToSave = $derived(model ? filterChanceEvidence(model, evidence) : {});
@@ -544,8 +538,7 @@
 
 	/**
 	 * Loads a saved evidence set as the comparison baseline, like a commit but without changing
-	 * the live evidence. Unlike `handleCommitEvidence`, this doesn't trigger the ideal/nadir
-	 * ratchet. Responses are discarded if the model or the selection changed meanwhile.
+	 * the live evidence. Responses are discarded if the model or the selection changed meanwhile.
 	 */
 	async function loadEvidenceSetAsBaseline(set: NetworkEvidenceSet) {
 		if (!model) return;
@@ -563,14 +556,13 @@
 				loadModelId,
 				chanceEvidence,
 				undefined,
-				false,
 				decisionEvidence,
 				requestSolution
 			);
 			if (requestId !== structureRequestId || ownRequestId !== baselineRequestId) return;
 			committedEvidence = chanceEvidence;
 			committedPosteriors = result.posteriors;
-			onCommitEvidence?.(chanceEvidence, undefined, loadModelId);
+			onCommitEvidence?.(chanceEvidence);
 		} catch (e) {
 			if (requestId !== structureRequestId || ownRequestId !== baselineRequestId) return;
 			evidenceSetsError =
@@ -601,50 +593,74 @@
 				</div>
 			{/if}
 			<!-- Named evidence sets -->
-			<div class="flex flex-wrap items-center gap-2 text-xs">
-				<label class="text-muted-foreground flex items-center gap-1">
-					Baseline:
-					<select
-						class="border-border bg-background rounded-md border px-1.5 py-0.5"
-						bind:value={selectedBaselineId}
-						onchange={(e) => {
-							const raw = (e.currentTarget as HTMLSelectElement).value;
-							if (raw === '') {
-								// Back to the prior as the baseline.
-								committedEvidence = {};
-								committedPosteriors = undefined;
-								return;
-							}
-							const set = evidenceSets.find((s) => String(s.id) === raw);
-							if (set) void loadEvidenceSetAsBaseline(set);
-						}}
+			{#if !readonly}
+				<div class="flex flex-wrap items-center gap-2 text-xs">
+					<label class="text-muted-foreground flex items-center gap-1">
+						Baseline:
+						<select
+							class="border-border bg-background rounded-md border px-1.5 py-0.5"
+							bind:value={selectedBaselineId}
+							onchange={(e) => {
+								const raw = (e.currentTarget as HTMLSelectElement).value;
+								if (raw === '') {
+									// Back to the prior as the baseline.
+									committedEvidence = {};
+									committedPosteriors = undefined;
+									return;
+								}
+								const set = evidenceSets.find((s) => String(s.id) === raw);
+								if (set) void loadEvidenceSetAsBaseline(set);
+							}}
+						>
+							<option value="">Prior (default)</option>
+							{#each evidenceSets as set (set.id)}
+								<option value={set.id}>{set.name}</option>
+							{/each}
+						</select>
+					</label>
+					<input
+						class="border-border bg-background w-40 rounded-md border px-1.5 py-0.5"
+						type="text"
+						placeholder="Name this evidence set…"
+						bind:value={newEvidenceSetName}
+					/>
+					<button
+						type="button"
+						class="border-border rounded-md border px-2 py-0.5 disabled:opacity-50"
+						disabled={savingEvidenceSet ||
+							!newEvidenceSetName.trim() ||
+							Object.keys(chanceEvidenceToSave).length === 0}
+						onclick={handleSaveEvidenceSet}
 					>
-						<option value="">Prior (default)</option>
-						{#each evidenceSets as set (set.id)}
-							<option value={set.id}>{set.name}</option>
-						{/each}
-					</select>
-				</label>
-				<input
-					class="border-border bg-background w-40 rounded-md border px-1.5 py-0.5"
-					type="text"
-					placeholder="Name this evidence set…"
-					bind:value={newEvidenceSetName}
-				/>
-				<button
-					type="button"
-					class="border-border rounded-md border px-2 py-0.5 disabled:opacity-50"
-					disabled={savingEvidenceSet ||
-						!newEvidenceSetName.trim() ||
-						Object.keys(chanceEvidenceToSave).length === 0}
-					onclick={handleSaveEvidenceSet}
-				>
-					Save current evidence
-				</button>
-				{#if evidenceSetsError}
-					<span class="text-destructive">{evidenceSetsError}</span>
-				{/if}
-			</div>
+						Save current evidence
+					</button>
+					{#if evidenceSetsError}
+						<span class="text-destructive">{evidenceSetsError}</span>
+					{/if}
+				</div>
+			{/if}
+			{#if assumedLabel || onExploreAssumptions}
+				<div class="flex flex-wrap items-center gap-2 text-xs">
+					{#if assumedLabel}
+						<span class="text-muted-foreground">Assumes: {assumedLabel}</span>
+					{/if}
+					{#if onExploreAssumptions && !readonly}
+						<button
+							type="button"
+							class="border-border rounded-md border px-2 py-0.5 disabled:opacity-50"
+							disabled={exploring || exploreBlockedReason !== null}
+							title={exploreBlockedReason ??
+								'Creates a new problem under these assumptions and switches to it.'}
+							onclick={() => assumable && onExploreAssumptions(assumable.assumptions)}
+						>
+							{exploring ? 'Creating…' : exploreLabel}
+						</button>
+						{#if exploreError}
+							<span class="text-destructive">{exploreError}</span>
+						{/if}
+					{/if}
+				</div>
+			{/if}
 			<!-- Keyed on `modelId` so hover/selection and node positions reset with the model. -->
 			{#key modelId}
 				<NetworkView
@@ -667,6 +683,9 @@
 					{onNodeHover}
 					onEvidenceChange={handleEvidenceChange}
 					onCommitEvidence={handleCommitEvidence}
+					{aside}
+					{asideAutoSaveId}
+					{readonly}
 				/>
 			{/key}
 		</div>

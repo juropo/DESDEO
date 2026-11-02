@@ -46,6 +46,14 @@ export interface NetworkModel {
 	/** Absent (or missing entries for some nodes) triggers an automatic one-off elk layout;
 	 *  see `computeElkLayout` in `layout.ts`. */
 	layout?: NetworkLayoutModel;
+	/** What a hypothetical problem assumes; empty (or absent) otherwise. */
+	assumptions?: NetworkAssumptions;
+}
+
+/** Assumed states of a hypothetical problem's parentless chance nodes and decisions. */
+export interface NetworkAssumptions {
+	chance: Record<string, string>;
+	decisions: Record<string, string>;
 }
 
 /** Shapes a method UI or `<NetworkPanel>` binds against when embedding a network. */
@@ -82,10 +90,6 @@ export interface WhatIfResult {
 	policy?: NetworkPolicy;
 	utilities?: NetworkUtilities;
 	utilityStdDevs?: NetworkUtilityStdDevs;
-	/** The problem's ideal/nadir, keyed by objective symbol (not node id). Only set for
-	 *  `commit: true` requests. */
-	ideal?: Record<string, number> | null;
-	nadir?: Record<string, number> | null;
 	/** Decision ids the pins/evidence moved off the followed solution's path. Utilities are empty
 	 *  when this is non-empty. */
 	offPolicyDecisions?: string[];

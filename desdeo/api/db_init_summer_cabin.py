@@ -104,6 +104,13 @@ def build_summer_cabin_problem():
     )
 
 
+OIL_WILDCATTER_DESCRIPTION_PARTS = [
+    DescriptionPart(text="Expected outcomes of the chosen policy:"),
+    DescriptionPart(label="  Profit", symbol="profit", format_spec=",.0f", suffix=" $"),
+    DescriptionPart(label="  Investment cost", symbol="investment", format_spec=",.0f", suffix=" $"),
+    DescriptionPart(label="  Oil produced", symbol="oil_produced", format_spec=",.0f", suffix=" barrels"),
+]
+
 DESCRIPTION_PARTS = [
     DescriptionPart(text="Investment decisions:"),
     DescriptionPart(label="  Battery installed", symbol="y", format_spec=".0f"),
@@ -292,6 +299,13 @@ if __name__ == "__main__":
                 index_map_json=index_map.model_dump_json(),
             )
             session.add(graphical_model_metadata)
+            session.add(
+                SolutionDescriptionMetaData(
+                    metadata_id=graphical_metadata_db.id,
+                    parts=[p.model_dump() for p in OIL_WILDCATTER_DESCRIPTION_PARTS],
+                    separator="\n",
+                )
+            )
             session.commit()
             session.refresh(graphical_db)
             print(f"Oil Wildcatter graphical model problem added (id={graphical_db.id}).")

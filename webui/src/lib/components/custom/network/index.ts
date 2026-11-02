@@ -7,6 +7,7 @@ export { default as NetworkPanel } from './NetworkPanel.svelte';
 export { default as TornadoChart } from './TornadoChart.svelte';
 
 export type {
+	NetworkAssumptions,
 	NetworkModel,
 	NetworkNodeModel,
 	NetworkEdgeModel,

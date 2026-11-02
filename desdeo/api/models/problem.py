@@ -377,6 +377,13 @@ class GraphicalModelMetaData(SQLModel, table=True):
     index_map_json: str | None = Field(
         default=None, description="JSON-serialised `IndexMap` (Phase 4), once the diagram has been compiled"
     )
+    assumptions_json: str | None = Field(
+        default=None,
+        description=(
+            "JSON-serialised `desdeo.problem.graphical.DiagramAssumptions` of a hypothetical problem; "
+            "`network_json` is then already conditioned on them"
+        ),
+    )
 
     metadata_instance: "ProblemMetaDataDB" = Relationship(back_populates="graphical_model_metadata")
 

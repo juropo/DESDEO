@@ -3,7 +3,7 @@
 	import { useSvelteFlow } from '@xyflow/svelte';
 
 	/**
-	 * Re-fits the viewport after an ELK relayout. `fitView()` is deferred by a macrotask because
+	 * Re-fits the viewport after an ELK relayout, or when the canvas is revealed. `fitView()` is deferred by a macrotask because
 	 * SvelteFlow's node-bounds cache is still stale in the same update. `trigger` is bumped after
 	 * each relayout; `untrack` keeps `fitView()`'s own writes from re-triggering the effect.
 	 */

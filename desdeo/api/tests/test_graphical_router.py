@@ -16,7 +16,6 @@ from desdeo.api.models import (
     GraphicalModelMetaData,
     Group,
     InteractiveSessionDB,
-    ObjectiveDB,
     ProblemDB,
     ProblemMetaDataDB,
     ReferencePoint,
@@ -47,7 +46,7 @@ from desdeo.problem.graphical.demo import (
     build_irrigation_demo,
     build_oil_wildcatter_demo,
 )
-from desdeo.tools import SolverResults
+from desdeo.tools import CVXPYSolver, PyomoCBCSolver, SolverResults
 from desdeo.tools.gurobipy_solver_interfaces import GurobipySolver
 
 from .conftest import delete_json, get_json, login, post_json
@@ -282,6 +281,27 @@ def test_compile_bad_annotation_returns_400(client: TestClient, session_and_user
     assert response.status_code == 400
 
 
+def test_compile_stricter_warn_cap_still_enforces_server_ceiling(
+    client: TestClient, session_and_user: dict, monkeypatch: pytest.MonkeyPatch
+):
+    """A stricter `max_cluster_size` with `on_exceed="warn"` doesn't turn the server ceiling into a warning.
+
+    `_chain_network`'s single cluster `{A, B}` has 4 states; the ceiling is monkeypatched to 3.
+    """
+    monkeypatch.setattr(graphical_router, "_SERVER_MAX_CLUSTER_SIZE", 3)
+
+    access_token = login(client)
+    payload = {
+        "network": _chain_network().model_dump(mode="json"),
+        "annotation": _no_decision_annotation().model_dump(mode="json"),
+        "max_cluster_size": 2,
+        "on_exceed": "warn",
+    }
+    response = post_json(client, "/graphical/compile", payload, access_token)
+    assert response.status_code == 400, response.text
+    assert "server limit" in response.json()["detail"]
+
+
 def test_compile_many_small_disjoint_clusters_exceeding_total_cap_is_400(
     client: TestClient, session_and_user: dict, monkeypatch: pytest.MonkeyPatch
 ):
@@ -404,9 +424,7 @@ def test_structure_includes_decision_parent_edge_from_chance_potential(client: T
     annotation = DecisionAnnotation(
         decisions=[DecisionNode(symbol="D", states=["s0", "s1"])],
         objectives=[
-            ObjectiveNode(
-                symbol="f1", parents=["B"], utility=Potential(variables=["B"], shape=[2], values=[0.0, 10.0])
-            )
+            ObjectiveNode(symbol="f1", parents=["B"], utility=Potential(variables=["B"], shape=[2], values=[0.0, 10.0]))
         ],
     )
     _persist_graphical_metadata(session, problem.id, network, annotation)
@@ -477,210 +495,6 @@ def test_whatif_no_decision_posteriors_and_utilities(client: TestClient, session
     assert data["utilities"]["f1"] == pytest.approx(0.0 * 0.2 + 10.0 * 0.8)
     # variance = E[U^2] - mean^2 = (0.0^2 * 0.2 + 10.0^2 * 0.8) - 8.0^2 = 16.0, std = 4.0
     assert data["utility_std_devs"]["f1"] == pytest.approx(4.0)
-
-
-def _no_decision_annotation_matching_dtlz2_f1(utility_values: list[float]) -> DecisionAnnotation:
-    """A no-decision annotation whose objective symbol (`"f_1"`) matches `dtlz2(5, 3)`'s own.
-
-    Lets the ratchet tests reuse the seeded `dtlz2(5, 3)` problem (`f_1` minimized, `ideal=0.0`,
-    `nadir=1.0`), matching objectives by symbol as `_ratchet_ideal_nadir` does.
-    """
-    return DecisionAnnotation(
-        objectives=[
-            ObjectiveNode(
-                symbol="f_1", parents=["B"], utility=Potential(variables=["B"], shape=[2], values=utility_values)
-            )
-        ]
-    )
-
-
-def _f1_ideal_nadir(session: Session, problem_id: int) -> tuple[float | None, float | None]:
-    obj_db = session.exec(
-        select(ObjectiveDB).where(ObjectiveDB.problem_id == problem_id, ObjectiveDB.symbol == "f_1")
-    ).first()
-    return obj_db.ideal, obj_db.nadir
-
-
-def test_whatif_commit_false_does_not_ratchet_or_return_bounds(client: TestClient, session_and_user: dict):
-    """`commit=False` (the default): no DB write, and `ideal`/`nadir` stay `None` on the response.
-
-    The computed utility (-10.0) would beat `f_1`'s ideal (0.0) if the ratchet ran.
-    """
-    session: Session = session_and_user["session"]
-    access_token = login(client)
-
-    problem = session.exec(select(ProblemDB)).first()
-    network = _chain_network()
-    annotation = _no_decision_annotation_matching_dtlz2_f1([-10.0, -10.0])
-    _persist_graphical_metadata(session, problem.id, network, annotation)
-
-    payload = {"problem_id": problem.id, "evidence": {"A": "hi"}, "commit": False}
-    response = post_json(client, "/graphical/whatif", payload, access_token)
-    assert response.status_code == 200
-    data = response.json()
-
-    assert data["utilities"]["f_1"] == pytest.approx(-10.0)
-    assert data["ideal"] is None
-    assert data["nadir"] is None
-
-    session.expire_all()
-    ideal, nadir = _f1_ideal_nadir(session, problem.id)
-    assert ideal == pytest.approx(0.0)
-    assert nadir == pytest.approx(1.0)
-
-
-def test_whatif_commit_true_ratchets_ideal_open_on_violation(client: TestClient, session_and_user: dict):
-    """`commit=True` with a utility beating the current ideal widens and persists it.
-
-    `f_1` minimizes with `ideal=0.0`/`nadir=1.0`; a utility of -10.0 replaces the ideal and leaves
-    the nadir untouched.
-    """
-    session: Session = session_and_user["session"]
-    access_token = login(client)
-
-    problem = session.exec(select(ProblemDB)).first()
-    network = _chain_network()
-    annotation = _no_decision_annotation_matching_dtlz2_f1([-10.0, -10.0])
-    _persist_graphical_metadata(session, problem.id, network, annotation)
-
-    payload = {"problem_id": problem.id, "evidence": {"A": "hi"}, "commit": True}
-    response = post_json(client, "/graphical/whatif", payload, access_token)
-    assert response.status_code == 200
-    data = response.json()
-
-    assert data["utilities"]["f_1"] == pytest.approx(-10.0)
-    assert data["ideal"]["f_1"] == pytest.approx(-10.0)
-    assert data["nadir"]["f_1"] == pytest.approx(1.0)
-
-    session.expire_all()
-    ideal, nadir = _f1_ideal_nadir(session, problem.id)
-    assert ideal == pytest.approx(-10.0)
-    assert nadir == pytest.approx(1.0)
-
-
-def test_whatif_commit_true_inside_range_does_not_change_bounds(client: TestClient, session_and_user: dict):
-    """`commit=True` with a utility inside the current ideal/nadir range changes nothing.
-
-    Bounds are only ever widened, never narrowed.
-    """
-    session: Session = session_and_user["session"]
-    access_token = login(client)
-
-    problem = session.exec(select(ProblemDB)).first()
-    network = _chain_network()
-    # Expected utility = 0.2 * 0.3 + 0.8 * 0.3 = 0.3, strictly inside [ideal=0.0, nadir=1.0].
-    annotation = _no_decision_annotation_matching_dtlz2_f1([0.3, 0.3])
-    _persist_graphical_metadata(session, problem.id, network, annotation)
-
-    payload = {"problem_id": problem.id, "evidence": {"A": "hi"}, "commit": True}
-    response = post_json(client, "/graphical/whatif", payload, access_token)
-    assert response.status_code == 200
-    data = response.json()
-
-    assert data["utilities"]["f_1"] == pytest.approx(0.3)
-    assert data["ideal"]["f_1"] == pytest.approx(0.0)
-    assert data["nadir"]["f_1"] == pytest.approx(1.0)
-
-    session.expire_all()
-    ideal, nadir = _f1_ideal_nadir(session, problem.id)
-    assert ideal == pytest.approx(0.0)
-    assert nadir == pytest.approx(1.0)
-
-
-def test_whatif_commit_true_multi_objective_with_decision_still_raises_501(
-    client: TestClient, session_and_user: dict
-):
-    """`commit=True` must not change or bypass `_compute_utilities`'s existing 501 scope cut.
-
-    Same fixture as `test_whatif_multi_objective_with_decision_raises_501`, plus `commit=True`.
-    """
-    session: Session = session_and_user["session"]
-    access_token = login(client)
-
-    problem = session.exec(select(ProblemDB)).first()
-    network = _decision_network()
-    annotation = DecisionAnnotation(
-        decisions=[DecisionNode(symbol="D", states=["s0", "s1"], information_set=["A"])],
-        objectives=[
-            ObjectiveNode(symbol="f1", parents=["A"], utility=Potential(variables=["A"], shape=[2], values=[0.0, 1.0])),
-            ObjectiveNode(symbol="f2", parents=["D"], utility=Potential(variables=["D"], shape=[2], values=[1.0, 0.0])),
-        ],
-    )
-    _persist_graphical_metadata(session, problem.id, network, annotation)
-
-    payload = {"problem_id": problem.id, "evidence": {}, "commit": True}
-    response = post_json(client, "/graphical/whatif", payload, access_token)
-    assert response.status_code == 501
-
-
-def test_whatif_commit_true_both_bounds_none_skips_ratchet(client: TestClient, session_and_user: dict):
-    """A freshly-*compiled* graphical-model problem starts with `ideal`/`nadir` both `None`.
-
-    The ratchet must skip it rather than collapse both bounds to the same value.
-    """
-    session: Session = session_and_user["session"]
-    access_token = login(client)
-
-    network = _chain_network()
-    annotation = _no_decision_annotation()
-    compile_payload = {"network": network.model_dump(mode="json"), "annotation": annotation.model_dump(mode="json")}
-    compile_response = post_json(client, "/graphical/compile", compile_payload, access_token)
-    assert compile_response.status_code == 200, compile_response.text
-    problem_id = compile_response.json()["problem_id"]
-
-    problem_db = session.get(ProblemDB, problem_id)
-    assert all(obj_db.ideal is None and obj_db.nadir is None for obj_db in problem_db.objectives)
-
-    payload = {"problem_id": problem_id, "evidence": {"A": "hi"}, "commit": True}
-    response = post_json(client, "/graphical/whatif", payload, access_token)
-    assert response.status_code == 200
-    data = response.json()
-
-    assert data["utilities"]["f1"] == pytest.approx(0.0 * 0.2 + 10.0 * 0.8)
-    # Both bounds were skipped, so "f1" is absent from the returned dicts.
-    assert "f1" not in data["ideal"]
-    assert "f1" not in data["nadir"]
-
-    session.expire_all()
-    obj_db = session.exec(
-        select(ObjectiveDB).where(ObjectiveDB.problem_id == problem_id, ObjectiveDB.symbol == "f1")
-    ).first()
-    assert obj_db.ideal is None
-    assert obj_db.nadir is None
-
-
-def test_whatif_commit_non_owner_without_privilege_is_403(client: TestClient, session_and_user: dict):
-    """A user who can SEE the problem (via a shared `Group`) but doesn't own it can't `commit`.
-
-    A non-committing call from the same user still works.
-    """
-    session: Session = session_and_user["session"]
-    access_token = login(client)  # default "analyst" user -- owns the problem
-
-    problem = session.exec(select(ProblemDB)).first()
-    network = _chain_network()
-    annotation = _no_decision_annotation()
-    _persist_graphical_metadata(session, problem.id, network, annotation)
-
-    dm_user = User(username="dm_user6", password_hash=get_password_hash("dm_pw"), role=UserRole.dm, group="test")
-    session.add(dm_user)
-    session.commit()
-    session.refresh(dm_user)
-    dm_token = login(client, username="dm_user6", password="dm_pw")  # noqa: S106
-
-    group = Group(name="shared6", owner_id=session_and_user["user"].id, user_ids=[dm_user.id], problem_id=problem.id)
-    session.add(group)
-    session.commit()
-
-    # dm_user6 can see the problem (group membership) -- a non-committing call succeeds.
-    plain_payload = {"problem_id": problem.id, "evidence": {"A": "hi"}}
-    plain_response = post_json(client, "/graphical/whatif", plain_payload, dm_token)
-    assert plain_response.status_code == 200
-
-    # ... but isn't the owner, so a committing call is forbidden.
-    commit_payload = {"problem_id": problem.id, "evidence": {"A": "hi"}, "commit": True}
-    forbidden = post_json(client, "/graphical/whatif", commit_payload, dm_token)
-    assert forbidden.status_code == 403
 
 
 def test_whatif_with_decision_single_objective_matches_pyagrum_oracle(client: TestClient, session_and_user: dict):
@@ -974,9 +788,7 @@ def test_whatif_oil_wildcatter_partially_pinned_or_unpinned_decisions_still_rais
     assert partially_pinned_response.status_code == 501
 
 
-def test_whatif_decision_evidence_unknown_decision_or_bad_label_is_400(
-    client: TestClient, session_and_user: dict
-):
+def test_whatif_decision_evidence_unknown_decision_or_bad_label_is_400(client: TestClient, session_and_user: dict):
     """`decision_evidence` referencing an unknown decision, or a label outside its own states, is 400."""
     session: Session = session_and_user["session"]
     access_token = login(client)
@@ -1053,9 +865,7 @@ def test_whatif_fully_pinned_decisions_multi_objective_matches_hand_computed_exp
     test_yes_engine = gum.LazyPropagation(to_pyagrum(network, decision_pins={"test": 0, "drill": 0}))
     test_yes_engine.makeInference()
     # P(test_result | structure, test="yes"), rows = structure (dry/wet/soaking).
-    test_result_given_structure = np.array(
-        [[0.6, 0.3, 0.1, 0.0], [0.3, 0.4, 0.3, 0.0], [0.1, 0.4, 0.5, 0.0]]
-    )
+    test_result_given_structure = np.array([[0.6, 0.3, 0.1, 0.0], [0.3, 0.4, 0.3, 0.0], [0.1, 0.4, 0.5, 0.0]])
     expected_test_result_given_yes = structure_prior @ test_result_given_structure
     assert test_yes_engine.posterior("test_result").toarray() == pytest.approx(expected_test_result_given_yes)
 
@@ -1148,9 +958,7 @@ def test_whatif_single_objective_decision_nan_meu_is_400(client: TestClient, ses
     assert "incompatible" in response.json()["detail"].lower()
 
 
-def test_whatif_partial_decision_evidence_single_objective_has_no_effect(
-    client: TestClient, session_and_user: dict
-):
+def test_whatif_partial_decision_evidence_single_objective_has_no_effect(client: TestClient, session_and_user: dict):
     """A partial `decision_evidence` on a single-objective, two-decision diagram changes nothing.
 
     Neither decision is in `policy` without evidence on `A`; pinning only `D2` changes neither
@@ -1370,9 +1178,7 @@ def test_whatif_solution_pin_overrides_solved_policy(client: TestClient, session
 
 
 @pytest.mark.gurobipy
-def test_whatif_solution_pin_moving_followed_decision_off_path_reports_it(
-    client: TestClient, session_and_user: dict
-):
+def test_whatif_solution_pin_moving_followed_decision_off_path_reports_it(client: TestClient, session_and_user: dict):
     """A pin that puts a followed decision where the solution never goes yields no utilities.
 
     The profit-optimal solution runs the test, so `drill`'s choice at `test="no"` is left
@@ -2194,7 +2000,9 @@ def test_sensitivity_nodes_filter_restricts_sweep(client: TestClient, session_an
     assert swept_nodes == {"B"}  # not {"A", "B", "C"} -- C is excluded by the filter
 
 
-def test_sensitivity_sweep_cap_exceeded_is_400(client: TestClient, session_and_user: dict, monkeypatch: pytest.MonkeyPatch):
+def test_sensitivity_sweep_cap_exceeded_is_400(
+    client: TestClient, session_and_user: dict, monkeypatch: pytest.MonkeyPatch
+):
     """Exceeding `_MAX_SENSITIVITY_SWEEP_NODES` (after any `nodes` filtering) is a clean 400.
 
     The cap is monkeypatched down to 1; `B` and `C` are both swept by default.
@@ -2251,7 +2059,9 @@ def test_sensitivity_excludes_near_impossible_state_from_values(client: TestClie
     )
     annotation = DecisionAnnotation(
         objectives=[
-            ObjectiveNode(symbol="f1", parents=["A"], utility=Potential(variables=["A"], shape=[2], values=[0.0, 100.0]))
+            ObjectiveNode(
+                symbol="f1", parents=["A"], utility=Potential(variables=["A"], shape=[2], values=[0.0, 100.0])
+            )
         ]
     )
     _persist_graphical_metadata(session, problem.id, network, annotation)
@@ -2307,6 +2117,45 @@ def test_voi_hand_computed(client: TestClient, session_and_user: dict):
     assert data["expected_value_with_observation"] == pytest.approx(5.8)
     assert data["value_of_information"] == pytest.approx(1.8)
     assert data["marginal"] == pytest.approx({"lo": 0.4, "hi": 0.6})
+
+
+def test_voi_skips_zero_probability_state(client: TestClient, session_and_user: dict):
+    """A swept state with zero prior probability doesn't make `/voi` a 400.
+
+    `A`'s prior is `[0.6, 0.4, 0.0]`; `utility[A,D] = [[10,0],[0,3],[5,5]]`. Blind, `D="s0"` gives
+    `0.6*10 = 6.0`. Observing `A` first: `0.6*10 + 0.4*3 = 7.2`, so `VoI = 1.2`.
+    """
+    session: Session = session_and_user["session"]
+    access_token = login(client)
+
+    problem = session.exec(select(ProblemDB)).first()
+    network = DiscreteNetwork(
+        variables=[DiscreteVariable(name="A", labels=["lo", "mid", "never"])],
+        arcs=[],
+        potentials={"A": Potential(variables=["A"], shape=[3], values=[0.6, 0.4, 0.0])},
+    )
+    annotation = DecisionAnnotation(
+        decisions=[DecisionNode(symbol="D", states=["s0", "s1"], information_set=[])],
+        objectives=[
+            ObjectiveNode(
+                symbol="fmatch",
+                parents=["A", "D"],
+                utility=Potential(variables=["A", "D"], shape=[3, 2], values=[[10.0, 0.0], [0.0, 3.0], [5.0, 5.0]]),
+                maximize=True,
+            )
+        ],
+    )
+    _persist_graphical_metadata(session, problem.id, network, annotation)
+
+    payload = {"problem_id": problem.id, "evidence": {}, "node": "A", "target": "fmatch"}
+    response = post_json(client, "/graphical/voi", payload, access_token)
+    assert response.status_code == 200, response.text
+    data = response.json()
+
+    assert data["base_value"] == pytest.approx(6.0)
+    assert data["expected_value_with_observation"] == pytest.approx(7.2)
+    assert data["value_of_information"] == pytest.approx(1.2)
+    assert data["marginal"] == pytest.approx({"lo": 0.6, "mid": 0.4, "never": 0.0})
 
 
 def test_voi_no_decision_is_400(client: TestClient, session_and_user: dict):
@@ -2505,25 +2354,50 @@ def test_solve_visible_non_owner_succeeds(client: TestClient, session_and_user: 
     assert response.status_code == 200, response.text
 
 
-def test_solve_without_gurobi_license_never_crashes_on_cvxpy_mip(
-    client: TestClient, session_and_user: dict, monkeypatch: pytest.MonkeyPatch
-):
-    """Without a Gurobi license, `/solve` uses a MIP-capable fallback or returns 400.
-
-    It must not fall back to `CVXPYSolver`, which may lack a MIP backend. Simulates a missing
-    license by monkeypatching `check_gurobi_license` in `desdeo.tools.utils`.
-    """
-    monkeypatch.setattr(tools_utils, "check_gurobi_license", lambda: False)
-
+def _solve_irrigation_profit_policy(client: TestClient) -> dict[str, str]:
+    """Compile the irrigation demo, solve `profit` with `/solve`, and decode the policy."""
     access_token = login(client)
 
     compile_response = post_json(client, "/graphical/demo/irrigation", {}, access_token)
     assert compile_response.status_code == 200, compile_response.text
     problem_id = compile_response.json()["problem_id"]
 
-    response = post_json(client, f"/graphical/{problem_id}/solve", {"objective_symbol": "profit"}, access_token)
-    # Either a MIP-capable fallback worked, or none is available.
-    assert response.status_code in (200, 400), response.text
+    solve_response = post_json(client, f"/graphical/{problem_id}/solve", {"objective_symbol": "profit"}, access_token)
+    assert solve_response.status_code == 200, solve_response.text
+
+    policy_response = post_json(
+        client,
+        f"/graphical/{problem_id}/policy",
+        {"variable_values": solve_response.json()["variable_values"], "evidence": {}},
+        access_token,
+    )
+    assert policy_response.status_code == 200, policy_response.text
+    return policy_response.json()["policy"]
+
+
+def test_solve_without_gurobi_license_maximizes(
+    client: TestClient, session_and_user: dict, monkeypatch: pytest.MonkeyPatch
+):
+    """Without a Gurobi license, `/solve` still finds the maximizing policy (`heavy`)."""
+    monkeypatch.setattr(tools_utils, "check_gurobi_license", lambda: False)
+
+    assert _solve_irrigation_profit_policy(client) == {"irrigate": "heavy"}
+
+
+@pytest.mark.parametrize(
+    "solver_class",
+    [
+        pytest.param(CVXPYSolver, marks=pytest.mark.cvxpy),
+        pytest.param(PyomoCBCSolver, marks=pytest.mark.pyomo),
+    ],
+)
+def test_solve_maximizes_with_non_gurobi_solvers(
+    client: TestClient, session_and_user: dict, monkeypatch: pytest.MonkeyPatch, solver_class
+):
+    """`/solve` maximizes `profit` whichever solver is picked; Pyomo minimizes a raw objective symbol."""
+    monkeypatch.setattr(graphical_router, "guess_best_solver", lambda _problem: solver_class)
+
+    assert _solve_irrigation_profit_policy(client) == {"irrigate": "heavy"}
 
 
 def test_solve_non_graphical_problem_is_404(client: TestClient, session_and_user: dict):

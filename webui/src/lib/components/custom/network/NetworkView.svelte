@@ -14,6 +14,7 @@
 	import '@xyflow/svelte/dist/base.css';
 	import { Button } from '$lib/components/ui/button';
 	import { SegmentedControl } from '$lib/components/custom/segmented-control';
+	import * as Resizable from '$lib/components/ui/resizable/index.js';
 	import IconRefreshCw from '@lucide/svelte/icons/refresh-cw';
 	import IconCheck from '@lucide/svelte/icons/check';
 	import IconInfo from '@lucide/svelte/icons/info';
@@ -95,6 +96,12 @@
 		onEvidenceChange?: (evidence: NetworkEvidence) => void;
 		/** Fired when the DM clicks "Commit evidence". What committing means is up to the caller. */
 		onCommitEvidence?: (evidence: NetworkEvidence) => void;
+		/** Host content for a resizable sidebar beside the canvas; the node table goes below it. */
+		aside?: Snippet;
+		/** Only the canvas, with no toolbar or table, and no node can be edited. */
+		readonly?: boolean;
+		/** Remembers the sidebar width in localStorage under this key. */
+		asideAutoSaveId?: string;
 	}
 
 	let {
@@ -117,7 +124,10 @@
 		onNodeSelect,
 		onNodeHover,
 		onEvidenceChange,
-		onCommitEvidence
+		onCommitEvidence,
+		aside,
+		asideAutoSaveId,
+		readonly = false
 	}: Props = $props();
 
 	let containerEl = $state<HTMLDivElement | null>(null);
@@ -126,10 +136,13 @@
 	// Plain `string` (not a literal union) so it type-matches `SegmentedControl`'s bindable
 	// `value: string` prop; the option `value`s below are the only strings it will ever hold.
 	let viewMode = $state<string>('split');
+	let layoutMode = $derived(readonly ? 'canvas' : viewMode);
 	let hoveredId = $state<string | null>(null);
 	let selectedId = $state<string | null>(null);
 	let relayouting = $state(false);
 	let layoutVersion = $state(0);
+	// Bumped when the canvas goes from zero size to visible, e.g. in a tab or after 'table' mode.
+	let revealVersion = $state(0);
 
 	let detailLevel = $derived(computeDetailLevel(containerWidth, viewport.zoom, compact));
 
@@ -199,7 +212,7 @@
 						description: n.description,
 						detail,
 						highlight: highlightStateFor(n.id, highlights),
-						editable: isNodeEditable(n.kind, mode),
+						editable: !readonly && isNodeEditable(n.kind, mode),
 						evidenceState: evidenceSnapshot[n.id],
 						// Only meaningful read-only in 'solver' mode -- in 'manual' mode the node is
 						// interactive instead, and shouldn't also show a (possibly stale) solved
@@ -273,9 +286,13 @@
 
 	onMount(() => {
 		if (!containerEl) return;
+		let visible = false;
 		const observer = new ResizeObserver((entries) => {
-			const width = entries[0]?.contentRect.width;
-			if (width) containerWidth = width;
+			const rect = entries[0]?.contentRect;
+			if (rect?.width) containerWidth = rect.width;
+			const nowVisible = !!rect && rect.width > 0 && rect.height > 0;
+			if (nowVisible && !visible) revealVersion++;
+			visible = nowVisible;
 		});
 		observer.observe(containerEl);
 
@@ -313,45 +330,52 @@
 </script>
 
 <div class="flex h-full min-h-0 flex-col gap-2 {className}">
-	<div class="flex flex-wrap items-center justify-between gap-2">
-		<SegmentedControl
-			size="sm"
-			bind:value={viewMode}
-			options={[
-				{ value: 'canvas', label: 'Canvas' },
-				{ value: 'split', label: 'Split' },
-				{ value: 'table', label: 'Table' }
-			]}
-		/>
-		<div class="flex items-center gap-2">
-			<!-- Evidence is always conditioned on (pyAgrum `setEvidence`), never an intervention or
-			     soft evidence. `aria-label` carries the full sentence. -->
-			<span
-				class="text-muted-foreground flex items-center gap-1 text-xs"
-				title={EVIDENCE_MODE_NOTE}
-				aria-label={EVIDENCE_MODE_NOTE}
-			>
-				<IconInfo class="size-3.5 shrink-0" />
-				Observational evidence only
-			</span>
-			<Button
-				variant="outline"
+	{#if !readonly}
+		<div class="flex flex-wrap items-center justify-between gap-2">
+			<SegmentedControl
 				size="sm"
-				disabled={!diverged || stale}
-				onclick={handleCommit}
-				title={stale
-					? 'Waiting for the current evidence to finish refreshing before it can be committed.'
-					: 'Accept the current evidence as the new baseline for future ghost/delta comparisons.'}
-			>
-				<IconCheck class="size-3.5" />
-				Commit evidence
-			</Button>
-			<Button variant="outline" size="sm" onclick={relayout} disabled={relayouting}>
-				<IconRefreshCw class="size-3.5 {relayouting ? 'animate-spin' : ''}" />
-				Re-layout
-			</Button>
+				bind:value={viewMode}
+				options={aside
+					? [
+							{ value: 'canvas', label: 'Canvas' },
+							{ value: 'split', label: 'Split' }
+						]
+					: [
+							{ value: 'canvas', label: 'Canvas' },
+							{ value: 'split', label: 'Split' },
+							{ value: 'table', label: 'Table' }
+						]}
+			/>
+			<div class="flex items-center gap-2">
+				<!-- Evidence is always conditioned on (pyAgrum `setEvidence`), never an intervention or
+			     soft evidence. `aria-label` carries the full sentence. -->
+				<span
+					class="text-muted-foreground flex items-center gap-1 text-xs"
+					title={EVIDENCE_MODE_NOTE}
+					aria-label={EVIDENCE_MODE_NOTE}
+				>
+					<IconInfo class="size-3.5 shrink-0" />
+					Observational evidence only
+				</span>
+				<Button
+					variant="outline"
+					size="sm"
+					disabled={!diverged || stale}
+					onclick={handleCommit}
+					title={stale
+						? 'Waiting for the current evidence to finish refreshing before it can be committed.'
+						: 'Accept the current evidence as the new baseline for future ghost/delta comparisons.'}
+				>
+					<IconCheck class="size-3.5" />
+					Commit evidence
+				</Button>
+				<Button variant="outline" size="sm" onclick={relayout} disabled={relayouting}>
+					<IconRefreshCw class="size-3.5 {relayouting ? 'animate-spin' : ''}" />
+					Re-layout
+				</Button>
+			</div>
 		</div>
-	</div>
+	{/if}
 
 	<!--
 		Both panes stay mounted; only visibility changes with `viewMode`, so canvas zoom/pan and the
@@ -373,43 +397,78 @@
 			class="flex min-h-0 flex-1 flex-col gap-2 transition-opacity duration-300"
 			class:opacity-50={stale}
 		>
-			<div
-				bind:this={containerEl}
-				class="border-border min-h-[180px] rounded-md border"
-				class:hidden={viewMode === 'table'}
-				class:flex-1={viewMode !== 'split'}
-				style={viewMode === 'split' ? 'flex: 6 1 0;' : ''}
-			>
-				<SvelteFlow
-					bind:nodes={flowNodes}
-					bind:edges={flowEdges}
-					bind:viewport
-					nodeTypes={NETWORK_NODE_TYPES}
-					fitView
-					minZoom={0.2}
-					maxZoom={2}
-					onnodeclick={handleNodeClick}
-					onnodepointerenter={handleNodePointerEnter}
-					onnodepointerleave={handleNodePointerLeave}
+			{#if aside}
+				<!-- The table sits under the host's content in the sidebar; 'table' mode isn't offered. -->
+				<Resizable.PaneGroup
+					direction="horizontal"
+					autoSaveId={asideAutoSaveId}
+					class="min-h-0 flex-1"
 				>
-					<Background />
-					<Controls showLock={false} />
-					<FitViewOnReady trigger={layoutVersion} />
-				</SvelteFlow>
-			</div>
-			<div
-				class="min-h-0 overflow-auto"
-				class:hidden={viewMode === 'canvas'}
-				class:flex-1={viewMode !== 'split'}
-				style={viewMode === 'split' ? 'flex: 4 1 0;' : ''}
-			>
-				<NetworkTable
-					{model}
-					{highlightedIds}
-					onRowHover={handleTableHover}
-					onRowSelect={handleTableSelect}
-				/>
-			</div>
+					<Resizable.Pane defaultSize={70} minSize={40} class="flex min-h-0">
+						<div
+							bind:this={containerEl}
+							class="border-border min-h-[180px] flex-1 rounded-md border"
+						>
+							{@render canvas()}
+						</div>
+					</Resizable.Pane>
+					<Resizable.Handle withHandle />
+					<Resizable.Pane defaultSize={30} minSize={18} maxSize={60} class="min-h-0">
+						<div class="h-full space-y-3 overflow-auto pl-2">
+							{@render aside()}
+							{#if layoutMode !== 'canvas'}
+								{@render table()}
+							{/if}
+						</div>
+					</Resizable.Pane>
+				</Resizable.PaneGroup>
+			{:else}
+				<div
+					bind:this={containerEl}
+					class="border-border min-h-[180px] rounded-md border"
+					class:hidden={layoutMode === 'table'}
+					class:flex-1={layoutMode !== 'split'}
+					style={layoutMode === 'split' ? 'flex: 6 1 0;' : ''}
+				>
+					{@render canvas()}
+				</div>
+				<div
+					class="min-h-0 overflow-auto"
+					class:hidden={layoutMode === 'canvas'}
+					class:flex-1={layoutMode !== 'split'}
+					style={layoutMode === 'split' ? 'flex: 4 1 0;' : ''}
+				>
+					{@render table()}
+				</div>
+			{/if}
 		</div>
 	</div>
 </div>
+
+{#snippet canvas()}
+	<SvelteFlow
+		bind:nodes={flowNodes}
+		bind:edges={flowEdges}
+		bind:viewport
+		nodeTypes={NETWORK_NODE_TYPES}
+		fitView
+		minZoom={0.2}
+		maxZoom={2}
+		onnodeclick={handleNodeClick}
+		onnodepointerenter={handleNodePointerEnter}
+		onnodepointerleave={handleNodePointerLeave}
+	>
+		<Background />
+		<Controls showLock={false} />
+		<FitViewOnReady trigger={layoutVersion + revealVersion} />
+	</SvelteFlow>
+{/snippet}
+
+{#snippet table()}
+	<NetworkTable
+		{model}
+		{highlightedIds}
+		onRowHover={handleTableHover}
+		onRowSelect={handleTableSelect}
+	/>
+{/snippet}

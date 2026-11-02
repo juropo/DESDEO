@@ -4,7 +4,6 @@ import {
 	createDebouncer,
 	createWhatIfRunner,
 	dominantDeltaIndex,
-	fetchCommitBounds,
 	formatUtility,
 	hasEvidenceDiverged
 } from './whatif';
@@ -220,64 +219,6 @@ describe('dominantDeltaIndex', () => {
 	it('respects a custom threshold', () => {
 		expect(dominantDeltaIndex([0.02, -0.03], 0.05)).toBeNull();
 		expect(dominantDeltaIndex([0.02, -0.03], 0.02)).toBe(1);
-	});
-});
-
-describe('fetchCommitBounds', () => {
-	it('calls fetchWhatIf with commit: true and no signal, and maps ideal/nadir through', async () => {
-		const fetchWhatIf = vi.fn().mockResolvedValue({
-			posteriors: {},
-			ideal: { f_1: 1.5 },
-			nadir: { f_1: 9.0 }
-		});
-		const result = await fetchCommitBounds(fetchWhatIf, 42, { weather: 'dry' });
-		expect(fetchWhatIf).toHaveBeenCalledWith(42, { weather: 'dry' }, undefined, true, {}, null);
-		expect(result).toEqual({ bounds: { ideal: { f_1: 1.5 }, nadir: { f_1: 9.0 } } });
-	});
-
-	it('passes decision pins and the followed solution through', async () => {
-		const fetchWhatIf = vi.fn().mockResolvedValue({ posteriors: {} });
-		const solution = { stateId: 7, solutionIndex: 2 };
-		await fetchCommitBounds(fetchWhatIf, 42, {}, { test: 'yes' }, solution);
-		expect(fetchWhatIf).toHaveBeenCalledWith(42, {}, undefined, true, { test: 'yes' }, solution);
-	});
-
-	it('maps a null ideal/nadir (non-committing response shape) to undefined', async () => {
-		const fetchWhatIf = vi.fn().mockResolvedValue({ posteriors: {}, ideal: null, nadir: null });
-		const result = await fetchCommitBounds(fetchWhatIf, 42, {});
-		expect(result).toEqual({ bounds: { ideal: undefined, nadir: undefined } });
-	});
-
-	it('resolves to an error instead of rejecting when fetchWhatIf fails', async () => {
-		const fetchWhatIf = vi.fn().mockRejectedValue(new Error('boom'));
-		const result = await fetchCommitBounds(fetchWhatIf, 42, {});
-		expect(result.bounds).toBeUndefined();
-		expect(result.error).toBe('boom');
-	});
-
-	it('reports a non-Error rejection with a generic message rather than throwing', async () => {
-		const fetchWhatIf = vi.fn().mockRejectedValue('not an Error instance');
-		const result = await fetchCommitBounds(fetchWhatIf, 42, {});
-		expect(result.bounds).toBeUndefined();
-		expect(result.error).toBe('Failed to fetch commit bounds');
-	});
-
-	it('is never called with a decision-node key once the caller filters to chance evidence', async () => {
-		// Like `handleCommitEvidence`: in 'manual' mode the committed evidence can contain decision
-		// nodes, which must be filtered out before calling `fetchCommitBounds`.
-		const model: NetworkModel = {
-			nodes: [
-				{ id: 'weather', label: 'Weather', kind: 'chance', states: ['dry', 'wet'] },
-				{ id: 'irrigate', label: 'Irrigate', kind: 'decision', states: ['yes', 'no'] }
-			],
-			edges: []
-		};
-		const committed = { weather: 'dry', irrigate: 'yes' };
-		const fetchWhatIf = vi.fn().mockResolvedValue({ posteriors: {}, ideal: {}, nadir: {} });
-
-		await fetchCommitBounds(fetchWhatIf, 42, filterChanceEvidence(model, committed));
-
-		expect(fetchWhatIf).toHaveBeenCalledWith(42, { weather: 'dry' }, undefined, true, {}, null);
 	});
 });
 
