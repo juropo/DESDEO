@@ -177,6 +177,25 @@ describe('apply_scenario_measures', () => {
 		expect(result).toEqual({ problem_id: 9 });
 	});
 
+	it('sends CVaR with the worst 5 % as the default tail probability', async () => {
+		applyScenarioMeasures.mockResolvedValue({ status: 200, data: { problem_id: 9 } });
+
+		await apply_scenario_measures(7, 3, ['f_1'], ['conditional_value_at_risk']);
+
+		expect(applyScenarioMeasures).toHaveBeenCalledWith({
+			problem_id: 7,
+			name: null,
+			uncertainty_measures: [
+				{
+					measure_type: 'conditional_value_at_risk',
+					scenario_model_id: 3,
+					symbols: ['f_1'],
+					alpha: 0.05
+				}
+			]
+		});
+	});
+
 	it('reports an error and returns null when the endpoint rejects the measures', async () => {
 		applyScenarioMeasures.mockResolvedValue({ status: 422, data: { detail: 'no scenario model' } });
 

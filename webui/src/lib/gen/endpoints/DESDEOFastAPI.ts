@@ -651,7 +651,7 @@ export interface UncertaintyMeasureSpec {
 	symbols: string[];
 	/** Prefix for the new aggregate symbols. Defaults vary by measure_type. */
 	prefix?: string | null;
-	/** Confidence level for CVaR, e.g. 0.95. Required for conditional_value_at_risk. */
+	/** Probability mass of the averaged tail of worst outcomes in the element's own direction, e.g. 0.05 for the worst 5 % (often called CVaR 95 %). Required for conditional_value_at_risk. */
 	alpha?: number | null;
 	/** Leaf-name → weight mapping. Required for weighted_scenarios. */
 	leaf_weights?: UncertaintyMeasureSpecLeafWeights;

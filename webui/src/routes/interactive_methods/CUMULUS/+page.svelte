@@ -207,10 +207,10 @@
 	const AVAILABLE_MEASURES: { value: MeasureType; label: string }[] = [
 		{ value: 'expected_value', label: 'Expected value (E_)' },
 		{ value: 'worst_case_robust', label: 'Worst-case robust (robust_)' },
-		{ value: 'conditional_value_at_risk', label: 'Conditional Value at Risk (CVaR, α = 95%)' }
+		{ value: 'conditional_value_at_risk', label: 'Conditional Value at Risk (CVAR_)' }
 	];
 	let selected_measures: MeasureType[] = $state(['expected_value']);
-	let cvar_alpha = $state(0.95);
+	let cvar_alpha = $state(0.05);
 	let combined_problem_name = $state('');
 
 	// Network structure demo dialog (dev only), backed by the irrigation demo diagram compiled on
@@ -536,7 +536,7 @@
 			applied.length > 0
 				? [...(applied as MeasureType[])]
 				: ['expected_value', 'worst_case_robust'];
-		cvar_alpha = 0.95;
+		cvar_alpha = 0.05;
 		combined_problem_name = `${problem.name} (combined)`;
 		scenario_setup_mode = 'reopen';
 		show_scenario_setup_dialog = true;
@@ -1026,7 +1026,7 @@
 			pending_scenario_model_id = result.scenario_model_id!;
 			pending_objective_symbols = result.objective_symbols!;
 			selected_measures = ['expected_value', 'worst_case_robust'];
-			cvar_alpha = 0.95;
+			cvar_alpha = 0.05;
 			combined_problem_name = problem ? `${problem.name} (combined)` : '';
 			scenario_setup_mode = 'initial';
 			show_scenario_setup_dialog = true;
@@ -1510,7 +1510,7 @@
 				{#if selected_measures.includes('conditional_value_at_risk')}
 					<div class="flex items-center gap-3 pl-7">
 						<label for="cvar-alpha-input" class="text-muted-foreground text-sm"
-							>CVaR confidence level (α)</label
+							>CVaR tail probability (α)</label
 						>
 						<input
 							id="cvar-alpha-input"
@@ -1521,6 +1521,7 @@
 							bind:value={cvar_alpha}
 							class="w-20 rounded border px-2 py-1 text-sm"
 						/>
+						<span class="text-muted-foreground text-xs">0.05 = average of the worst 5 %</span>
 					</div>
 				{/if}
 			</div>

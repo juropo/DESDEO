@@ -408,7 +408,7 @@ function build_uncertainty_measures_request(
 			scenario_model_id,
 			symbols: objective_symbols,
 			...(measure_type === 'conditional_value_at_risk' && {
-				alpha: measure_options.cvar_alpha ?? 0.95
+				alpha: measure_options.cvar_alpha ?? 0.05
 			})
 		}))
 	};

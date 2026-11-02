@@ -230,7 +230,11 @@ class UncertaintyMeasureSpec(BaseModel):
         default=None, description="Prefix for the new aggregate symbols. Defaults vary by measure_type."
     )
     alpha: float | None = Field(
-        default=None, description="Confidence level for CVaR, e.g. 0.95. Required for conditional_value_at_risk."
+        default=None,
+        description=(
+            "Probability mass of the averaged tail of worst outcomes in the element's own direction, "
+            "e.g. 0.05 for the worst 5 % (often called CVaR 95 %). Required for conditional_value_at_risk."
+        ),
     )
     leaf_weights: dict[str, float] | None = Field(
         default=None, description="Leaf-name → weight mapping. Required for weighted_scenarios."

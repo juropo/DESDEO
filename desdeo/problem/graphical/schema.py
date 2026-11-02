@@ -165,7 +165,8 @@ class RiskMeasure(BaseModel):
     """`ObjectiveNode.symbol` this risk measure replaces/augments."""
     kind: RiskMeasureKind = RiskMeasureKind.cvar
     alpha: float
-    """Confidence/quantile level, e.g. 0.95 for CVaR_0.95. Must be in (0, 1)."""
+    """Probability mass of the averaged tail of worst outcomes in the target's own direction,
+    e.g. 0.05 for the worst 5 % (often called CVaR 95 %). Must be in (0, 1)."""
 
     @model_validator(mode="after")
     def _check_alpha(self) -> Self:

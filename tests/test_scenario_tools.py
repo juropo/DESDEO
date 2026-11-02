@@ -617,8 +617,8 @@ def test_expected_asf_uses_scenario_probabilities(asf_result):
 # add_conditional_value_at_risk
 # ---------------------------------------------------------------------------
 
-_ALPHA = 0.95
-_SCALE = 1.0 / (1.0 - _ALPHA)
+_ALPHA = 0.05
+_SCALE = 1.0 / _ALPHA
 
 
 @pytest.fixture(name="cvar_result")
@@ -724,7 +724,7 @@ def test_cvar_result_added_as_objective(cvar_result):
 @pytest.mark.schema
 @pytest.mark.scenario
 def test_cvar_expression_uses_correct_scale(cvar_result):
-    """CVaR expression multiplies the weighted sum by 1/(1-alpha)."""
+    """CVaR expression multiplies the weighted sum by 1/alpha."""
     problem, _ = cvar_result
     obj = next(o for o in problem.objectives or [] if o.symbol == "CVAR_f_1")
     func = obj.func
@@ -1055,7 +1055,7 @@ def test_weighted_multiple_aggregations(model):
         scenario_model=model, symbols=["f_1", "f_2", "f_3"], combined=problem, symbol_maps=symbol_maps
     )
     problem, _added3 = add_conditional_value_at_risk(
-        scenario_model=model, symbols=["f_1", "f_2", "f_3"], alpha=0.95, combined=problem, symbol_maps=symbol_maps
+        scenario_model=model, symbols=["f_1", "f_2", "f_3"], alpha=0.05, combined=problem, symbol_maps=symbol_maps
     )
     problem, _added4 = add_weighted_scenarios(
         scenario_model=model,
@@ -1543,7 +1543,7 @@ def test_other_aggregators_accept_a_forward_referencing_constraint():
     combined, symbol_maps = build_combined_scenario_problem(model)
 
     for problem, _ in (
-        add_conditional_value_at_risk(model, ["con_a"], alpha=0.9, combined=combined, symbol_maps=symbol_maps),
+        add_conditional_value_at_risk(model, ["con_a"], alpha=0.1, combined=combined, symbol_maps=symbol_maps),
         add_worst_case_robust(model, ["con_a"], combined=combined, symbol_maps=symbol_maps),
     ):
         PolarsEvaluator(problem).evaluate({v.symbol: [1.0] for v in problem.variables})

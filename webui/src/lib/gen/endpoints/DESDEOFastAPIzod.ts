@@ -6829,7 +6829,7 @@ export const InitializeMethodCumulusInitializePostBody = zod
 								.union([zod.number(), zod.null()])
 								.optional()
 								.describe(
-									'Confidence level for CVaR, e.g. 0.95. Required for conditional_value_at_risk.'
+									"Probability mass of the averaged tail of worst outcomes in the element's own direction, e.g. 0.05 for the worst 5 % (often called CVaR 95 %). Required for conditional_value_at_risk."
 								),
 							leaf_weights: zod
 								.union([zod.record(zod.string(), zod.number()), zod.null()])
@@ -7043,7 +7043,7 @@ export const GetOrInitializeMethodCumulusGetOrInitializePostBody = zod
 								.union([zod.number(), zod.null()])
 								.optional()
 								.describe(
-									'Confidence level for CVaR, e.g. 0.95. Required for conditional_value_at_risk.'
+									"Probability mass of the averaged tail of worst outcomes in the element's own direction, e.g. 0.05 for the worst 5 % (often called CVaR 95 %). Required for conditional_value_at_risk."
 								),
 							leaf_weights: zod
 								.union([zod.record(zod.string(), zod.number()), zod.null()])
@@ -7416,7 +7416,7 @@ export const ApplyScenarioMeasuresMethodCumulusApplyScenarioMeasuresPostBody = z
 								.union([zod.number(), zod.null()])
 								.optional()
 								.describe(
-									'Confidence level for CVaR, e.g. 0.95. Required for conditional_value_at_risk.'
+									"Probability mass of the averaged tail of worst outcomes in the element's own direction, e.g. 0.05 for the worst 5 % (often called CVaR 95 %). Required for conditional_value_at_risk."
 								),
 							leaf_weights: zod
 								.union([zod.record(zod.string(), zod.number()), zod.null()])
@@ -7913,7 +7913,7 @@ export const ModifyProblemMethodCumulusModifyProblemPostBody = zod
 										.union([zod.number(), zod.null()])
 										.optional()
 										.describe(
-											'Confidence level for CVaR, e.g. 0.95. Required for conditional_value_at_risk.'
+											"Probability mass of the averaged tail of worst outcomes in the element's own direction, e.g. 0.05 for the worst 5 % (often called CVaR 95 %). Required for conditional_value_at_risk."
 										),
 									leaf_weights: zod
 										.union([zod.record(zod.string(), zod.number()), zod.null()])
