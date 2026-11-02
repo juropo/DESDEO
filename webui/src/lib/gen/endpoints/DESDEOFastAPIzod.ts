@@ -6751,6 +6751,8 @@ export const InitializeMethodCumulusInitializePostQueryParams = zod.object({
 });
 
 export const initializeMethodCumulusInitializePostBodyStartingPointOnePreferenceTypeDefault = `reference_point`;
+export const initializeMethodCumulusInitializePostBodyUncertaintyMeasuresOneItemAlphaOneExclusiveMin = 0;
+export const initializeMethodCumulusInitializePostBodyUncertaintyMeasuresOneItemAlphaOneExclusiveMax = 1;
 
 export const InitializeMethodCumulusInitializePostBody = zod
 	.object({
@@ -6830,7 +6832,17 @@ export const InitializeMethodCumulusInitializePostBody = zod
 								.optional()
 								.describe('Prefix for the new aggregate symbols. Defaults vary by measure_type.'),
 							alpha: zod
-								.union([zod.number(), zod.null()])
+								.union([
+									zod
+										.number()
+										.gt(
+											initializeMethodCumulusInitializePostBodyUncertaintyMeasuresOneItemAlphaOneExclusiveMin
+										)
+										.lt(
+											initializeMethodCumulusInitializePostBodyUncertaintyMeasuresOneItemAlphaOneExclusiveMax
+										),
+									zod.null()
+								])
 								.optional()
 								.describe(
 									"Probability mass of the averaged tail of worst outcomes in the element's own direction, e.g. 0.05 for the worst 5 % (often called CVaR 95 %). Required for conditional_value_at_risk."
@@ -6972,6 +6984,8 @@ export const GetOrInitializeMethodCumulusGetOrInitializePostQueryParams = zod.ob
 });
 
 export const getOrInitializeMethodCumulusGetOrInitializePostBodyStartingPointOnePreferenceTypeDefault = `reference_point`;
+export const getOrInitializeMethodCumulusGetOrInitializePostBodyUncertaintyMeasuresOneItemAlphaOneExclusiveMin = 0;
+export const getOrInitializeMethodCumulusGetOrInitializePostBodyUncertaintyMeasuresOneItemAlphaOneExclusiveMax = 1;
 
 export const GetOrInitializeMethodCumulusGetOrInitializePostBody = zod
 	.object({
@@ -7051,7 +7065,17 @@ export const GetOrInitializeMethodCumulusGetOrInitializePostBody = zod
 								.optional()
 								.describe('Prefix for the new aggregate symbols. Defaults vary by measure_type.'),
 							alpha: zod
-								.union([zod.number(), zod.null()])
+								.union([
+									zod
+										.number()
+										.gt(
+											getOrInitializeMethodCumulusGetOrInitializePostBodyUncertaintyMeasuresOneItemAlphaOneExclusiveMin
+										)
+										.lt(
+											getOrInitializeMethodCumulusGetOrInitializePostBodyUncertaintyMeasuresOneItemAlphaOneExclusiveMax
+										),
+									zod.null()
+								])
 								.optional()
 								.describe(
 									"Probability mass of the averaged tail of worst outcomes in the element's own direction, e.g. 0.05 for the worst 5 % (often called CVaR 95 %). Required for conditional_value_at_risk."
@@ -7387,6 +7411,8 @@ export const ApplyScenarioMeasuresMethodCumulusApplyScenarioMeasuresPostQueryPar
 });
 
 export const applyScenarioMeasuresMethodCumulusApplyScenarioMeasuresPostBodyStartingPointOnePreferenceTypeDefault = `reference_point`;
+export const applyScenarioMeasuresMethodCumulusApplyScenarioMeasuresPostBodyUncertaintyMeasuresOneItemAlphaOneExclusiveMin = 0;
+export const applyScenarioMeasuresMethodCumulusApplyScenarioMeasuresPostBodyUncertaintyMeasuresOneItemAlphaOneExclusiveMax = 1;
 
 export const ApplyScenarioMeasuresMethodCumulusApplyScenarioMeasuresPostBody = zod
 	.object({
@@ -7466,7 +7492,17 @@ export const ApplyScenarioMeasuresMethodCumulusApplyScenarioMeasuresPostBody = z
 								.optional()
 								.describe('Prefix for the new aggregate symbols. Defaults vary by measure_type.'),
 							alpha: zod
-								.union([zod.number(), zod.null()])
+								.union([
+									zod
+										.number()
+										.gt(
+											applyScenarioMeasuresMethodCumulusApplyScenarioMeasuresPostBodyUncertaintyMeasuresOneItemAlphaOneExclusiveMin
+										)
+										.lt(
+											applyScenarioMeasuresMethodCumulusApplyScenarioMeasuresPostBodyUncertaintyMeasuresOneItemAlphaOneExclusiveMax
+										),
+									zod.null()
+								])
 								.optional()
 								.describe(
 									"Probability mass of the averaged tail of worst outcomes in the element's own direction, e.g. 0.05 for the worst 5 % (often called CVaR 95 %). Required for conditional_value_at_risk."
@@ -7882,6 +7918,8 @@ export const ModifyProblemMethodCumulusModifyProblemPostQueryParams = zod.object
 });
 
 export const modifyProblemMethodCumulusModifyProblemPostBodyModificationsSoftConstraintsOneItemViolationSymbolDefault = `constraint_violation`;
+export const modifyProblemMethodCumulusModifyProblemPostBodyModificationsUncertaintyMeasuresOneItemAlphaOneExclusiveMin = 0;
+export const modifyProblemMethodCumulusModifyProblemPostBodyModificationsUncertaintyMeasuresOneItemAlphaOneExclusiveMax = 1;
 
 export const ModifyProblemMethodCumulusModifyProblemPostBody = zod
 	.object({
@@ -7969,7 +8007,17 @@ export const ModifyProblemMethodCumulusModifyProblemPostBody = zod
 											'Prefix for the new aggregate symbols. Defaults vary by measure_type.'
 										),
 									alpha: zod
-										.union([zod.number(), zod.null()])
+										.union([
+											zod
+												.number()
+												.gt(
+													modifyProblemMethodCumulusModifyProblemPostBodyModificationsUncertaintyMeasuresOneItemAlphaOneExclusiveMin
+												)
+												.lt(
+													modifyProblemMethodCumulusModifyProblemPostBodyModificationsUncertaintyMeasuresOneItemAlphaOneExclusiveMax
+												),
+											zod.null()
+										])
 										.optional()
 										.describe(
 											"Probability mass of the averaged tail of worst outcomes in the element's own direction, e.g. 0.05 for the worst 5 % (often called CVaR 95 %). Required for conditional_value_at_risk."

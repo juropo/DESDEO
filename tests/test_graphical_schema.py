@@ -132,8 +132,8 @@ def test_risk_measure_alpha_out_of_range_raises():
 
 def test_risk_measure_alpha_valid():
     """A valid `alpha` is kept as given."""
-    risk = RiskMeasure(symbol="R", target="F", alpha=0.95)
-    assert risk.alpha == 0.95
+    risk = RiskMeasure(symbol="R", target="F", alpha=0.05)
+    assert risk.alpha == 0.05
 
 
 # ── DecisionAnnotation: internal consistency ────────────────────────────────────────────────
@@ -169,14 +169,14 @@ def test_annotation_duplicate_symbols_across_categories_raises():
 
 def test_annotation_risk_measure_unknown_target_raises():
     """A risk measure targeting an objective symbol that doesn't exist is rejected."""
-    risk = RiskMeasure(symbol="R", target="nonexistent", alpha=0.9)
+    risk = RiskMeasure(symbol="R", target="nonexistent", alpha=0.1)
     with pytest.raises(ValidationError, match="unknown objective"):
         _annotation(risk_measures=[risk])
 
 
 def test_annotation_risk_measure_known_target_ok():
     """A risk measure targeting a real objective symbol is accepted."""
-    risk = RiskMeasure(symbol="R", target="F", alpha=0.9)
+    risk = RiskMeasure(symbol="R", target="F", alpha=0.1)
     annotation = _annotation(risk_measures=[risk])
     assert annotation.risk_measures[0].target == "F"
 

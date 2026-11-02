@@ -48,6 +48,7 @@ from desdeo.api.routers.utils import (
     _may_access_state,
     fetch_interactive_session_with_role_check,
     fetch_problem_with_role_check,
+    find_graphical_metadata,
     get_solver_results_at,
 )
 from desdeo.problem import Problem
@@ -269,16 +270,8 @@ def compile_graphical_model(
 
 
 def _fetch_graphical_metadata(problem_id: int, db_session: Session) -> GraphicalModelMetaData:
-    """The most recently added `GraphicalModelMetaData` row for `problem_id`, or 404.
-
-    Queried directly with an explicit order, since `ProblemMetaDataDB.all_metadata` is unordered.
-    """
-    row = db_session.exec(
-        select(GraphicalModelMetaData)
-        .join(ProblemMetaDataDB, GraphicalModelMetaData.metadata_id == ProblemMetaDataDB.id)
-        .where(ProblemMetaDataDB.problem_id == problem_id)
-        .order_by(GraphicalModelMetaData.id.desc())
-    ).first()
+    """`find_graphical_metadata` for `problem_id`, or 404 if there is none."""
+    row = find_graphical_metadata(problem_id, db_session)
     if row is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -1314,6 +1307,7 @@ def _sweep_node(
     annotation: DecisionAnnotation,
     base_evidence: dict[str, str],
     sweep_node_name: str,
+    *,
     target: str,
     target_state: str | None,
     states: list[str] | None = None,
@@ -1479,8 +1473,8 @@ def sensitivity(
                     annotation,
                     request.evidence,
                     name,
-                    request.target,
-                    request.target_state,
+                    target=request.target,
+                    target_state=request.target_state,
                     states=surviving_states,
                 )
                 low, high = min(values.values()), max(values.values())
@@ -1603,8 +1597,8 @@ def value_of_information(
                 annotation,
                 request.evidence,
                 request.node,
-                request.target,
-                None,
+                target=request.target,
+                target_state=None,
                 states=possible_states,
             )
             expected_with_observation = sum(marginal[state] * values[state] for state in possible_states)

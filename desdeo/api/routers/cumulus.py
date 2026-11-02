@@ -78,6 +78,7 @@ from desdeo.problem.graphical import (
     DecisionAnnotation,
     DiagramAssumptions,
     DiscreteNetwork,
+    IndexMap,
     compile_with_assumptions,
 )
 from desdeo.problem.json_parser import FormatEnum, MathParser
@@ -184,7 +185,13 @@ def _resolve_uncertainty_source(
             symbols = [obj.symbol for obj in current.objectives] + [obj.symbol for obj in scenario_model_db.objectives]
             return _UncertaintySource(current, list(dict.fromkeys(symbols)), scenario_model_db=scenario_model_db)
         meta = find_graphical_metadata(current.id, db_session)
-        if meta is not None:
+        stored = (
+            IndexMap.model_validate_json(meta.index_map_json).outcome_distributions
+            if meta is not None and meta.index_map_json is not None
+            else {}
+        )
+        # Rebuilt distributions have the stored ones' symbols, so none of the objectives can match.
+        if meta is not None and (not stored or not stored.keys().isdisjoint(o.symbol for o in current.objectives)):
             try:
                 _, distributions = graphical_outcome_distributions(Problem.from_problemdb(current), meta)
             except ValueError as e:
@@ -280,6 +287,20 @@ def _replace_solution_descriptions(
     db_session.commit()
 
 
+def _store_outcome_distributions(problem_db: ProblemDB, problem: Problem, db_session: Session) -> None:
+    """Store `problem`'s outcome distributions in `problem_db`'s graphical index map if it has none."""
+    meta = find_graphical_metadata(problem_db.id, db_session)
+    if meta is None or meta.index_map_json is None:
+        return
+    index_map = IndexMap.model_validate_json(meta.index_map_json)
+    if index_map.outcome_distributions:
+        return
+    _, distributions = graphical_outcome_distributions(problem, meta)
+    meta.index_map_json = index_map.model_copy(update={"outcome_distributions": distributions}).model_dump_json()
+    db_session.add(meta)
+    db_session.commit()
+
+
 def _build_combined_problem_and_initialize(
     request: CumulusInitializationRequest,
     context: SessionContext,
@@ -333,6 +354,7 @@ def _build_combined_problem_and_initialize(
     db_session.commit()
     if descriptions is not None:
         _replace_solution_descriptions(new_problem_db, descriptions, db_session)
+        _store_outcome_distributions(new_problem_db, combined_problem, db_session)
 
     new_context = SessionContext(
         user=user,
@@ -1524,6 +1546,7 @@ def modify_problem(
     db_session.commit()
     if descriptions is not None:
         _replace_solution_descriptions(new_problem_db, descriptions, db_session)
+        _store_outcome_distributions(new_problem_db, modified_problem, db_session)
 
     original_problem_id = request.original_problem_id if request.original_problem_id is not None else problem_db.id
 
@@ -1620,6 +1643,9 @@ def create_hypothetical(
             "description": problem_db.description,
         }
     )
+    # The problem is recompiled with the original objectives, so its descriptions are those of
+    # the problem `problem_db`'s aggregates (if any) are built on.
+    descriptions = _retargeted_solution_descriptions(problem_db, problem, [], db_session)
     new_problem_db = ProblemDB.from_problem(problem, user=context.user)
     new_problem_db.is_temporary = True
     new_problem_db.parent_problem_id = problem_db.id
@@ -1629,6 +1655,7 @@ def create_hypothetical(
 
     copy_problem_metadata(problem_db, new_problem_db, db_session)
     db_session.commit()
+    _replace_solution_descriptions(new_problem_db, descriptions, db_session)
     new_meta = _fetch_graphical_metadata(new_problem_db.id, db_session)
     new_meta.network_json = conditioned.model_dump_json()
     new_meta.rjt_json = rjt.model_dump_json()

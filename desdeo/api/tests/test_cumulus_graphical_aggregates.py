@@ -661,3 +661,79 @@ def test_retarget_description_parts(client: TestClient, session_and_user: dict) 
     assert texts([{"text": "a"}, investment, robust_investment]) == ["a", "robust_investment"]
     assert texts([{"text": "a"}, {"text": "b"}]) == ["a", "b"]
     assert texts([{"text": "a"}, {"symbol": "x"}], {"x": "robust_investment"}) == ["a", "robust_investment"]
+
+
+@pytest.mark.cvxpy
+@pytest.mark.parametrize(
+    "measures",
+    [
+        [{"measure_type": "expected_value", "symbols": ["profit"]}],
+        [{"measure_type": "worst_case_robust", "symbols": ["profit"]}],
+    ],
+)
+def test_hypothetical_from_aggregate_solution_description(
+    client: TestClient, session_and_user: dict, monkeypatch: pytest.MonkeyPatch, measures: list[dict]
+) -> None:
+    """A hypothetical made from an aggregate problem describes solutions with the original objectives."""
+    session = session_and_user["session"]
+    token = login(client)
+    problem_id = _compile_oil_wildcatter(client, token)
+    parts = [
+        {"text": "Outcomes:"},
+        {"label": "Profit", "symbol": "profit", "format_spec": ".0f"},
+        {"label": "Double profit", "expression": ["Multiply", 2, "profit"], "format_spec": ".0f"},
+    ]
+    resp = post_json(client, "/solution-description/update_metadata", {"problem_id": problem_id, "parts": parts}, token)
+    assert resp.status_code == 200, resp.text
+    agg_id = _aggregate(client, token, problem_id, measures)["problem_id"]
+
+    hyp_resp = _hypothetical(client, token, agg_id, chance={"structure": "soaking"})
+    assert hyp_resp.status_code == 200, hyp_resp.text
+    hyp_id = hyp_resp.json()["problem_id"]
+    _run_checks(session, monkeypatch, hyp_id, hyp_resp.json()["state_id"])
+    resp = post_json(client, "/method/cumulus/initialize", {"problem_id": hyp_id}, token)
+    assert resp.status_code == 200, resp.text
+    init = resp.json()
+
+    resp = post_json(
+        client,
+        "/solution-description/get",
+        {"problem_id": hyp_id, "solution": {"state_id": init["state_id"], "solution_index": 0}},
+        token,
+    )
+    assert resp.status_code == 200, resp.text
+    profit = init["current_solutions"][0]["objective_values"]["profit"]
+    assert resp.json()["description"] == f"Outcomes:\nProfit: {profit:.0f}\nDouble profit: {2 * profit:.0f}"
+
+
+def test_cvar_alpha_out_of_range_rejected(client: TestClient, session_and_user: dict) -> None:
+    """A CVaR alpha outside (0, 1) returns 422 from request validation."""
+    token = login(client)
+    problem_id = _compile_oil_wildcatter(client, token)
+    resp = post_json(
+        client,
+        "/method/cumulus/get-or-initialize",
+        {"problem_id": problem_id, "uncertainty_measures": _measures(cvar_alpha=1.5)},
+        token,
+    )
+    assert resp.status_code == 422
+
+
+@pytest.mark.cvxpy
+def test_aggregate_stores_rebuilt_outcome_distributions(client: TestClient, session_and_user: dict) -> None:
+    """An aggregate built from an index map without outcome distributions stores the rebuilt ones."""
+    session = session_and_user["session"]
+    token = login(client)
+    problem_id = _compile_oil_wildcatter(client, token)
+    meta = find_graphical_metadata(problem_id, session)
+    index_map = IndexMap.model_validate_json(meta.index_map_json)
+    meta.index_map_json = index_map.model_copy(update={"outcome_distributions": {}}).model_dump_json()
+    session.add(meta)
+    session.commit()
+
+    agg_id = _aggregate(client, token, problem_id, [{"measure_type": "expected_value", "symbols": ["profit"]}])[
+        "problem_id"
+    ]
+    session.expire_all()
+    stored = IndexMap.model_validate_json(find_graphical_metadata(agg_id, session).index_map_json)
+    assert stored.outcome_distributions == index_map.outcome_distributions

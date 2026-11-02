@@ -244,6 +244,8 @@ class UncertaintyMeasureSpec(BaseModel):
     )
     alpha: float | None = Field(
         default=None,
+        gt=0,
+        lt=1,
         description=(
             "Probability mass of the averaged tail of worst outcomes in the element's own direction, "
             "e.g. 0.05 for the worst 5 % (often called CVaR 95 %). Required for conditional_value_at_risk."

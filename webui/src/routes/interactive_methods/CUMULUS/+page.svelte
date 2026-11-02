@@ -818,7 +818,6 @@
 		create_hypothetical as createHypotheticalRequest,
 		default_solution_name,
 		get_objective_constraints as getObjectiveConstraintsRequest,
-		only_available_measures as onlyAvailableMeasures,
 		preselected_measures as preselectedMeasures,
 		type MeasureType,
 		type MeasureOptions
