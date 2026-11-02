@@ -67,11 +67,13 @@
 
 	import type { ProblemInfo, Solution, SolutionType, MethodMode, PeriodKey } from '$lib/types';
 	import type { Response, MapState } from './types';
+	import type { PageProps } from './$types';
+	import type { TableData } from '../GNIMBUS/types';
 
 	let current_state: Response = $state({} as Response);
 
 	let problem: ProblemInfo | null = $state(null);
-	const { data } = $props<{ data: ProblemInfo[] }>();
+	const { data }: PageProps = $props();
 	let problem_list = $derived(data.problems ?? []);
 
 	let selected_type_solutions = $state('current');
@@ -135,24 +137,24 @@
 	let warning_message: string | null = $state(null);
 
 	// Objective constraint dialog state
-	type ConstraintType = '<=0' | '=0' | '<=0 (soft)' | '=0 (soft)';
+	type ConstraintType = '<=0' | '=0';
 	interface ObjectiveConstraint {
 		id: number;
 		func: string;
 		type: ConstraintType;
 	}
-	const CONSTRAINT_TYPES: ConstraintType[] = ['<=0', '=0', '<=0 (soft)', '=0 (soft)'];
+	const CONSTRAINT_TYPES: ConstraintType[] = ['<=0', '=0'];
 	let show_constraint_dialog = $state(false);
-	// Progress text for the hard-bound path, which rebuilds the problem and can take a while.
-	let constraint_progress: string | null = $state(null);
 	let constraint_obj_filter: 'active' | 'all' = $state('active');
 	let pending_constraints: ObjectiveConstraint[] = $state([]);
+	// The list in effect on the backend; the dialog opens on a copy of it.
+	let applied_constraints: ObjectiveConstraint[] = $state([]);
 	let next_constraint_id = $state(0);
 
 	function add_constraint() {
 		pending_constraints = [
 			...pending_constraints,
-			{ id: next_constraint_id++, func: '', type: '<=0 (soft)' }
+			{ id: next_constraint_id++, func: '', type: '<=0' }
 		];
 	}
 
@@ -163,38 +165,29 @@
 	async function apply_constraints() {
 		if (!problem) return;
 
-		constraint_progress = null;
 		const result = await setObjectiveConstraintsRequest(
 			problem,
 			current_state.state_id ?? null,
-			pending_constraints,
-			(message) => (constraint_progress = message)
+			pending_constraints
 		);
-		constraint_progress = null;
-
 		if (!result) return;
+		applied_constraints = pending_constraints.map((c) => ({ ...c }));
 		show_constraint_dialog = false;
+	}
 
-		if (result.new_problem_id === null) return;
+	async function load_constraints() {
+		if (!problem) return;
+		const constraints = await getObjectiveConstraintsRequest(problem.id);
+		if (!constraints) return;
+		applied_constraints = constraints.map((c) => ({ id: next_constraint_id++, ...c }));
+	}
 
-		// Hard bounds rebuilt the problem. Solving, saving and the solution archive are all
-		// scoped by problem id, so the session has to follow it. Scenario detection is skipped:
-		// the bounded problem inherits whatever the decision maker already chose, and asking
-		// again here would be wrong.
-		const initialization = await initializeCumulusStateRequest(result.new_problem_id, true);
-		if (!initialization) return;
-
-		await apply_initialization_result(initialization);
-		warning_message = result.current_solution_excluded
-			? 'The bounds exclude the solution you were on, so the method restarted from a new ' +
-				'starting point. Your earlier solutions are still available under the unbounded problem.'
-			: 'The bounds created a new problem and the method restarted against it. Your earlier ' +
-				'solutions are still available under the unbounded problem.';
+	function open_constraint_dialog() {
+		pending_constraints = applied_constraints.map((c) => ({ ...c }));
+		show_constraint_dialog = true;
 	}
 
 	function cancel_constraints() {
-		pending_constraints = [];
-		constraint_progress = null;
 		show_constraint_dialog = false;
 	}
 
@@ -606,11 +599,12 @@
 
 	async function confirm_scenario_setup() {
 		show_scenario_setup_dialog = false;
+		if (!problem) return;
 		if (selected_measures.length === 0) {
 			// No measures chosen — treat as "use plain problem". Only meaningful on first load;
 			// reopening from the menu with nothing selected is just a no-op cancel.
 			if (scenario_setup_mode === 'initial') {
-				const plainResult = await initializeCumulusStateRequest(problem?.id!, true);
+				const plainResult = await initializeCumulusStateRequest(problem.id, true);
 				if (plainResult) await apply_initialization_result(plainResult);
 				await refresh_scenario_availability();
 			}
@@ -620,20 +614,20 @@
 		const scenarioResult =
 			scenario_setup_mode === 'initial'
 				? await initializeCumulusStateWithScenariosRequest(
-						problem?.id!,
+						problem.id,
 						pending_scenario_model_id,
 						pending_objective_symbols,
 						selected_measures,
 						measure_options,
-						combined_problem_name.trim() || undefined
+						combined_problem_name.trim() ? combined_problem_name.trim() : undefined
 					)
 				: await applyScenarioMeasuresRequest(
-						problem?.id!,
+						problem.id,
 						pending_scenario_model_id,
 						pending_objective_symbols,
 						selected_measures,
 						measure_options,
-						combined_problem_name.trim() || undefined
+						combined_problem_name.trim() ? combined_problem_name.trim() : undefined
 					);
 		if (scenarioResult) {
 			await apply_initialization_result(scenarioResult);
@@ -644,8 +638,9 @@
 
 	async function cancel_scenario_setup() {
 		show_scenario_setup_dialog = false;
+		if (!problem) return;
 		if (scenario_setup_mode === 'initial') {
-			const plainResult = await initializeCumulusStateRequest(problem?.id!, true);
+			const plainResult = await initializeCumulusStateRequest(problem.id, true);
 			if (plainResult) await apply_initialization_result(plainResult);
 			await refresh_scenario_availability();
 		}
@@ -654,7 +649,8 @@
 	function confirm_finish() {
 		const selectedSolution = chosen_solutions[selectedIndexes[0]];
 		const final_solution = { ...selectedSolution };
-		const solutionName = selectedSolution.name || `Solution #${selectedIndexes[0] + 1}`;
+		const solutionName =
+			blankToNull(selectedSolution.name) ?? `Solution #${selectedIndexes[0] + 1}`;
 
 		openConfirmDialog({
 			title: 'Confirm Final Choice',
@@ -662,7 +658,7 @@
 			confirmText: 'Yes, Proceed',
 			cancelText: 'Cancel',
 			confirmVariant: 'destructive',
-			onConfirm: () => handle_finish(final_solution, selectedIndexes[0])
+			onConfirm: () => void handle_finish(final_solution, selectedIndexes[0])
 		});
 	}
 
@@ -671,11 +667,7 @@
 			console.error('No previous preference values found for finishing.');
 			return;
 		}
-		const response = await handleFinishRequest(
-			problem,
-			final_solution,
-			current_state.previous_preference
-		);
+		const response = await handleFinishRequest(problem, final_solution);
 		if (response) {
 			selected_iteration_index = [index];
 			mode = 'final';
@@ -685,6 +677,7 @@
 	import {
 		handle_intermediate as handleIntermediateRequest,
 		handle_iterate as handleIterateRequest,
+		blankToNull,
 		handle_save as handleSaveRequest,
 		handle_remove_saved as handleRemoveSavedRequest,
 		handle_finish as handleFinishRequest,
@@ -696,6 +689,7 @@
 		apply_scenario_measures as applyScenarioMeasuresRequest,
 		set_objective_constraints as setObjectiveConstraintsRequest,
 		apply_network_bounds,
+		get_objective_constraints as getObjectiveConstraintsRequest,
 		type MeasureType,
 		type MeasureOptions
 	} from './handlers';
@@ -730,14 +724,15 @@
 			description: 'Enter a name for this solution.',
 			confirmText: 'Save',
 			cancelText: 'Cancel',
-			initialValue: solution.name || '',
+			initialValue: solution.name ?? '',
 			placeholder: 'Solution name',
-			onConfirm: (name) => handle_save(solution, name)
+			required: true,
+			onConfirm: (name) => void handle_save(solution, name.trim())
 		});
 	}
 
 	async function handle_save(solution: Solution, name: string | undefined) {
-		const solutionToSave = { ...solution, name: name || null };
+		const solutionToSave = { ...solution, name: blankToNull(name) };
 
 		const success = await handleSaveRequest(problem, solution, name);
 
@@ -758,7 +753,7 @@
 				updatedSavedSolutions = [...current_state.saved_solutions];
 				updatedSavedSolutions[existingIndex] = {
 					...updatedSavedSolutions[existingIndex],
-					name: name || null
+					name: blankToNull(name)
 				};
 			} else {
 				updatedSavedSolutions = [...current_state.saved_solutions, solutionToSave];
@@ -776,10 +771,10 @@
 	function confirm_remove_saved(solution: Solution) {
 		openConfirmDialog({
 			title: 'Remove Saved Solution',
-			description: `Are you sure you want to remove ${solution.name || 'this solution'} from saved solutions?`,
+			description: `Are you sure you want to remove ${blankToNull(solution.name) ?? 'this solution'} from saved solutions?`,
 			confirmText: 'Remove',
 			cancelText: 'Cancel',
-			onConfirm: () => handle_remove_saved(solution)
+			onConfirm: () => void handle_remove_saved(solution)
 		});
 	}
 
@@ -801,12 +796,7 @@
 		}
 	}
 
-	async function handle_iterate(_data: {
-		numSolutions: number;
-		typePreferences: string;
-		preferenceValues: number[];
-		objectiveValues: number[];
-	}) {
+	async function handle_iterate() {
 		if (!problem) {
 			console.error('No problem selected');
 			return;
@@ -877,19 +867,12 @@
 					mapDescription: data.description
 				};
 
-				for (let year of newMapState.yearlist) {
-					if (data.options[year]?.tooltip?.formatterEnabled) {
-						data.options[year].tooltip.formatter = function (params: any) {
-							return `${params.name}`;
-						};
-					}
-				}
-
+				// get_maps has already set up the tooltip formatters.
 				newMapState.mapOptions = {
-					period1: data.options[newMapState.yearlist[0]] || {},
-					period2: data.options[newMapState.yearlist[1]] || {},
-					period3: data.options[newMapState.yearlist[2]] || {}
-				} as Record<PeriodKey, Record<string, any>>;
+					period1: data.options[newMapState.yearlist[0]] ?? {},
+					period2: data.options[newMapState.yearlist[1]] ?? {},
+					period3: data.options[newMapState.yearlist[2]] ?? {}
+				};
 
 				mapStates[solutionIndex] = newMapState;
 				if (solutionIndex === selected_iteration_index[0]) {
@@ -903,9 +886,9 @@
 
 	$effect(() => {
 		if (hasUtopiaMetadata && chosen_solutions.length > 0) {
-			mapStates = new Array(chosen_solutions.length);
+			mapStates = new Array<MapState>(chosen_solutions.length);
 			chosen_solutions.forEach((solution, index) => {
-				get_maps(solution, index);
+				void get_maps(solution, index);
 			});
 		}
 	});
@@ -920,7 +903,7 @@
 		}
 
 		const selectedSolution = chosen_solutions[selected_iteration_index[0]];
-		selected_iteration_objectives = selectedSolution.objective_values || {};
+		selected_iteration_objectives = selectedSolution.objective_values ?? {};
 
 		if (
 			hasUtopiaMetadata &&
@@ -931,7 +914,7 @@
 		}
 
 		if (hasSolutionDescription && problem) {
-			getSolutionDescriptionRequest(problem, selectedSolution).then((desc) => {
+			void getSolutionDescriptionRequest(problem, selectedSolution).then((desc) => {
 				solutionDescription = desc;
 			});
 		}
@@ -939,7 +922,10 @@
 
 	function update_preferences_from_state(state: Response | null) {
 		if (!problem) return;
-		current_preference = updatePreferencesFromState(state as any, problem);
+		current_preference = updatePreferencesFromState(
+			state as unknown as Parameters<typeof updatePreferencesFromState>[0],
+			problem
+		);
 		last_iterated_preference = [...current_preference];
 	}
 
@@ -967,9 +953,10 @@
 
 	onMount(async () => {
 		if ($methodSelection.selectedProblemId) {
-			problem = problem_list.find(
-				(p: ProblemInfo) => String(p.id) === String($methodSelection.selectedProblemId)
-			);
+			problem =
+				problem_list.find(
+					(p: ProblemInfo) => String(p.id) === String($methodSelection.selectedProblemId)
+				) ?? null;
 
 			if (problem) {
 				hasUtopiaMetadata = checkUtopiaMetadata(problem);
@@ -1010,7 +997,7 @@
 		if (result.problem_id && problem && (problem_changed || bounds_incomplete)) {
 			const resp = await getProblemProblemProblemIdGet(result.problem_id);
 			if (resp.status === 200 && resp.data) {
-				problem = resp.data as typeof problem;
+				problem = resp.data;
 				hasUtopiaMetadata = checkUtopiaMetadata(problem);
 				hasSolutionDescription = !hasUtopiaMetadata && checkSolutionDescription(problem);
 				active_objective_symbols = new Set(problem.objectives.map((o) => o.symbol));
@@ -1041,6 +1028,7 @@
 		if (current_state.response_type === 'cumulus.finalize') {
 			mode = 'final';
 		}
+		await load_constraints();
 	}
 
 	let type_preferences = $state(PREFERENCE_TYPES.ReferencePoint);
@@ -1072,11 +1060,11 @@
 </svelte:head>
 
 {#if $isLoading}
-	<LoadingSpinner text={constraint_progress ?? ''} />
+	<LoadingSpinner />
 {/if}
 
 {#if $errorMessage}
-	<Alert title="Error" message={$errorMessage} variant="destructive" />
+	<Alert title="Error" message={$errorMessage} variant="destructive" timeout={0} />
 {/if}
 
 {#if warning_message}
@@ -1084,6 +1072,7 @@
 		title="Warning"
 		message={warning_message}
 		variant="default"
+		timeout={0}
 		onClose={() => (warning_message = null)}
 	/>
 {/if}
@@ -1106,7 +1095,6 @@
 									filtered_problem
 								)}
 								externalSelectedIndexes={selected_iteration_index}
-								onSelectSolution={() => {}}
 							/>
 						</Resizable.Pane>
 
@@ -1140,7 +1128,7 @@
 			{#if problem && chosen_solutions.length > 0 && selected_iteration_index.length > 0}
 				<EndStateView
 					{problem}
-					tableData={[chosen_solutions[selected_iteration_index[0]] as any]}
+					tableData={[chosen_solutions[selected_iteration_index[0]] as unknown as TableData]}
 				/>
 			{/if}
 		{/snippet}
@@ -1247,7 +1235,7 @@
 					{/snippet}
 				</DropdownMenu.Trigger>
 				<DropdownMenu.Content align="end">
-					<DropdownMenu.Item onclick={() => (show_constraint_dialog = true)}
+					<DropdownMenu.Item onclick={open_constraint_dialog}
 						>Add objective constraint</DropdownMenu.Item
 					>
 					<DropdownMenu.Item
@@ -1366,7 +1354,7 @@
 					</Dialog.Description>
 				</Dialog.Header>
 				<div class="space-y-3 py-4">
-					{#each problem.objectives as objective}
+					{#each problem.objectives as objective (objective.symbol)}
 						{@const isActive = active_objective_symbols.has(objective.symbol)}
 						{@const isLast = active_objective_symbols.size === 1 && isActive}
 						{@const checkboxId = `obj-checkbox-${objective.symbol}`}
@@ -1376,10 +1364,11 @@
 								checked={isActive}
 								disabled={isLast}
 								onCheckedChange={(checked) => {
-									const next = new Set(active_objective_symbols);
-									if (checked) next.add(objective.symbol);
-									else next.delete(objective.symbol);
-									active_objective_symbols = next;
+									active_objective_symbols = new Set(
+										checked
+											? [...active_objective_symbols, objective.symbol]
+											: [...active_objective_symbols].filter((s) => s !== objective.symbol)
+									);
 								}}
 							/>
 							<label
@@ -1429,7 +1418,7 @@
 						class="rounded border px-2 py-1 text-sm"
 					/>
 				</div>
-				{#each AVAILABLE_MEASURES as measure}
+				{#each AVAILABLE_MEASURES as measure (measure.value)}
 					{@const isChecked = selected_measures.includes(measure.value)}
 					{@const checkboxId = `measure-checkbox-${measure.value}`}
 					<div class="flex items-center gap-3">
@@ -1488,11 +1477,8 @@
 					<Dialog.Title>Add Objective Constraints</Dialog.Title>
 					<Dialog.Description>
 						Define constraints on the objective functions. Changes take effect only when you press
-						Apply. Soft constraints are penalised when violated and leave the problem as it is. Hard
-						constraints (<span class="font-mono">&lt;=0</span> and
-						<span class="font-mono">=0</span>) shrink the feasible region, so applying one rebuilds
-						the problem and restarts the method against it — this takes a moment, and is rejected if
-						no solution satisfies the bounds. The problem you are on now stays available either way.
+						Apply. The constraints are soft: they are met whenever they can be, and when they
+						cannot, they are relaxed as little as possible.
 					</Dialog.Description>
 				</Dialog.Header>
 
@@ -1520,7 +1506,7 @@
 									</tr>
 								</thead>
 								<tbody class="divide-y">
-									{#each constraint_obj_filter === 'active' ? problem.objectives.filter( (o) => active_objective_symbols.has(o.symbol) ) : problem.objectives as obj}
+									{#each constraint_obj_filter === 'active' ? problem.objectives.filter( (o) => active_objective_symbols.has(o.symbol) ) : problem.objectives as obj (obj.symbol)}
 										<tr class="align-top">
 											<td class="py-2 pr-3 font-mono text-xs">{obj.symbol}</td>
 											<td class="py-2 pr-3">
@@ -1569,7 +1555,7 @@
 												{constraint.type}
 											</Select.Trigger>
 											<Select.Content>
-												{#each CONSTRAINT_TYPES as ct}
+												{#each CONSTRAINT_TYPES as ct (ct)}
 													<Select.Item value={ct} class="text-xs">{ct}</Select.Item>
 												{/each}
 											</Select.Content>
@@ -1627,7 +1613,7 @@
 				</Dialog.Description>
 			</Dialog.Header>
 			<div class="space-y-3 py-4">
-				{#each AVAILABLE_SCALARIZATIONS as sf}
+				{#each AVAILABLE_SCALARIZATIONS as sf (sf.value)}
 					{@const isChecked = selected_scalarizations.includes(sf.value)}
 					{@const isLast = selected_scalarizations.length === 1 && isChecked}
 					{@const checkboxId = `sf-checkbox-${sf.value}`}

@@ -3,6 +3,7 @@ import prettier from 'eslint-config-prettier';
 import js from '@eslint/js';
 import { includeIgnoreFile } from '@eslint/compat';
 import svelte from 'eslint-plugin-svelte';
+import ts from 'typescript-eslint';
 import globals from 'globals';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
@@ -44,21 +45,23 @@ export default defineConfig(
 		}
 	},
 
-	// Make sure Svelte blocks use TS parser. Also covers `*.svelte.{js,ts}` (Svelte 5 runes
-	// modules) — eslint-plugin-svelte's `flat/recommended` routes those through
-	// `svelte-eslint-parser` too, so they need the same `extraFileExtensions` treatment as
-	// `.svelte` files or type-aware rules fail with "don't have parserOptions set to generate
-	// type information".
-	{
-		files: ['**/*.svelte', '**/*.svelte.{js,ts}'],
-		languageOptions: {
-			parserOptions: {
-				parser: ts.parser,
-				extraFileExtensions: ['.svelte'],
-				svelteConfig
-			}
-		}
-	},
+  // Files outside tsconfig.json: lint without type information
+  {
+    files: ['*.{js,mjs,ts}', '.storybook/**', 'e2e/**', 'tests/**'],
+    ...ts.configs.disableTypeChecked
+  },
+
+  // Make sure Svelte blocks use TS parser
+  {
+    files: ['**/*.svelte', '**/*.svelte.ts', '**/*.svelte.js'],
+    languageOptions: {
+      parserOptions: {
+        parser: ts.parser,
+        extraFileExtensions: ['.svelte'],
+        svelteConfig
+      }
+    }
+  },
 
 	// Node env for server-only files
 	{
