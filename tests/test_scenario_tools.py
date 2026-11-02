@@ -21,10 +21,10 @@ from desdeo.problem.testproblems import (
 )
 from desdeo.tools.robust import add_single_objective_worst_case_regret, add_weighted_scenarios, add_worst_case_robust
 from desdeo.tools.scenarios import (
-    _symbols_in,
     build_combined_scenario_problem,
     build_scenario_problem,
     build_scenario_symbol_maps,
+    symbols_in,
 )
 from desdeo.tools.stochastic import add_conditional_value_at_risk, add_expected_asf, add_expected_value
 
@@ -455,7 +455,7 @@ def test_summer_cabin_leaf_constraints_reference_only_own_variables():
         own_vars = {per_leaf[leaf] for per_leaf in symbol_maps["variables"].values() if leaf in per_leaf}
         for per_leaf in symbol_maps["constraints"].values():
             if leaf in per_leaf:
-                referenced = _symbols_in(cons[per_leaf[leaf]]) & combined_vars
+                referenced = symbols_in(cons[per_leaf[leaf]]) & combined_vars
                 assert referenced <= own_vars, (leaf, per_leaf[leaf], referenced - own_vars)
 
 

@@ -1,6 +1,7 @@
 """Defines end-points to access functionalities related to the CUMULUS method."""
 
 import logging
+from dataclasses import dataclass
 from math import isfinite
 from typing import Annotated, Any
 
@@ -45,10 +46,12 @@ from desdeo.api.models.cumulus import (
     CumulusScenarioAvailabilityResponse,
     CumulusScenarioSetupResponse,
     ProblemModification,
+    UncertaintyMeasureType,
+    UncertaintySource,
 )
 from desdeo.api.models.generic import SolutionInfo
 from desdeo.api.models.generic_states import SolutionReference, SolutionReferenceResponse, StateKind
-from desdeo.api.models.problem import ConstraintDB, ProblemDB
+from desdeo.api.models.problem import ConstraintDB, GraphicalModelMetaData, ProblemDB
 from desdeo.api.models.scenario import ScenarioModelDB
 from desdeo.api.models.state import CumulusClassificationState
 from desdeo.api.routers.graphical import _fetch_graphical_metadata
@@ -83,7 +86,9 @@ from .utils import (
     collect_saved_solutions,
     copy_problem_metadata,
     determine_unstated_constraint_properties,
+    find_graphical_metadata,
     get_solver_results_at,
+    graphical_outcome_distributions,
     iter_states_of_kinds,
     leaves_properties_unstated,
 )
@@ -122,19 +127,61 @@ _MEASURE_PREFIXES = {
 }
 
 
-def _resolve_scenario_model(problem_db: ProblemDB, db_session: Session) -> tuple[ProblemDB, ScenarioModelDB] | None:
-    """Walk up `parent_problem_id` to find the problem (if any) with an associated scenario model.
+_MEASURE_TYPES: dict[UncertaintySource, list[UncertaintyMeasureType]] = {
+    "scenario_model": ["expected_value", "worst_case_robust", "conditional_value_at_risk", "weighted_scenarios"],
+    "graphical": ["expected_value", "worst_case_robust", "conditional_value_at_risk"],
+}
 
-    A combined scenario problem's `parent_problem_id` points at the original problem the
-    scenarios are attached to, so this lets callers ask "does scenario X have scenarios"
-    using whichever problem id is currently active on the frontend (original or combined).
+
+@dataclass(frozen=True)
+class _UncertaintySource:
+    """What uncertainty measures for a problem are taken over, and the problem they are applied to."""
+
+    base_problem_db: ProblemDB
+    objective_symbols: list[str]
+    scenario_model_db: ScenarioModelDB | None = None
+    graphical_meta: GraphicalModelMetaData | None = None
+
+    @property
+    def source(self) -> UncertaintySource:
+        return "scenario_model" if self.scenario_model_db is not None else "graphical"
+
+
+def _resolve_uncertainty_source(
+    problem_db: ProblemDB, db_session: Session, *, strict: bool = False
+) -> _UncertaintySource | None:
+    """Walk up `parent_problem_id` to the problem (if any) that uncertainty measures are applied to.
+
+    That is the problem carrying a scenario model, or a graphical-model problem with an objective
+    that has an outcome distribution. A problem whose objectives are all aggregates is passed
+    over, so this finds the base problem whether `problem_db` is the original problem or one
+    already combined from it. A problem whose outcome distributions can't be read is logged and
+    passed over too.
+
+    Raises:
+        HTTPException 422: `strict` is set and `problem_db`'s outcome distributions can't be read.
     """
     current: ProblemDB | None = problem_db
     for _ in range(_MAX_PARENT_HOPS):
         if current is None:
             return None
         if current.scenario_models:
-            return current, current.scenario_models[0]
+            scenario_model_db = current.scenario_models[0]
+            # Include objectives from both the base problem and the scenario pool (e.g. f_3).
+            symbols = [obj.symbol for obj in current.objectives] + [obj.symbol for obj in scenario_model_db.objectives]
+            return _UncertaintySource(current, list(dict.fromkeys(symbols)), scenario_model_db=scenario_model_db)
+        meta = find_graphical_metadata(current.id, db_session)
+        if meta is not None:
+            try:
+                _, distributions = graphical_outcome_distributions(Problem.from_problemdb(current), meta)
+            except ValueError as e:
+                if strict and current is problem_db:
+                    raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
+                logger.warning("Outcome distributions of problem %s can't be read: %s", current.id, e)
+                distributions = {}
+            symbols = [obj.symbol for obj in current.objectives if obj.symbol in distributions]
+            if symbols:
+                return _UncertaintySource(current, symbols, graphical_meta=meta)
         current = db_session.get(ProblemDB, current.parent_problem_id) if current.parent_problem_id else None
     return None
 
@@ -155,7 +202,7 @@ def _build_combined_problem_and_initialize(
     base_problem_db: ProblemDB,
     parent_state: StateDB | None,
 ) -> CumulusInitializationResponse:
-    """Build a combined scenario problem from `request.uncertainty_measures` and initialize CUMULUS on it."""
+    """Build a combined problem from `request.uncertainty_measures` and initialize CUMULUS on it."""
     db_session = context.db_session
     user = context.user
     interactive_session = context.interactive_session
@@ -163,7 +210,9 @@ def _build_combined_problem_and_initialize(
     problem = Problem.from_problemdb(base_problem_db)
     mods = ProblemModification(uncertainty_measures=request.uncertainty_measures)
     try:
-        combined_problem = apply_problem_modifications(problem, mods, db_session)
+        combined_problem = apply_problem_modifications(
+            problem, mods, db_session, find_graphical_metadata(base_problem_db.id, db_session)
+        )
     except HTTPException:
         raise
     except Exception as e:
@@ -564,10 +613,11 @@ def get_or_initialize(
 ):
     """Get the latest CUMULUS state if it exists, or initialize a new one if it doesn't.
 
-    If the problem has associated scenarios and no uncertainty measures have been specified, a
+    If the problem has associated scenarios (a scenario model, or a graphical model whose
+    objectives are not yet aggregated) and no uncertainty measures have been specified, a
     ``CumulusScenarioSetupResponse`` is returned so the frontend can ask the decision maker which
     aggregates to include.  When the frontend re-calls with ``uncertainty_measures`` populated, a
-    combined multi-scenario problem is built, saved to the database, and used for initialization.
+    combined problem is built, saved to the database, and used for initialization.
     """
     db_session = context.db_session
     user = context.user
@@ -642,33 +692,24 @@ def get_or_initialize(
             soft_constraint_ids=soft_ids,
         )
 
-    # No existing state — check whether the problem has associated scenarios.
-    scenario_models = problem_db.scenario_models
-    if scenario_models:
-        scenario_model_db = scenario_models[0]
-
+    # No existing state — check whether the problem itself is the one measures are applied to.
+    uncertainty_source = _resolve_uncertainty_source(problem_db, db_session)
+    if uncertainty_source is not None and uncertainty_source.base_problem_db.id == problem_db.id:
         if request.uncertainty_measures is None:
             # Ask the frontend which uncertainty aggregates the DM wants to include.
-            problem = Problem.from_problemdb(problem_db)
-            # Include objectives from both the base problem and the scenario pool (e.g. f_3).
-            seen: set[str] = set()
-            all_symbols: list[str] = []
-            for sym in [obj.symbol for obj in problem.objectives] + [
-                obj.symbol for obj in scenario_model_db.objectives
-            ]:
-                if sym not in seen:
-                    seen.add(sym)
-                    all_symbols.append(sym)
+            scenario_model_db = uncertainty_source.scenario_model_db
             return CumulusScenarioSetupResponse(
-                scenario_model_id=scenario_model_db.id,
-                objective_symbols=all_symbols,
+                source=uncertainty_source.source,
+                scenario_model_id=scenario_model_db.id if scenario_model_db is not None else None,
+                objective_symbols=uncertainty_source.objective_symbols,
+                measure_types=_MEASURE_TYPES[uncertainty_source.source],
             )
 
         if not request.uncertainty_measures:
             # DM explicitly declined to use scenarios — initialize with the original problem.
             return initialize(request, context)
 
-        # The DM has chosen measures — build and persist the combined scenario problem.
+        # The DM has chosen measures — build and persist the combined problem.
         return _build_combined_problem_and_initialize(request, context, problem_db, context.parent_state)
 
     return initialize(request, context)
@@ -680,31 +721,26 @@ def get_scenario_availability(
 ) -> CumulusScenarioAvailabilityResponse:
     """Report whether uncertainty measures can be added to (or changed on) a problem.
 
-    Looks past any combined scenario problem already built from it (via `parent_problem_id`),
+    Looks past any combined problem already built from it (via `parent_problem_id`),
     so this stays accurate whether `problem_id` is the original problem or one already combined
     from it. Used to decide whether to show the "Add uncertainty measures" UI action at all.
     """
     problem_db = context.problem_db
-    resolved = _resolve_scenario_model(problem_db, context.db_session)
-    if resolved is None:
+    uncertainty_source = _resolve_uncertainty_source(problem_db, context.db_session)
+    if uncertainty_source is None:
         return CumulusScenarioAvailabilityResponse(available=False)
 
-    base_problem_db, scenario_model_db = resolved
-    problem = Problem.from_problemdb(base_problem_db)
-    # Include objectives from both the base problem and the scenario pool (e.g. f_3).
-    seen: set[str] = set()
-    all_symbols: list[str] = []
-    for sym in [obj.symbol for obj in problem.objectives] + [obj.symbol for obj in scenario_model_db.objectives]:
-        if sym not in seen:
-            seen.add(sym)
-            all_symbols.append(sym)
-
+    scenario_model_db = uncertainty_source.scenario_model_db
     return CumulusScenarioAvailabilityResponse(
         available=True,
-        base_problem_id=base_problem_db.id,
-        scenario_model_id=scenario_model_db.id,
-        objective_symbols=all_symbols,
-        applied_measures=_detect_applied_measures(problem_db),
+        source=uncertainty_source.source,
+        base_problem_id=uncertainty_source.base_problem_db.id,
+        scenario_model_id=scenario_model_db.id if scenario_model_db is not None else None,
+        objective_symbols=uncertainty_source.objective_symbols,
+        applied_measures=(
+            [] if uncertainty_source.base_problem_db.id == problem_db.id else _detect_applied_measures(problem_db)
+        ),
+        measure_types=_MEASURE_TYPES[uncertainty_source.source],
     )
 
 
@@ -726,15 +762,16 @@ def apply_scenario_measures(
             detail="uncertainty_measures must be provided and non-empty.",
         )
 
-    resolved = _resolve_scenario_model(context.problem_db, context.db_session)
-    if resolved is None:
+    uncertainty_source = _resolve_uncertainty_source(context.problem_db, context.db_session, strict=True)
+    if uncertainty_source is None:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="This problem has no associated scenario model.",
+            detail="This problem has no associated scenario model or graphical model.",
         )
-    base_problem_db, _scenario_model_db = resolved
 
-    return _build_combined_problem_and_initialize(request, context, base_problem_db, parent_state=None)
+    return _build_combined_problem_and_initialize(
+        request, context, uncertainty_source.base_problem_db, parent_state=None
+    )
 
 
 @router.post("/finalize")
@@ -1346,7 +1383,9 @@ def modify_problem(
     parent_state = context.parent_state
 
     problem = Problem.from_problemdb(problem_db)
-    modified_problem = apply_problem_modifications(problem, request.modifications, db_session)
+    modified_problem = apply_problem_modifications(
+        problem, request.modifications, db_session, find_graphical_metadata(problem_db.id, db_session)
+    )
 
     changed_constraints, only_constraints_changed = _changed_by_modification(problem, modified_problem)
 

@@ -223,12 +223,12 @@ def leaf_expr(info: _ElemResolution, leaf: str) -> "str | list":
     return next((e.func for e in info.elem_list if e.symbol == leaf_sym), leaf_sym)
 
 
-def _symbols_in(node) -> set[str]:
+def symbols_in(node) -> set[str]:
     """Collect every symbol referenced in a MathJSON node, ignoring operator keywords."""
     if isinstance(node, str):
         return set() if node in _RESERVED else {node}
     if isinstance(node, list):
-        return {symbol for child in node for symbol in _symbols_in(child)}
+        return {symbol for child in node for symbol in symbols_in(child)}
     return set()
 
 
@@ -263,7 +263,7 @@ def require_no_forward_references(info: _ElemResolution, combined: "Problem") ->
         func = next((e.func for e in info.elem_list if e.symbol == leaf_sym), None)
         if func is None:
             continue
-        used = _symbols_in(func)
+        used = symbols_in(func)
         for symbols in later_kinds.values():
             if referenced := sorted(used & symbols):
                 msg = (

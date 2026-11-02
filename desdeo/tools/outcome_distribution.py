@@ -361,6 +361,17 @@ def cvar_dd_internal_symbols(cvar_symbol: str) -> dict[str, str]:
     }
 
 
+def cvar_dd_constraint_symbols(cvar_symbol: str, n_outcomes: int) -> set[str]:
+    """The constraint symbols ``add_cvar_dd`` creates for the CVaR element ``cvar_symbol``.
+
+    ``n_outcomes`` is the number of outcomes in the distribution the CVaR is taken over.
+    """
+    per_outcome = ("11", "12", "13", "14", "15", "16lo", "16hi", "17lo", "17hi")
+    return {f"cvar_{tag}_{cvar_symbol}_{i}" for tag in per_outcome for i in range(n_outcomes)} | {
+        f"cvar_18_{cvar_symbol}"
+    }
+
+
 def add_cvar_dd(
     problem: "Problem",
     distributions: dict[str, OutcomeDistribution],

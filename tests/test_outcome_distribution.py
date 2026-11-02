@@ -22,6 +22,7 @@ from desdeo.tools import (
     add_expected_value_dd,
     add_worst_case_dd,
 )
+from desdeo.tools.outcome_distribution import cvar_dd_constraint_symbols
 
 
 def _ef(symbol, func):
@@ -677,3 +678,32 @@ def test_non_objective_base_elements():
     assert "E_s" in {s.symbol for s in new_problem.scalarization_funcs}
     assert "E_g" in {e.symbol for e in new_problem.extra_funcs}
     assert {o.symbol for o in new_problem.objectives} == {"f"}
+
+
+def test_cvar_dd_constraint_symbols_match_added_constraints():
+    """cvar_dd_constraint_symbols names exactly the constraints add_cvar_dd adds."""
+    problem, dists, _ = _build_bruteforce_problem(maximize=True)
+    problem = problem.model_copy(
+        update={
+            "objectives": [
+                *problem.objectives,
+                Objective(
+                    name="g",
+                    symbol="g",
+                    func=["Multiply", 0, "y"],
+                    maximize=False,
+                    is_linear=True,
+                    is_convex=True,
+                    is_twice_differentiable=True,
+                ),
+            ]
+        }
+    )
+    dists["g"] = OutcomeDistribution(
+        symbol="g", name="g", maximize=False, values=[1.0, 3.0, 5.0], probabilities=["p_0", "p_1", "p_2"]
+    )
+    new_problem, mapping = add_cvar_dd(problem, dists, ["f", "g"], alpha=0.3)
+
+    added = {c.symbol for c in new_problem.constraints} - {c.symbol for c in (problem.constraints or [])}
+    expected = set().union(*(cvar_dd_constraint_symbols(mapping[s], 3) for s in ("f", "g")))
+    assert added == expected

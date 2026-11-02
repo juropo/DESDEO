@@ -29,7 +29,7 @@ from desdeo.api.models import (
     UserRole,
     UserSavedSolutionDB,
 )
-from desdeo.api.models.cumulus import ProblemModification
+from desdeo.api.models.cumulus import ProblemModification, UncertaintyMeasureSpec
 from desdeo.api.models.generic_states import StateKind
 from desdeo.api.models.problem import (
     ForestProblemMetaData,
@@ -62,9 +62,15 @@ from desdeo.problem.schema import (
 )
 from desdeo.problem.utils import ProblemUtilsError, add_soft_constraint, determine_function_properties
 from desdeo.tools import SolverResults, guess_best_solver
-from desdeo.tools.outcome_distribution import OutcomeDistribution
+from desdeo.tools.outcome_distribution import (
+    OutcomeDistribution,
+    add_cvar_dd,
+    add_expected_value_dd,
+    add_worst_case_dd,
+    cvar_dd_constraint_symbols,
+)
 from desdeo.tools.robust import add_weighted_scenarios, add_worst_case_robust
-from desdeo.tools.scenarios import build_combined_scenario_problem
+from desdeo.tools.scenarios import build_combined_scenario_problem, symbols_in
 from desdeo.tools.stochastic import add_conditional_value_at_risk, add_expected_value
 from desdeo.tools.utils import payoff_table_method
 
@@ -171,6 +177,19 @@ def copy_problem_metadata(source_problem_db: ProblemDB, target_problem_db: Probl
         )
 
 
+def find_graphical_metadata(problem_id: int, db_session: Session) -> GraphicalModelMetaData | None:
+    """The most recently added `GraphicalModelMetaData` row for `problem_id`, if any.
+
+    Queried directly with an explicit order, since `ProblemMetaDataDB.all_metadata` is unordered.
+    """
+    return db_session.exec(
+        select(GraphicalModelMetaData)
+        .join(ProblemMetaDataDB, GraphicalModelMetaData.metadata_id == ProblemMetaDataDB.id)
+        .where(ProblemMetaDataDB.problem_id == problem_id)
+        .order_by(GraphicalModelMetaData.id.desc())
+    ).first()
+
+
 def graphical_outcome_distributions(
     problem: Problem, meta: GraphicalModelMetaData
 ) -> tuple[Problem, dict[str, OutcomeDistribution]]:
@@ -233,15 +252,110 @@ def _apply_soft_constraints(
     return problem
 
 
-def _apply_uncertainty_measures(problem: Problem, mods: ProblemModification, db_session: Session) -> Problem:
-    specs = mods.uncertainty_measures or []
-    sm_ids = {spec.scenario_model_id for spec in specs}
-    if len(sm_ids) > 1:
+def _apply_graphical_uncertainty_measures(
+    problem: Problem, specs: list[UncertaintyMeasureSpec], graphical_meta: GraphicalModelMetaData | None
+) -> Problem:
+    """`problem` with the aggregates in `specs` as its only objectives, over its outcome distributions.
+
+    The auxiliary variables and constraints of a compiled CVaR risk measure go with its objective.
+    """
+    if graphical_meta is None:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="All uncertainty measures in a single request must reference the same scenario_model_id.",
+            detail="No scenario_model_id was given and the problem has no graphical model.",
         )
-    sm_id = next(iter(sm_ids))
+    try:
+        problem, distributions = graphical_outcome_distributions(problem, graphical_meta)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
+    objective_symbols = {objective.symbol for objective in problem.objectives}
+
+    aggregate_symbols: set[str] = set()
+    for spec in specs:
+        if spec.measure_type == "weighted_scenarios":
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="'weighted_scenarios' is not available for a graphical model.",
+            )
+        if spec.measure_type == "conditional_value_at_risk" and spec.alpha is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="'alpha' is required for 'conditional_value_at_risk'.",
+            )
+        unknown = [s for s in spec.symbols if s not in objective_symbols or s not in distributions]
+        if unknown:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Symbol(s) {unknown} are not objectives of this problem with an outcome distribution.",
+            )
+        try:
+            if spec.measure_type == "expected_value":
+                problem, new_symbols = add_expected_value_dd(
+                    problem, distributions, spec.symbols, prefix=spec.prefix or "E_"
+                )
+            elif spec.measure_type == "worst_case_robust":
+                problem, new_symbols = add_worst_case_dd(
+                    problem, distributions, spec.symbols, prefix=spec.prefix or "robust_"
+                )
+            else:
+                problem, new_symbols = add_cvar_dd(
+                    problem, distributions, spec.symbols, alpha=spec.alpha, prefix=spec.prefix or "CVAR_"
+                )
+        except ValueError as e:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Failed to apply uncertainty measure '{spec.measure_type}': {e}",
+            ) from e
+        aggregate_symbols.update(new_symbols.values())
+
+    if not aggregate_symbols:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="The uncertainty measures produced no aggregates to use as objectives.",
+        )
+
+    objectives = [objective for objective in problem.objectives if objective.symbol in aggregate_symbols]
+    dropped = {objective.symbol for objective in problem.objectives} - aggregate_symbols
+
+    risk_aux: set[str] = set()
+    risk_constraints: set[str] = set()
+    for symbol, risk_map in IndexMap.model_validate_json(graphical_meta.index_map_json).risk_measures.items():
+        if symbol in dropped:
+            risk_aux |= {
+                risk_map.eta_symbol,
+                risk_map.lambda_symbol,
+                risk_map.lambda_bar_symbol,
+                risk_map.rho_symbol,
+                risk_map.rho_bar_symbol,
+            }
+            risk_constraints |= cvar_dd_constraint_symbols(symbol, len(risk_map.utility_values))
+    variables = [variable for variable in problem.variables if variable.symbol not in risk_aux]
+    constraints = [c for c in problem.constraints or [] if c.symbol not in risk_constraints]
+
+    gone = dropped | risk_aux
+    referencing = [
+        element.symbol
+        for element in [*constraints, *(problem.extra_funcs or []), *(problem.scalarization_funcs or [])]
+        if symbols_in(element.func) & gone
+    ]
+    if referencing:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"Element(s) {referencing} reference objectives the uncertainty aggregates replace "
+                f"({sorted(dropped)}), or their risk-measure variables."
+            ),
+        )
+
+    return problem.model_copy(
+        update={"objectives": objectives, "variables": variables, "constraints": constraints or None}
+    )
+
+
+def _apply_scenario_uncertainty_measures(
+    problem: Problem, specs: list[UncertaintyMeasureSpec], sm_id: int, db_session: Session
+) -> Problem:
+    """The combined scenario problem of `problem` with the aggregates in `specs` added."""
     scenario_model_db = db_session.get(ScenarioModelDB, sm_id)
     if scenario_model_db is None:
         raise HTTPException(
@@ -304,6 +418,28 @@ def _apply_uncertainty_measures(problem: Problem, mods: ProblemModification, db_
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail=f"Failed to apply uncertainty measure '{spec.measure_type}': {e}",
             ) from e
+
+    return combined
+
+
+def _apply_uncertainty_measures(
+    problem: Problem,
+    mods: ProblemModification,
+    db_session: Session,
+    graphical_meta: GraphicalModelMetaData | None = None,
+) -> Problem:
+    specs = mods.uncertainty_measures or []
+    sm_ids = {spec.scenario_model_id for spec in specs}
+    if len(sm_ids) > 1:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="All uncertainty measures in a single request must reference the same scenario_model_id.",
+        )
+    sm_id = next(iter(sm_ids))
+    if sm_id is None:
+        combined = _apply_graphical_uncertainty_measures(problem, specs, graphical_meta)
+    else:
+        combined = _apply_scenario_uncertainty_measures(problem, specs, sm_id, db_session)
 
     # Run the payoff table synchronously so the combined problem already has correct
     # ideal/nadir when it is saved to the database. Combined objectives are new symbols
@@ -504,7 +640,12 @@ def determine_unstated_constraint_properties(problem: Problem, symbols: Iterable
     return problem
 
 
-def apply_problem_modifications(problem: Problem, mods: ProblemModification, db_session: Session) -> Problem:
+def apply_problem_modifications(
+    problem: Problem,
+    mods: ProblemModification,
+    db_session: Session,
+    graphical_meta: GraphicalModelMetaData | None = None,
+) -> Problem:
     """Apply a ProblemModification spec to a Problem and return the modified result.
 
     Operations are applied in this order:
@@ -522,6 +663,8 @@ def apply_problem_modifications(problem: Problem, mods: ProblemModification, db_
         problem: the current Problem instance to modify.
         mods: the modification specification from the request.
         db_session: an active database session (needed for uncertainty-measure look-ups).
+        graphical_meta: the problem's graphical model, which uncertainty measures without a
+            ``scenario_model_id`` aggregate over.
 
     Raises:
         HTTPException 404: a referenced ScenarioModelDB does not exist.
@@ -551,7 +694,7 @@ def apply_problem_modifications(problem: Problem, mods: ProblemModification, db_
     modified_problem = _apply_soft_constraints(modified_problem, mods, soft_candidate_constraints)
 
     if mods.uncertainty_measures:
-        modified_problem = _apply_uncertainty_measures(modified_problem, mods, db_session)
+        modified_problem = _apply_uncertainty_measures(modified_problem, mods, db_session, graphical_meta)
 
     # Last, so that the analysis sees the problem in its final shape.
     return determine_unstated_constraint_properties(modified_problem, _constraints_without_stated_properties(mods))
