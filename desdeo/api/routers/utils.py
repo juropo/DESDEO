@@ -43,6 +43,13 @@ from desdeo.api.models.problem import (
 from desdeo.api.models.session import CreateSessionRequest
 from desdeo.api.routers.user_authentication import get_current_user
 from desdeo.problem import Problem
+from desdeo.problem.graphical import (
+    DecisionAnnotation,
+    DiscreteNetwork,
+    IndexMap,
+    RootedJunctionTree,
+    build_outcome_distributions,
+)
 from desdeo.problem.schema import (
     Constant,
     Constraint,
@@ -55,6 +62,7 @@ from desdeo.problem.schema import (
 )
 from desdeo.problem.utils import ProblemUtilsError, add_soft_constraint, determine_function_properties
 from desdeo.tools import SolverResults, guess_best_solver
+from desdeo.tools.outcome_distribution import OutcomeDistribution
 from desdeo.tools.robust import add_weighted_scenarios, add_worst_case_robust
 from desdeo.tools.scenarios import build_combined_scenario_problem
 from desdeo.tools.stochastic import add_conditional_value_at_risk, add_expected_value
@@ -161,6 +169,45 @@ def copy_problem_metadata(source_problem_db: ProblemDB, target_problem_db: Probl
                 assumptions_json=item.assumptions_json,
             )
         )
+
+
+def graphical_outcome_distributions(
+    problem: Problem, meta: GraphicalModelMetaData
+) -> tuple[Problem, dict[str, OutcomeDistribution]]:
+    """`meta`'s outcome distributions, and `problem` with the `pu_*` extra functions they reference.
+
+    A problem compiled before `IndexMap.outcome_distributions` existed has neither, so both are
+    rebuilt from the stored network, annotation, RJT and cluster index maps. A problem that was
+    never compiled (no stored index map) has no distributions.
+
+    Raises:
+        ValueError: `problem` already has a `pu_*` extra function that differs from the rebuilt one.
+    """
+    if meta.index_map_json is None or meta.rjt_json is None:
+        return problem, {}
+
+    index_map = IndexMap.model_validate_json(meta.index_map_json)
+    existing = {extra_func.symbol: extra_func for extra_func in problem.extra_funcs or []}
+    distributions = index_map.outcome_distributions
+    if distributions and all(
+        symbol in existing for distribution in distributions.values() for symbol in distribution.probabilities
+    ):
+        return problem, distributions
+
+    distributions, extra_funcs = build_outcome_distributions(
+        DiscreteNetwork.model_validate_json(meta.network_json),
+        DecisionAnnotation.model_validate_json(meta.annotation_json),
+        RootedJunctionTree.model_validate_json(meta.rjt_json),
+        index_map.clusters,
+    )
+    missing = []
+    for extra_func in extra_funcs:
+        if extra_func.symbol not in existing:
+            missing.append(extra_func)
+        elif existing[extra_func.symbol].func != extra_func.func:
+            msg = f"Problem's extra function '{extra_func.symbol}' doesn't match the rebuilt outcome probability."
+            raise ValueError(msg)
+    return problem.model_copy(update={"extra_funcs": [*(problem.extra_funcs or []), *missing]}), distributions
 
 
 def _apply_soft_constraints(

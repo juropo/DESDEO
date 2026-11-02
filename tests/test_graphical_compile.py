@@ -170,6 +170,7 @@ def _brute_force_marginal(
     order: list[str],
     cardinality: dict[str, int],
     policy_by_decision: dict[str, tuple[list[str], dict]],
+    *,
     node: str,
     state_index: int,
 ) -> float:
@@ -203,6 +204,7 @@ def _utility_distribution_for_policy(
     order: list[str],
     cardinality: dict[str, int],
     policy_by_decision: dict[str, tuple[list[str], dict]],
+    *,
     objective_symbol: str,
 ) -> dict[float, float]:
     """`{utility_value: probability_mass}` for one objective under one fixed deterministic policy."""
@@ -267,7 +269,7 @@ def _brute_force_cvar(
     best = None
     for policy in _enumerate_policies(annotation, cardinality, eff):
         distribution = _utility_distribution_for_policy(
-            network, annotation, order, cardinality, policy, objective_symbol
+            network, annotation, order, cardinality, policy, objective_symbol=objective_symbol
         )
         if objective.maximize:
             value = _cvar_from_distribution(distribution, alpha)
@@ -863,14 +865,19 @@ def test_probability_constraint_on_decision_marginal_changes_optimum():
     cardinality = _cardinalities(network, constrained)
     policy_by_decision = _read_back_policy(constrained, index_map, result)
 
-    marginal_hi = _brute_force_marginal(network, constrained, order, cardinality, policy_by_decision, "D", 1)
+    marginal_hi = _brute_force_marginal(
+        network, constrained, order, cardinality, policy_by_decision, node="D", state_index=1
+    )
     assert marginal_hi <= 0.5 + 1e-6
 
     readback_reward = _expected_utilities(network, constrained, order, cardinality, policy_by_decision)["fmatch"]
     assert readback_reward == pytest.approx(result.optimal_objectives["fmatch"], abs=1e-6)
 
     def feasible(policy) -> bool:
-        return _brute_force_marginal(network, constrained, order, cardinality, policy, "D", 1) <= 0.5 + 1e-9
+        return (
+            _brute_force_marginal(network, constrained, order, cardinality, policy, node="D", state_index=1)
+            <= 0.5 + 1e-9
+        )
 
     brute_force = _brute_force_optimum_feasible(network, constrained, "fmatch", feasible)
     assert result.optimal_objectives["fmatch"] == pytest.approx(brute_force, abs=1e-6)
@@ -927,16 +934,16 @@ def test_expected_value_constraint_on_decision_cost_changes_optimum():
     cardinality = _cardinalities(network, constrained)
     policy_by_decision = _read_back_policy(constrained, index_map, result)
 
-    p_lo = _brute_force_marginal(network, constrained, order, cardinality, policy_by_decision, "D", 0)
-    p_hi = _brute_force_marginal(network, constrained, order, cardinality, policy_by_decision, "D", 1)
+    p_lo = _brute_force_marginal(network, constrained, order, cardinality, policy_by_decision, node="D", state_index=0)
+    p_hi = _brute_force_marginal(network, constrained, order, cardinality, policy_by_decision, node="D", state_index=1)
     assert 2.0 * p_lo + 5.0 * p_hi <= 3.0 + 1e-6
 
     readback_reward = _expected_utilities(network, constrained, order, cardinality, policy_by_decision)["fmatch"]
     assert readback_reward == pytest.approx(result.optimal_objectives["fmatch"], abs=1e-6)
 
     def feasible(policy) -> bool:
-        lo = _brute_force_marginal(network, constrained, order, cardinality, policy, "D", 0)
-        hi = _brute_force_marginal(network, constrained, order, cardinality, policy, "D", 1)
+        lo = _brute_force_marginal(network, constrained, order, cardinality, policy, node="D", state_index=0)
+        hi = _brute_force_marginal(network, constrained, order, cardinality, policy, node="D", state_index=1)
         return 2.0 * lo + 5.0 * hi <= 3.0 + 1e-9
 
     brute_force = _brute_force_optimum_feasible(network, constrained, "fmatch", feasible)
@@ -1475,7 +1482,7 @@ def test_cvar_hand_computed_minimize_sign_convention():
 
 
 def test_cvar_degenerate_single_utility_value():
-    """A constant utility (|U| == 1): the epsilon/M degenerate case in `_cvar_epsilon`/`big_m`."""
+    """A constant utility (|U| == 1): the epsilon/M degenerate case in `add_cvar_dd`."""
     network = DiscreteNetwork(
         variables=[DiscreteVariable(name="A", labels=["lo", "hi"])],
         arcs=[],

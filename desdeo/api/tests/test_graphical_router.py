@@ -26,6 +26,7 @@ from desdeo.api.models import (
 )
 from desdeo.api.routers import graphical as graphical_router
 from desdeo.api.routers.user_authentication import get_password_hash
+from desdeo.api.routers.utils import graphical_outcome_distributions
 from desdeo.problem.graphical import (
     DecisionAnnotation,
     DecisionNode,
@@ -48,6 +49,7 @@ from desdeo.problem.graphical.demo import (
 )
 from desdeo.tools import CVXPYSolver, PyomoCBCSolver, SolverResults
 from desdeo.tools.gurobipy_solver_interfaces import GurobipySolver
+from desdeo.tools.outcome_distribution import add_expected_value_dd
 
 from .conftest import delete_json, get_json, login, post_json
 
@@ -1484,7 +1486,7 @@ def test_policy_solution_id_visible_non_owner_is_403(client: TestClient, session
     """
     session: Session = session_and_user["session"]
     owner = session_and_user["user"]
-    access_token = login(client)
+    login(client)
 
     problem = session.exec(select(ProblemDB)).first()
     network = _decision_network()
@@ -1654,6 +1656,77 @@ def test_policy_accepts_scalar_risk_measure_eta_without_422(client: TestClient, 
     response = post_json(client, f"/graphical/{problem.id}/policy", payload, access_token)
     assert response.status_code != 422, response.text
     assert response.status_code == 200, response.text
+
+
+def test_graphical_outcome_distributions_rebuilds_for_old_index_map():
+    """An index map and problem stored without outcome distributions get them rebuilt."""
+    network, annotation = build_oil_wildcatter_demo()
+    rjt = build_rooted_junction_tree(network, annotation)
+    problem, index_map = compile_diagram(network, annotation, rjt=rjt)
+    meta = GraphicalModelMetaData(
+        network_json=network.model_dump_json(),
+        annotation_json=annotation.model_dump_json(),
+        rjt_json=rjt.model_dump_json(),
+        index_map_json=index_map.model_dump_json(),
+    )
+
+    same_problem, distributions = graphical_outcome_distributions(problem, meta)
+    assert same_problem is problem
+    assert distributions == index_map.outcome_distributions
+
+    pu_symbols = {p for distribution in distributions.values() for p in distribution.probabilities}
+    old_problem = problem.model_copy(
+        update={"extra_funcs": [f for f in problem.extra_funcs if f.symbol not in pu_symbols]}
+    )
+    old_meta = meta.model_copy(
+        update={"index_map_json": index_map.model_copy(update={"outcome_distributions": {}}).model_dump_json()}
+    )
+
+    rebuilt_problem, rebuilt = graphical_outcome_distributions(old_problem, old_meta)
+    assert rebuilt == index_map.outcome_distributions
+    assert rebuilt_problem.extra_funcs == problem.extra_funcs
+    add_expected_value_dd(rebuilt_problem, rebuilt, list(rebuilt))
+
+
+def test_graphical_outcome_distributions_edge_cases():
+    """No index map gives no distributions; missing `pu_*` are rebuilt; a conflicting one raises."""
+    network, annotation = build_oil_wildcatter_demo()
+    rjt = build_rooted_junction_tree(network, annotation)
+    problem, index_map = compile_diagram(network, annotation, rjt=rjt)
+    meta = GraphicalModelMetaData(
+        network_json=network.model_dump_json(),
+        annotation_json=annotation.model_dump_json(),
+        rjt_json=rjt.model_dump_json(),
+        index_map_json=index_map.model_dump_json(),
+    )
+    pu_symbols = {p for distribution in index_map.outcome_distributions.values() for p in distribution.probabilities}
+    without_pu = problem.model_copy(
+        update={"extra_funcs": [f for f in problem.extra_funcs if f.symbol not in pu_symbols]}
+    )
+
+    uncompiled_meta = meta.model_copy(update={"index_map_json": None})
+    same_problem, distributions = graphical_outcome_distributions(without_pu, uncompiled_meta)
+    assert same_problem is without_pu
+    assert distributions == {}
+
+    rebuilt_problem, distributions = graphical_outcome_distributions(without_pu, meta)
+    assert distributions == index_map.outcome_distributions
+    assert rebuilt_problem.extra_funcs == problem.extra_funcs
+
+    first_pu = min(pu_symbols)
+    conflicting = problem.model_copy(
+        update={
+            "extra_funcs": [
+                f.model_copy(update={"func": ["Multiply", 2, f.func]}) if f.symbol == first_pu else f
+                for f in problem.extra_funcs
+            ]
+        }
+    )
+    stale_meta = meta.model_copy(
+        update={"index_map_json": index_map.model_copy(update={"outcome_distributions": {}}).model_dump_json()}
+    )
+    with pytest.raises(ValueError, match=first_pu):
+        graphical_outcome_distributions(conflicting, stale_meta)
 
 
 # --- Named evidence sets --------------------------------------------------------------------------

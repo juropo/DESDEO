@@ -22,6 +22,7 @@ from .compile import (
     DecisionPolicy,
     IndexMap,
     RiskMeasureIndexMap,
+    build_outcome_distributions,
     compile_diagram,
     read_policy_from_solution,
 )
@@ -67,6 +68,7 @@ __all__ = [
     "RiskMeasureIndexMap",
     "RiskMeasureKind",
     "RootedJunctionTree",
+    "build_outcome_distributions",
     "build_rooted_junction_tree",
     "clear_rjt_cache",
     "compile_diagram",
