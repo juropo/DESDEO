@@ -1290,6 +1290,7 @@ def compile_diagram(
     rjt: RootedJunctionTree | None = None,
     max_cluster_size: int | None = None,
     on_exceed: Literal["warn", "raise"] = "warn",
+    free_nodes: frozenset[str] = frozenset(),
 ) -> tuple[Problem, IndexMap]:
     """Compile `(network, annotation)` into a `Problem` implementing the RJT MILP formulation.
 
@@ -1316,13 +1317,17 @@ def compile_diagram(
             `None` performs no size check at all, and `state_space_size` in the hundreds of
             thousands starts to matter (see `_position_map`'s docstring on where that cost lands).
         on_exceed: `"warn"` (default) or `"raise"`, forwarded alongside `max_cluster_size`.
+        free_nodes: chance nodes that get no CPT constraints. Their joint is left free,
+            constrained only by local consistency and root mass; callers add their own
+            constraints on it. Their CPTs must still be normalised.
 
     Returns:
         tuple[Problem, IndexMap]: the compiled MILP, and the per-cluster/per-decision bookkeeping
             needed to read a solution back into cluster moments and deterministic policies.
 
     Raises:
-        ValueError: `annotation` doesn't validate against `network`; a chance node's CPT isn't
+        ValueError: `annotation` doesn't validate against `network`; `free_nodes` names something
+            that isn't a chance node of `network`; a chance node's CPT isn't
             normalised; an `ObjectiveNode`'s utility has a non-finite value; `rjt` was given but
             doesn't match `(network, annotation)`'s expected node set, family containment, or has
             a root cluster with a non-empty separator (see the module docstring's "Root
@@ -1339,6 +1344,11 @@ def compile_diagram(
     """
     annotation.validate_against(network)
     _check_cpts_normalized(network)
+
+    unknown_free_nodes = set(free_nodes) - set(network.potentials)
+    if unknown_free_nodes:
+        msg = f"free_nodes {sorted(unknown_free_nodes)} aren't chance nodes of the network."
+        raise ValueError(msg)
 
     cardinality = _cardinalities(network, annotation)
     expected_nodes = set(cardinality)
@@ -1424,7 +1434,8 @@ def compile_diagram(
             _check_family_contained(
                 set(potential.variables), set(index_map.nodes), ownership, "Chance node's CPT parents"
             )
-            constraints.extend(_build_cpt_constraints(ownership, potential, index_map))
+            if ownership not in free_nodes:
+                constraints.extend(_build_cpt_constraints(ownership, potential, index_map))
 
         if cluster.parent is not None:
             parent_map = cluster_maps[cluster.parent]

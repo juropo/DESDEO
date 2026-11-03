@@ -23,7 +23,7 @@ def two_node_chain_network() -> DiscreteNetwork:
         arcs=[("A", "B")],
         potentials={
             "A": Potential(variables=["A"], shape=[2], values=[0.4, 0.6]),
-            "B": Potential(variables=["B", "A"], shape=[2, 2], values=[[0.9, 0.1], [0.2, 0.8]]),
+            "B": Potential(variables=["B", "A"], shape=[2, 2], values=[[0.9, 0.2], [0.1, 0.8]]),
         },
     )
 

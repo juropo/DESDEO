@@ -20,6 +20,7 @@ import itertools
 import numpy as np
 import pyagrum as gum
 import pytest
+from fixtures import two_node_chain_network
 
 from desdeo.problem.graphical import (
     Cluster,
@@ -762,6 +763,84 @@ def test_malformed_root_cluster_separator_raises():
     )
     with pytest.raises(ValueError, match="non-empty separator"):
         compile_diagram(network, annotation, rjt=bad_rjt)
+
+
+# ── free_nodes ──────────────────────────────────────────────────────────────────────────────────
+
+
+def _b_hi_annotation() -> DecisionAnnotation:
+    """Maximize P(B=hi)."""
+    return DecisionAnnotation(
+        objectives=[
+            ObjectiveNode(
+                symbol="fB",
+                parents=["B"],
+                utility=Potential(variables=["B"], shape=[2], values=[0.0, 1.0]),
+                maximize=True,
+            )
+        ]
+    )
+
+
+def test_free_node_mass_moves_to_best_state():
+    """With A free, the optimum puts all of A's mass on argmax_a P(B=hi | A=a)."""
+    network = two_node_chain_network()
+    p_b_hi_given_a = np.array(network.potentials["B"].values)[1]
+    problem, index_map = compile_diagram(network, _b_hi_annotation(), free_nodes=frozenset({"A"}))
+    result = GurobipySolver(problem).solve("fB")
+    assert result.success, result.message
+
+    assert result.optimal_objectives["fB"] == pytest.approx(p_b_hi_given_a.max(), abs=1e-6)
+    mu_a = np.array(result.optimal_variables[index_map.clusters["A"].mu_symbol])
+    expected = np.zeros(2)
+    expected[p_b_hi_given_a.argmax()] = 1.0
+    assert mu_a == pytest.approx(expected, abs=1e-6)
+
+
+def test_no_free_nodes_uses_cpt():
+    """With `free_nodes` empty the optimum is sum_a P(A=a) P(B=hi | A=a)."""
+    network = two_node_chain_network()
+    p_a = np.array(network.potentials["A"].values)
+    p_b_hi_given_a = np.array(network.potentials["B"].values)[1]
+    problem, _ = compile_diagram(network, _b_hi_annotation())
+    result = GurobipySolver(problem).solve("fB")
+    assert result.success, result.message
+    assert result.optimal_objectives["fB"] == pytest.approx(p_a @ p_b_hi_given_a, abs=1e-6)
+
+
+def test_free_node_has_no_cpt_constraints():
+    """A free node gets no CPT constraints; the other nodes keep theirs."""
+    network = two_node_chain_network()
+    full, _ = compile_diagram(network, _b_hi_annotation())
+    free, _ = compile_diagram(network, _b_hi_annotation(), free_nodes=frozenset({"A"}))
+
+    def cpt_symbols(problem, node):
+        return {c.symbol for c in problem.constraints if c.symbol.startswith(f"cpt_{node}_")}
+
+    assert cpt_symbols(full, "A")
+    assert cpt_symbols(free, "A") == set()
+    assert cpt_symbols(free, "B") == cpt_symbols(full, "B")
+    assert len(free.constraints) == len(full.constraints) - len(cpt_symbols(full, "A"))
+
+
+def test_free_nodes_must_be_chance_nodes():
+    """An unknown name or a decision symbol in `free_nodes` raises."""
+    network = two_node_chain_network()
+    annotation = DecisionAnnotation(
+        decisions=[DecisionNode(symbol="D", states=["s0", "s1"])],
+        objectives=[
+            ObjectiveNode(
+                symbol="fBD",
+                parents=["B", "D"],
+                utility=Potential(variables=["B", "D"], shape=[2, 2], values=[[0.0, 0.0], [1.0, 2.0]]),
+                maximize=True,
+            )
+        ],
+    )
+    with pytest.raises(ValueError, match="free_nodes"):
+        compile_diagram(network, annotation, free_nodes=frozenset({"X"}))
+    with pytest.raises(ValueError, match="free_nodes"):
+        compile_diagram(network, annotation, free_nodes=frozenset({"D"}))
 
 
 # ── DiagramConstraint compilation ───────────────────────────────────────────────────────────────
