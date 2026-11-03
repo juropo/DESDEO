@@ -26,6 +26,15 @@ from .compile import (
     compile_diagram,
     read_policy_from_solution,
 )
+from .dynamic import (
+    StationaryDiagram,
+    StationaryEvaluation,
+    TwoSliceStructure,
+    classify_2tbn,
+    evaluate_stationary_policy,
+    initial_state_distribution,
+    promote_to_decisions,
+)
 from .network import DiscreteNetwork, DiscreteVariable, DiscreteVariableKind, Potential
 from .rooted_junction_tree import (
     Cluster,
@@ -68,14 +77,21 @@ __all__ = [
     "RiskMeasureIndexMap",
     "RiskMeasureKind",
     "RootedJunctionTree",
+    "StationaryDiagram",
+    "StationaryEvaluation",
+    "TwoSliceStructure",
     "build_outcome_distributions",
     "build_rooted_junction_tree",
+    "classify_2tbn",
     "clear_rjt_cache",
     "compile_diagram",
     "compile_with_assumptions",
     "condition_network",
     "effective_information_sets",
+    "evaluate_stationary_policy",
     "fixed_decision_constraints",
+    "initial_state_distribution",
+    "promote_to_decisions",
     "read_policy_from_solution",
     "validate_assumptions",
 ]
