@@ -1317,9 +1317,11 @@ def compile_diagram(
             `None` performs no size check at all, and `state_space_size` in the hundreds of
             thousands starts to matter (see `_position_map`'s docstring on where that cost lands).
         on_exceed: `"warn"` (default) or `"raise"`, forwarded alongside `max_cluster_size`.
-        free_nodes: chance nodes that get no CPT constraints. Their joint is left free,
-            constrained only by local consistency and root mass; callers add their own
-            constraints on it. Their CPTs must still be normalised.
+        free_nodes: chance nodes that get no CPT constraints. Their joint is constrained only by
+            local consistency and root mass, which is correct only if each free node's cluster
+            holds free nodes alone. Declare the free nodes first in `network.variables`, each
+            depending only on earlier free nodes, to ensure this. Callers add their own
+            constraints on the joint. Their CPTs must still be normalised.
 
     Returns:
         tuple[Problem, IndexMap]: the compiled MILP, and the per-cluster/per-decision bookkeeping

@@ -188,6 +188,20 @@ def _ancestors(nodes: Sequence[str], parents: dict[str, Sequence[str]], within: 
     return found
 
 
+def _check_undecided_atemporal_state(
+    structure: TwoSliceStructure, parents: dict[str, Sequence[str]], decided: set[str]
+) -> None:
+    """Raise `ValueError` if a decided node is an ancestor of an atemporal state node."""
+    atemporal_state = [name for name in structure.state_nodes if name in structure.atemporal]
+    decided_ancestors = sorted(_ancestors(atemporal_state, parents) & decided)
+    if decided_ancestors:
+        msg = (
+            f"Decisions {decided_ancestors} are ancestors of atemporal state nodes {atemporal_state}, which "
+            "stay fixed across steps; an atemporal chance state node can't depend on a decision."
+        )
+        raise ValueError(msg)
+
+
 def _check_objectives(
     objectives: list[ObjectiveNode], structure: TwoSliceStructure, decisions: set[str], labels: dict[str, list[str]]
 ) -> None:
@@ -220,7 +234,8 @@ class StationaryDiagram(BaseModel):
 
     Decisions act from slice t onwards; slice 0 is the status-quo population. Each decision's
     `information_set` replaces its network parents, and its `states` must equal the node's labels.
-    An atemporal decision's information set may only contain atemporal nodes.
+    An atemporal decision's information set may only contain atemporal nodes, and no atemporal
+    chance state node may have a decision ancestor.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -291,6 +306,9 @@ class StationaryDiagram(BaseModel):
                 )
                 raise ValueError(msg)
 
+        parents = {name: potential.variables[1:] for name, potential in self.network.potentials.items()}
+        _check_undecided_atemporal_state(structure, parents, set(decision_symbols))
+
         if self.initial_distribution is not None:
             expected_shape = [len(labels[name]) for name in structure.state_nodes]
             if (
@@ -313,7 +331,6 @@ class StationaryDiagram(BaseModel):
                 msg = f"initial_distribution must be finite, nonnegative and sum to 1, got sum {values.sum()}."
                 raise ValueError(msg)
         else:
-            parents = {name: potential.variables[1:] for name, potential in self.network.potentials.items()}
             _check_no_decided_ancestors(_ancestors(structure.state_nodes, parents), set(decision_symbols))
 
         return self
@@ -576,6 +593,7 @@ class StationaryIndexMap(BaseModel):
 def _step_network(diagram: StationaryDiagram) -> DiscreteNetwork:
     """One 2-slice step: a uniform free chain over the state, slice t, the decisions and the state sink.
 
+    The state nodes are declared first, so each state node's cluster holds only state nodes.
     Each state node takes all earlier state nodes as parents. Slice-0 and atemporal chance nodes
     that aren't state are dropped, and so are slice-t chance nodes that no next-step state node,
     objective, decision or constraint depends on. The sink's parents are the next-step state nodes
@@ -594,7 +612,9 @@ def _step_network(diagram: StationaryDiagram) -> DiscreteNetwork:
     targets += [parent for objective in diagram.objectives for parent in objective.parents]
     targets += [node for constraint in diagram.constraints for node in constraint.nodes if node in parents]
     kept = state | _ancestors(targets, parents, structure.slicet | (structure.atemporal & decisions))
-    variables = [variable for variable in network.variables if variable.name in kept]
+    by_name = {variable.name: variable for variable in network.variables}
+    variables = [by_name[name] for name in state_nodes]
+    variables += [variable for variable in network.variables if variable.name in kept - state]
     cardinality = {variable.name: len(variable.labels) for variable in variables}
 
     arcs = [(parent, child) for parent, child in network.arcs if child in kept - state and parent in kept]
@@ -693,6 +713,12 @@ def compile_stationary_diagram(
         on_exceed=on_exceed,
         free_nodes=frozenset(state_nodes),
     )
+
+    for name in state_nodes:
+        extra = sorted(set(index_map.clusters[name].nodes) - set(state_nodes))
+        if extra:
+            msg = f"Internal error: state node '{name}' shares its cluster with non-state nodes {extra}."
+            raise ValueError(msg)
 
     occupation_owner = state_nodes[-1]
     current = _marginal_exprs(index_map, occupation_owner, state_nodes, cardinalities)

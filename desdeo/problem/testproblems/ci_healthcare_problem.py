@@ -18,7 +18,6 @@ from desdeo.problem.graphical import (
     StationaryIndexMap,
     compile_stationary_diagram,
 )
-from desdeo.problem.graphical.adapters.pyagrum import load_network
 from desdeo.problem.schema import Problem
 
 NODE_NAMES = {
@@ -96,6 +95,8 @@ def _objective(symbol: str, name: str, parents: list[str], utility: np.ndarray, 
 
 def _load_normalised_network() -> DiscreteNetwork:
     """The BIF's network with each CPT rescaled to sum to 1, which the file's rounding breaks."""
+    from desdeo.problem.graphical.adapters.pyagrum import load_network  # noqa: PLC0415
+
     network = load_network(_BIF_PATH)
     potentials = {}
     for name, potential in network.potentials.items():

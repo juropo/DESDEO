@@ -610,6 +610,46 @@ def test_compiled_decision_sink_parent_matches_brute_force(objective_symbol):
     assert result.optimal_objectives[objective_symbol] == pytest.approx(best, abs=1e-6)
 
 
+@pytest.mark.gurobipy
+def test_compiled_non_state_declared_before_state_matches_brute_force():
+    """A slice-t node declared before a state node stays out of the free state clusters."""
+    network = _network({"A0": [], "At": ["A0"], "B0": [], "D0": [], "Dt": [], "Bt": ["B0", "At", "Dt"]})
+    match = np.array([[0.1, 0.0], [0.9, 1.0]])
+    bt = np.empty([2, 2, 2, 2])
+    bt[:, 0, 0], bt[:, 1, 1] = match, match
+    bt[:, 0, 1], bt[:, 1, 0] = 1 - match, 1 - match
+    network = _replace_cpt(
+        network, "Bt", Potential(variables=["Bt", "B0", "At", "Dt"], shape=[2] * 4, values=bt.tolist())
+    )
+    diagram = StationaryDiagram.with_default_information_sets(
+        network, {"Dt": []}, [_objective("u", ["Bt"], [0.0, 1.0])], discount=GAMMA
+    )
+    best = max(evaluate_stationary_policy(diagram, policies).objectives["u"] for policies in _all_policies(diagram))
+
+    result, _, _, stationary_map = _solve(diagram, "u")
+    assert result.optimal_objectives["u"] == pytest.approx(best, abs=1e-6)
+    for name in stationary_map.state_nodes:
+        assert set(stationary_map.index_map.clusters[name].nodes) <= set(stationary_map.state_nodes)
+
+
+@pytest.mark.gurobipy
+@pytest.mark.parametrize("reverse", [False, True])
+def test_compiled_decided_next_state_matches_evaluation(reverse):
+    """A slice-t decision that is the next value of a state node solves to its evaluated policy."""
+    network = ci_healthcare_mirror_network()
+    if reverse:
+        network = network.model_copy(update={"variables": list(reversed(network.variables))})
+    diagram = StationaryDiagram.with_default_information_sets(
+        network,
+        {"LYHt": ["PISt", "LYSt", "GER"], "GER": None},
+        [_objective("m", ["KUOt"], [0.0, -1.0])],
+        discount=GAMMA,
+    )
+    assert diagram.structure.next_of["LYH0"] == "LYHt"
+
+    _solve(diagram, "m")
+
+
 @pytest.mark.slow
 @pytest.mark.cvxpy
 @pytest.mark.parametrize("objective_symbol", ["cost", "dissatisfaction", "mortality", "illness"])
@@ -753,6 +793,19 @@ def test_atemporal_decision_ancestor_of_state_without_initial_distribution_raise
             {"G": None},
             [_objective("x", ["Xt"], X_UTILITY)],
             discount=GAMMA,
+        )
+
+
+def test_atemporal_state_with_decision_ancestor_raises():
+    """An atemporal chance state node can't depend on a decision, even with an explicit initial distribution."""
+    network = _network({"G": [], "A": ["G"], "X0": [], "Xt": ["X0", "A"]})
+    with pytest.raises(ValueError, match="ancestors of atemporal state nodes"):
+        StationaryDiagram.with_default_information_sets(
+            network,
+            {"G": None},
+            [_objective("x", ["Xt"], X_UTILITY)],
+            discount=GAMMA,
+            initial_distribution=Potential(variables=["A", "X0"], shape=[2, 2], values=[[0.25, 0.25], [0.25, 0.25]]),
         )
 
 
