@@ -1256,7 +1256,7 @@ def _check_cpts_normalized(network: DiscreteNetwork) -> None:
         if not np.allclose(sums, 1.0):
             msg = (
                 f"Chance node '{variable.name}''s CPT doesn't sum to 1 over its own states for "
-                f"every parent configuration (got sums {np.atleast_1d(sums).tolist()}). The MILP "
+                f"every parent configuration (max |row sum - 1| = {np.max(np.abs(sums - 1.0)):.3e}). The MILP "
                 "compiler's McCormick linearisation assumes normalised CPTs; an unnormalised one "
                 "would compile without error but produce an infeasible or silently wrong model."
             )

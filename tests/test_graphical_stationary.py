@@ -43,7 +43,9 @@ from desdeo.problem.graphical.adapters.pyagrum import to_pyagrum
 from desdeo.problem.graphical.compile import _group_flat_indices_by_projection
 from desdeo.problem.graphical.dynamic import _contract
 from desdeo.problem.graphical.index_map import mixed_radix_encode
-from desdeo.tools import add_asf_diff
+from desdeo.problem.testproblems import ci_healthcare_stationary_diagram
+from desdeo.tools import CVXPYSolver, add_asf_diff
+from desdeo.tools.cvxpy_solver_interfaces import CVXPYSolverOptions
 from desdeo.tools.gurobipy_solver_interfaces import GurobipySolver
 
 pytestmark = pytest.mark.graphical
@@ -606,6 +608,28 @@ def test_compiled_decision_sink_parent_matches_brute_force(objective_symbol):
 
     result, _, _, _ = _solve(diagram, objective_symbol)
     assert result.optimal_objectives[objective_symbol] == pytest.approx(best, abs=1e-6)
+
+
+@pytest.mark.slow
+@pytest.mark.cvxpy
+@pytest.mark.parametrize("objective_symbol", ["cost", "dissatisfaction", "mortality", "illness"])
+def test_ci_healthcare_reduced_information_set(objective_symbol):
+    """Each single-objective optimum evaluates to the solver's objectives and beats the status quo."""
+    diagram = ci_healthcare_stationary_diagram(lyh_information_set=["PISt", "LYSt", "GER"])
+    problem, stationary_map = compile_stationary_diagram(diagram)
+    result = CVXPYSolver(problem, CVXPYSolverOptions(solver="SCIP")).solve(objective_symbol)
+    assert result.success, result.message
+
+    policies = read_policy_from_solution(stationary_map.index_map, result.optimal_variables)
+    evaluation = evaluate_stationary_policy(diagram, policies)
+    # CPT entries down to 1e-14 and McCormick `b = 1` leakage within solver tolerances leave
+    # relative objective errors of a few 1e-4, and absolute errors of a few 1e-6 near zero.
+    for symbol, value in evaluation.objectives.items():
+        floor = 1e-5 if symbol == objective_symbol else 2e-5
+        assert result.optimal_objectives[symbol] == pytest.approx(value, rel=1e-3, abs=floor)
+
+    status_quo = evaluate_stationary_policy(diagram, {}).objectives[objective_symbol]
+    assert evaluation.objectives[objective_symbol] <= status_quo + 1e-6
 
 
 # ── promote_to_decisions ───────────────────────────────────────────────────────────────────────
