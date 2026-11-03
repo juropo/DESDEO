@@ -1,10 +1,13 @@
 """Conversion between `DiscreteNetwork` and pyAgrum's `BayesNet`/`InfluenceDiagram`.
 
-Also pyAgrum-backed I/O and learning: `load_network`, `save_network`, `learn_network`. This is the
-only module in `desdeo/problem/graphical/` that imports pyAgrum.
+A `gum.InfluenceDiagram` maps to and from a `(DiscreteNetwork, DecisionAnnotation)` pair via
+`to_pyagrum_influence_diagram` and `from_pyagrum_influence_diagram`.
+
+Also pyAgrum-backed I/O and learning: `load_network`, `save_network`, `load_influence_diagram`,
+`learn_network`. This is the only module in `desdeo/problem/graphical/` that imports pyAgrum.
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,7 +20,7 @@ from desdeo.problem.graphical.network import (
     DiscreteVariableKind,
     Potential,
 )
-from desdeo.problem.graphical.schema import DecisionAnnotation
+from desdeo.problem.graphical.schema import DecisionAnnotation, DecisionNode, ObjectiveNode
 
 
 @dataclass(frozen=True)
@@ -282,7 +285,8 @@ def to_pyagrum_influence_diagram(network: DiscreteNetwork, annotation: DecisionA
 
     Decisions get arcs from their declared `information_set` (no-forgetting is left to the
     inference engine). Each `ObjectiveNode` gets its own utility node `util_<symbol>`, negated when
-    minimized since pyAgrum always maximizes.
+    minimized since pyAgrum always maximizes. Decision and objective names (or symbols, if unnamed)
+    become the pyAgrum variables' descriptions.
 
     Args:
         network: the Bayesian network (chance nodes + CPTs).
@@ -292,12 +296,15 @@ def to_pyagrum_influence_diagram(network: DiscreteNetwork, annotation: DecisionA
         gum.InfluenceDiagram: the equivalent pyAgrum diagram.
     """
     diagram = gum.InfluenceDiagram()
+    diagram.setProperty("name", network.name)
 
     for variable in network.variables:
         diagram.addChanceNode(_variable_to_pyagrum(variable))
     # Decisions first, since chance-node CPTs may name them as parents.
     for decision in annotation.decisions:
-        diagram.addDecisionNode(gum.LabelizedVariable(decision.symbol, decision.symbol, decision.states))
+        diagram.addDecisionNode(
+            gum.LabelizedVariable(decision.symbol, decision.name or decision.symbol, decision.states)
+        )
 
     for node_name, potential in network.potentials.items():
         for parent in potential.variables[1:]:
@@ -311,7 +318,7 @@ def to_pyagrum_influence_diagram(network: DiscreteNetwork, annotation: DecisionA
 
     for objective in annotation.objectives:
         util_name = f"util_{objective.symbol}"
-        diagram.addUtilityNode(gum.LabelizedVariable(util_name, util_name, 1))
+        diagram.addUtilityNode(gum.LabelizedVariable(util_name, objective.name or objective.symbol, 1))
         for parent in objective.parents:
             diagram.addArc(parent, util_name)
         # pyAgrum maximizes, so minimized objectives are negated. Utility-derived values read back
@@ -325,3 +332,153 @@ def to_pyagrum_influence_diagram(network: DiscreteNetwork, annotation: DecisionA
         _fill_cpt(diagram.utility(util_name), fake_potential)
 
     return diagram
+
+
+def _name_from_description(variable: gum.DiscreteVariable, symbol: str) -> str:
+    """A node's descriptive name: its pyAgrum description, or `""` if that repeats its name or symbol."""
+    description = variable.description()
+    return "" if description in (variable.name(), symbol) else description
+
+
+def from_pyagrum_influence_diagram(
+    diagram: gum.InfluenceDiagram,
+    *,
+    minimize: Collection[str] = (),
+    units: dict[str, str] | None = None,
+    no_forgetting: bool = False,
+) -> tuple[DiscreteNetwork, DecisionAnnotation]:
+    """Convert a pyAgrum `InfluenceDiagram` to a `(DiscreteNetwork, DecisionAnnotation)` pair.
+
+    Chance nodes become the network, in topological order; a CPT keeps any decision parents in its
+    `Potential.variables`, while `arcs` hold only chance-to-chance arcs. Each decision becomes a
+    `DecisionNode` observing its diagram parents. Each utility node becomes an `ObjectiveNode`
+    whose symbol is the node name without a leading `util_`. A variable's description becomes the
+    node's `name`, or `name=""` if it equals the node name or symbol. Decisions, objectives and
+    each `information_set` are ordered by pyAgrum node id, so the order may differ from the one the
+    diagram was exported from. Decision states are the variable's labels, so a non-labelized
+    decision variable (e.g. a range) imports with its values as label strings.
+
+    Args:
+        diagram: the pyAgrum diagram.
+        minimize: symbols of objectives to minimize. Their utilities are negated, since pyAgrum
+            only maximizes; all other objectives are maximized.
+        units: objective symbol -> unit.
+        no_forgetting: if true, use the diagram's total decision order with no-forgetting
+            semantics; otherwise use LIMID semantics (`decision_order=None`), the semantics
+            `ShaferShenoyLIMIDInference` uses without `addNoForgettingAssumption`. pyAgrum's
+            solution is only exact for solvable LIMIDs, while the compiled problem's optimum is
+            exact for any LIMID.
+
+    Returns:
+        tuple[DiscreteNetwork, DecisionAnnotation]: the network and its annotation, validated
+            against each other.
+
+    Raises:
+        TypeError: if `minimize` is a single string rather than a collection of symbols.
+        ValueError: if a utility node has no parents, or its stripped symbol is empty or clashes
+            with another node's; if `minimize` or `units` name unknown objectives; or if
+            `no_forgetting` is set but the decisions have no total order.
+    """
+    if isinstance(minimize, str):
+        msg = f"minimize must be a collection of objective symbols, not the string {minimize!r}."
+        raise TypeError(msg)
+    minimize = set(minimize)
+    units = units or {}
+
+    chance_ids = [node_id for node_id in diagram.topologicalOrder() if diagram.isChanceNode(node_id)]
+    chance_names = {diagram.variable(node_id).name() for node_id in chance_ids}
+    variables = [_variable_from_pyagrum(diagram.variable(node_id)) for node_id in chance_ids]
+    arcs: list[tuple[str, str]] = []
+    potentials: dict[str, Potential] = {}
+    for node_id in chance_ids:
+        node_name = diagram.variable(node_id).name()
+        potential = _potential_from_pyagrum(diagram.cpt(node_id))
+        potentials[node_name] = potential
+        arcs.extend((parent, node_name) for parent in potential.variables[1:] if parent in chance_names)
+    network = DiscreteNetwork(
+        name=diagram.propertyWithDefault("name", ""), variables=variables, arcs=arcs, potentials=potentials
+    )
+
+    decisions = []
+    objectives = []
+    # Symbol -> pyAgrum node name, for reporting clashes with stripped utility symbols.
+    node_names = {
+        diagram.variable(node_id).name(): diagram.variable(node_id).name()
+        for node_id in diagram.nodes()
+        if not diagram.isUtilityNode(node_id)
+    }
+    for node_id in sorted(diagram.nodes()):
+        variable = diagram.variable(node_id)
+        if diagram.isDecisionNode(node_id):
+            decisions.append(
+                DecisionNode(
+                    symbol=variable.name(),
+                    name=_name_from_description(variable, variable.name()),
+                    states=list(variable.labels()),
+                    information_set=[diagram.variable(parent).name() for parent in sorted(diagram.parents(node_id))],
+                )
+            )
+        elif diagram.isUtilityNode(node_id):
+            symbol = variable.name().removeprefix("util_")
+            if not symbol:
+                msg = f"Utility node {variable.name()!r} has an empty symbol once its 'util_' prefix is stripped."
+                raise ValueError(msg)
+            if symbol in node_names:
+                msg = (
+                    f"Utility node {variable.name()!r} imports as objective {symbol!r}, which clashes with "
+                    f"node {node_names[symbol]!r}."
+                )
+                raise ValueError(msg)
+            node_names[symbol] = variable.name()
+            if not diagram.parents(node_id):
+                msg = f"Utility node {variable.name()!r} has no parents; a constant utility can't be an ObjectiveNode."
+                raise ValueError(msg)
+            utility = _potential_from_pyagrum(diagram.utility(node_id))
+            values = np.array(utility.values, dtype=float)[0]
+            maximize = symbol not in minimize
+            if not maximize:
+                values = -values
+            parents = utility.variables[1:]
+            objectives.append(
+                ObjectiveNode(
+                    symbol=symbol,
+                    name=_name_from_description(variable, symbol),
+                    parents=parents,
+                    utility=Potential(variables=parents, shape=list(values.shape), values=values.tolist()),
+                    maximize=maximize,
+                    unit=units.get(symbol),
+                )
+            )
+
+    objective_symbols = {objective.symbol for objective in objectives}
+    for label, symbols in (("minimize", minimize), ("units", units)):
+        unknown = sorted(set(symbols) - objective_symbols)
+        if unknown:
+            msg = f"{label} names unknown objective(s) {unknown}; the diagram has {sorted(objective_symbols)}."
+            raise ValueError(msg)
+
+    decision_order = None
+    if no_forgetting:
+        if not diagram.decisionOrderExists():
+            msg = "no_forgetting=True requires the diagram's decisions to have a total order, but none exists."
+            raise ValueError(msg)
+        decision_order = [diagram.variable(node_id).name() for node_id in diagram.decisionOrder()]
+
+    annotation = DecisionAnnotation(
+        decisions=decisions, objectives=objectives, decision_order=decision_order, no_forgetting=no_forgetting
+    )
+    annotation.validate_against(network)
+    return network, annotation
+
+
+def load_influence_diagram(
+    path: str | Path,
+    *,
+    minimize: Collection[str] = (),
+    units: dict[str, str] | None = None,
+    no_forgetting: bool = False,
+) -> tuple[DiscreteNetwork, DecisionAnnotation]:
+    """Import an influence diagram from disk via `gum.loadID`; see `from_pyagrum_influence_diagram`."""
+    return from_pyagrum_influence_diagram(
+        gum.loadID(str(path)), minimize=minimize, units=units, no_forgetting=no_forgetting
+    )
