@@ -26,18 +26,25 @@ from desdeo.problem.graphical import (
     DecisionAnnotation,
     DecisionNode,
     DecisionPolicy,
+    DiagramConstraint,
+    DiagramConstraintKind,
     DiscreteNetwork,
     ObjectiveNode,
     Potential,
     StationaryDiagram,
     classify_2tbn,
+    compile_stationary_diagram,
     evaluate_stationary_policy,
     initial_state_distribution,
     promote_to_decisions,
+    read_policy_from_solution,
 )
 from desdeo.problem.graphical.adapters.pyagrum import to_pyagrum
+from desdeo.problem.graphical.compile import _group_flat_indices_by_projection
 from desdeo.problem.graphical.dynamic import _contract
 from desdeo.problem.graphical.index_map import mixed_radix_encode
+from desdeo.tools import add_asf_diff
+from desdeo.tools.gurobipy_solver_interfaces import GurobipySolver
 
 pytestmark = pytest.mark.graphical
 
@@ -371,6 +378,236 @@ def test_state_node_outside_transition_matches_unrolled_network():
     assert evaluation.objectives["w"] == pytest.approx(_unrolled_average(network, "Wt", [0.0, 1.0]), abs=1e-6)
 
 
+# ── compile_stationary_diagram ─────────────────────────────────────────────────────────────────
+
+
+def _all_policies(diagram: StationaryDiagram):
+    """Every deterministic policy of `diagram`'s decisions, as `{symbol: DecisionPolicy}`."""
+    cardinality = {variable.name: len(variable.labels) for variable in diagram.network.variables}
+    per_decision = []
+    for decision in diagram.decisions:
+        n_info = int(np.prod([cardinality[name] for name in decision.information_set]))
+        per_decision.append(
+            [
+                _policy(decision, decision.information_set, list(choices))
+                for choices in itertools.product(range(len(decision.states)), repeat=n_info)
+            ]
+        )
+    for combination in itertools.product(*per_decision):
+        yield {policy.symbol: policy for policy in combination}
+
+
+def _solve(diagram: StationaryDiagram, objective_symbol: str):
+    """Solve `diagram`'s MILP for one objective; return the result, read-back policies and their evaluation."""
+    problem, stationary_map = compile_stationary_diagram(diagram)
+    result = GurobipySolver(problem).solve(objective_symbol)
+    assert result.success, result.message
+    policies = read_policy_from_solution(stationary_map.index_map, result.optimal_variables)
+    evaluation = evaluate_stationary_policy(diagram, policies)
+    for symbol, value in evaluation.objectives.items():
+        assert result.optimal_objectives[symbol] == pytest.approx(value, abs=1e-6)
+    return result, policies, evaluation, stationary_map
+
+
+def _same_slice_diagram(information_set: list[str] | None) -> StationaryDiagram:
+    return StationaryDiagram.with_default_information_sets(
+        same_slice_2tbn_network(),
+        {"Dt": information_set},
+        [_objective("x", ["Xt"], X_UTILITY), _objective("y", ["Yt"], Y_UTILITY)],
+        discount=GAMMA,
+    )
+
+
+def _atemporal_diagram() -> StationaryDiagram:
+    return StationaryDiagram.with_default_information_sets(
+        atemporal_2tbn_network(),
+        {"G": None},
+        [_objective("x", ["Xt"], X_UTILITY), _objective("g", ["G"], [0.0, -0.3, -0.6])],
+        discount=GAMMA,
+    )
+
+
+@pytest.mark.gurobipy
+@pytest.mark.parametrize("gamma", [0.5, 0.9, 0.99])
+def test_compiled_mdp_matches_value_iteration(gamma):
+    """The MILP optimum and policy of the fully observed MDP equal value iteration's."""
+    diagram = StationaryDiagram.with_default_information_sets(
+        mdp_2tbn_network(), {"Dt": None}, [_objective("u", ["Xt"], X_UTILITY)], discount=gamma
+    )
+    transition, reward, mu = _explicit_mdp(diagram.network, X_UTILITY)
+    optimal_value, optimal_policy = _value_iteration(transition, reward, gamma)
+
+    result, policies, _, _ = _solve(diagram, "u")
+    assert result.optimal_objectives["u"] == pytest.approx((1 - gamma) * mu @ optimal_value, abs=1e-6)
+    assert policies["Dt"].information_set == ["X0"]
+    assert [policies["Dt"].policy[s] for s in range(2)] == optimal_policy.tolist()
+
+
+@pytest.mark.gurobipy
+@pytest.mark.parametrize("information_set", [None, ["X0", "Yt"]])
+@pytest.mark.parametrize("objective_symbol", ["x", "y"])
+def test_compiled_same_slice_matches_brute_force(information_set, objective_symbol):
+    """With a same-slice observation, the MILP optimum is the best enumerated deterministic policy."""
+    diagram = _same_slice_diagram(information_set)
+    best = max(
+        evaluate_stationary_policy(diagram, policies).objectives[objective_symbol]
+        for policies in _all_policies(diagram)
+    )
+
+    result, _, _, _ = _solve(diagram, objective_symbol)
+    assert result.optimal_objectives[objective_symbol] == pytest.approx(best, abs=1e-6)
+
+
+@pytest.mark.gurobipy
+@pytest.mark.parametrize("objective_symbol", ["x", "g"])
+def test_compiled_atemporal_decision_matches_brute_force(objective_symbol):
+    """An atemporal decision with an atemporal chance state: the MILP picks the brute-force argmax."""
+    diagram = _atemporal_diagram()
+    values = {
+        policies["G"].policy[0]: evaluate_stationary_policy(diagram, policies).objectives[objective_symbol]
+        for policies in _all_policies(diagram)
+    }
+    best = max(values, key=values.get)
+
+    result, policies, _, _ = _solve(diagram, objective_symbol)
+    assert result.optimal_objectives[objective_symbol] == pytest.approx(values[best], abs=1e-6)
+    assert policies["G"].policy == {0: best}
+
+
+@pytest.mark.gurobipy
+def test_compiled_asf_solution_is_not_dominated():
+    """An ASF solution's policy evaluates to the solver's objectives and no deterministic policy dominates it."""
+    diagram = _same_slice_diagram(["X0", "Yt"])
+    problem, stationary_map = compile_stationary_diagram(diagram)
+    enumerated = [evaluate_stationary_policy(diagram, policies).objectives for policies in _all_policies(diagram)]
+    ideal = {symbol: max(values[symbol] for values in enumerated) for symbol in ("x", "y")}
+    nadir = {symbol: min(values[symbol] for values in enumerated) for symbol in ("x", "y")}
+    reference_point = {symbol: (ideal[symbol] + nadir[symbol]) / 2 for symbol in ("x", "y")}
+
+    problem = problem.update_ideal_and_nadir(ideal, nadir)
+    scalarized, target = add_asf_diff(problem, "asf", reference_point)
+    result = GurobipySolver(scalarized).solve(target)
+    assert result.success, result.message
+
+    policies = read_policy_from_solution(stationary_map.index_map, result.optimal_variables)
+    evaluation = evaluate_stationary_policy(diagram, policies)
+    for symbol in ("x", "y"):
+        assert result.optimal_objectives[symbol] == pytest.approx(evaluation.objectives[symbol], abs=1e-6)
+    for values in enumerated:
+        at_least = all(values[symbol] >= evaluation.objectives[symbol] - 1e-9 for symbol in ("x", "y"))
+        better = any(values[symbol] > evaluation.objectives[symbol] + 1e-9 for symbol in ("x", "y"))
+        assert not (at_least and better), values
+
+
+@pytest.mark.gurobipy
+@pytest.mark.parametrize("diagram_builder", [lambda: _same_slice_diagram(["X0", "Yt"]), _atemporal_diagram])
+def test_compiled_occupation_matches_evaluation(diagram_builder):
+    """The solved occupation cluster's marginal over the state nodes is the evaluated occupation measure."""
+    diagram = diagram_builder()
+    result, _, evaluation, stationary_map = _solve(diagram, "x")
+    cluster = stationary_map.index_map.clusters[stationary_map.occupation_owner]
+    cardinalities = evaluation.occupation.shape
+    groups = _group_flat_indices_by_projection(
+        cluster.nodes, cluster.cardinalities, stationary_map.state_nodes, cardinalities
+    )
+    mu = np.array(result.optimal_variables[cluster.mu_symbol])
+    occupation = np.array([mu[group].sum() for group in groups])
+
+    assert occupation.sum() == pytest.approx(1.0, abs=1e-6)
+    np.testing.assert_allclose(occupation, np.ravel(evaluation.occupation.values), rtol=0, atol=1e-6)
+
+
+def test_compile_stationary_sink_name_clash_raises():
+    """A symbol named like the internal state sink is refused."""
+    diagram = StationaryDiagram.with_default_information_sets(
+        mdp_2tbn_network(), {"Dt": None}, [_objective("__state_t", ["Xt"], X_UTILITY)], discount=GAMMA
+    )
+    with pytest.raises(ValueError, match="reserved"):
+        compile_stationary_diagram(diagram)
+
+
+def test_compile_stationary_flow_name_clash_raises():
+    """A constraint symbol named like a flow-balance constraint is refused."""
+    constraint = DiagramConstraint(
+        symbol="flow_1", kind=DiagramConstraintKind.probability, nodes=["Xt"], func=["Subtract", ["At", "Xt", 1], 0.9]
+    )
+    diagram = StationaryDiagram.with_default_information_sets(
+        mdp_2tbn_network(),
+        {"Dt": None},
+        [_objective("u", ["Xt"], X_UTILITY)],
+        discount=GAMMA,
+        constraints=[constraint],
+    )
+    with pytest.raises(ValueError, match="reserved for the flow-balance constraints"):
+        compile_stationary_diagram(diagram)
+
+
+def _sink_apart_network() -> DiscreteNetwork:
+    """`Wt | Y0, Dt` and `Dt | Y0`, with `Yt` a root, so the state sink is apart from the free chain."""
+    network = _network({"Y0": [], "Yt": [], "W0": [], "Wt": ["Y0", "Dt"], "D0": [], "Dt": ["Y0"]})
+    network = _replace_cpt(network, "Yt", Potential(variables=["Yt"], shape=[2], values=[0.8, 0.2]))
+    win = np.array([[0.2, 0.7], [0.9, 0.4]])
+    return _replace_cpt(
+        network,
+        "Wt",
+        Potential(variables=["Wt", "Y0", "Dt"], shape=[2, 2, 2], values=np.stack([1 - win, win]).tolist()),
+    )
+
+
+def _barren_node_network() -> DiscreteNetwork:
+    """The MDP with an isolated slice pair `Q0`, `Qt`."""
+    network = mdp_2tbn_network()
+    return DiscreteNetwork(
+        variables=[*network.variables, binary_variable("Q0"), binary_variable("Qt")],
+        arcs=network.arcs,
+        potentials={
+            **network.potentials,
+            "Q0": Potential(variables=["Q0"], shape=[2], values=[0.5, 0.5]),
+            "Qt": Potential(variables=["Qt"], shape=[2], values=[0.4, 0.6]),
+        },
+    )
+
+
+@pytest.mark.gurobipy
+@pytest.mark.parametrize(
+    ("network_builder", "objective"),
+    [(_sink_apart_network, ["Wt"]), (_barren_node_network, ["Xt"])],
+)
+def test_compiled_disconnected_step_matches_brute_force(network_builder, objective):
+    """A step network that would split into several components compiles to the brute-force optimum."""
+    diagram = StationaryDiagram.with_default_information_sets(
+        network_builder(), {"Dt": None}, [_objective("u", objective, [1.0, 3.0])], discount=GAMMA
+    )
+    best = max(evaluate_stationary_policy(diagram, policies).objectives["u"] for policies in _all_policies(diagram))
+
+    result, _, _, stationary_map = _solve(diagram, "u")
+    assert result.optimal_objectives["u"] == pytest.approx(best, abs=1e-6)
+    assert "Qt" not in stationary_map.index_map.clusters
+
+
+@pytest.mark.gurobipy
+@pytest.mark.parametrize("objective_symbol", ["e", "x"])
+def test_compiled_decision_sink_parent_matches_brute_force(objective_symbol):
+    """A lone decision `Et` joins the state sink as an extra parent and compiles to the brute-force optimum."""
+    network = _network({"Et": [], "E0": [], "X0": [], "Xt": ["X0"]})
+    network = _replace_cpt(
+        network, "Xt", Potential(variables=["Xt", "X0"], shape=[2, 2], values=[[0.6, 0.2], [0.4, 0.8]])
+    )
+    diagram = StationaryDiagram.with_default_information_sets(
+        network,
+        {"Et": None},
+        [_objective("e", ["Et"], [0.0, 2.0]), _objective("x", ["Xt"], [1.0, 3.0])],
+        discount=GAMMA,
+    )
+    best = max(
+        evaluate_stationary_policy(diagram, policies).objectives[objective_symbol]
+        for policies in _all_policies(diagram)
+    )
+
+    result, _, _, _ = _solve(diagram, objective_symbol)
+    assert result.optimal_objectives[objective_symbol] == pytest.approx(best, abs=1e-6)
+
+
 # ── promote_to_decisions ───────────────────────────────────────────────────────────────────────
 
 
@@ -449,6 +686,38 @@ def test_discount_out_of_range_raises(discount):
     with pytest.raises(ValueError, match="discount must be in"):
         StationaryDiagram.with_default_information_sets(
             mdp_2tbn_network(), {"Dt": None}, [_objective("u", ["Xt"], X_UTILITY)], discount=discount
+        )
+
+
+@pytest.mark.parametrize(
+    ("values", "reason"),
+    [([0.6, 0.7], "got sum"), ([1.2, -0.2], "got negative"), ([float("nan"), 1.0], "got non-finite")],
+)
+def test_unnormalised_initial_distribution_raises(values, reason):
+    """The initial distribution must be a probability distribution."""
+    with pytest.raises(ValueError, match=f"finite, nonnegative and sum to 1, {reason}"):
+        StationaryDiagram.with_default_information_sets(
+            mdp_2tbn_network(),
+            {"Dt": None},
+            [_objective("u", ["Xt"], X_UTILITY)],
+            discount=GAMMA,
+            initial_distribution=Potential(variables=["X0"], shape=[2], values=values),
+        )
+
+
+@pytest.mark.parametrize("node", ["Y0", "D0"])
+def test_constraint_on_dropped_node_raises(node):
+    """Constraints can't reference slice-0 nodes that aren't state."""
+    constraint = DiagramConstraint(
+        symbol="c", kind=DiagramConstraintKind.probability, nodes=[node], func=["Subtract", ["At", node, 1], 0.5]
+    )
+    with pytest.raises(ValueError, match="must be slice-t nodes, decisions, state nodes"):
+        StationaryDiagram.with_default_information_sets(
+            same_slice_2tbn_network(),
+            {"Dt": None},
+            [_objective("x", ["Xt"], X_UTILITY)],
+            discount=GAMMA,
+            constraints=[constraint],
         )
 
 

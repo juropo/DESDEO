@@ -9,15 +9,23 @@ status-quo slice-0 population.
 
 from collections.abc import Hashable, Sequence
 from math import prod
-from typing import Self
+from typing import Literal, Self
 
 import numpy as np
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from .compile import DecisionPolicy
+from desdeo.problem.schema import Constraint, ConstraintTypeEnum, Problem
+
+from .compile import (
+    DecisionPolicy,
+    IndexMap,
+    _extract_expr,
+    _group_flat_indices_by_projection,
+    compile_diagram,
+)
 from .index_map import mixed_radix_decode
-from .network import DiscreteNetwork, Potential, kahn_topological_order
-from .schema import DecisionNode, DiagramConstraint, ObjectiveNode, _check_unique_symbols
+from .network import DiscreteNetwork, DiscreteVariable, Potential, kahn_topological_order
+from .schema import DecisionAnnotation, DecisionNode, DiagramConstraint, ObjectiveNode, _check_unique_symbols
 
 Factor = tuple[Sequence[Hashable], np.ndarray]
 """A table and the names of its axes, in order."""
@@ -25,6 +33,12 @@ Factor = tuple[Sequence[Hashable], np.ndarray]
 
 _EINSUM_MAX_AXES = 52
 """numpy's einsum accepts at most this many distinct integer axis labels."""
+
+_INITIAL_SUM_TOLERANCE = 1e-9
+"""How far `StationaryDiagram.initial_distribution` may sum from 1."""
+
+_STATE_SINK = "__state_t"
+"""One-state chance node whose cluster holds the slice-t state joint."""
 
 
 def _check_known_decisions(symbols: set[str], node_names: set[str]) -> None:
@@ -218,11 +232,13 @@ class StationaryDiagram(BaseModel):
     objectives: list[ObjectiveNode]
     """Parents are slice-t nodes, decision symbols or atemporal state nodes."""
     constraints: list[DiagramConstraint] = Field(default_factory=list)
+    """Nodes are slice-t nodes, decisions, state nodes or objective symbols; a constraint on a slice-0
+    or atemporal state node constrains its occupation marginal."""
     discount: float
     """The discount factor gamma, in (0, 1)."""
     initial_distribution: Potential | None = None
-    """Joint over `TwoSliceStructure.state_nodes`, in that order. `None` contracts the slice-0 and
-    atemporal CPTs."""
+    """Joint over `TwoSliceStructure.state_nodes`, in that order, nonnegative and summing to 1. `None`
+    contracts the slice-0 and atemporal CPTs."""
 
     @model_validator(mode="after")
     def _check_diagram(self) -> Self:
@@ -265,11 +281,14 @@ class StationaryDiagram(BaseModel):
 
         _check_objectives(self.objectives, structure, set(decision_symbols), labels)
 
-        referenceable = node_names | set(objective_symbols)
+        referenceable = structure.slicet | set(decision_symbols) | set(structure.state_nodes) | set(objective_symbols)
         for constraint in self.constraints:
-            unknown = [node for node in constraint.nodes if node not in referenceable]
-            if unknown:
-                msg = f"Constraint '{constraint.symbol}': nodes reference unknown node(s) {unknown}."
+            not_allowed = [node for node in constraint.nodes if node not in referenceable]
+            if not_allowed:
+                msg = (
+                    f"Constraint '{constraint.symbol}': nodes {not_allowed} must be slice-t nodes, decisions, "
+                    f"state nodes {structure.state_nodes} or objective symbols."
+                )
                 raise ValueError(msg)
 
         if self.initial_distribution is not None:
@@ -282,6 +301,16 @@ class StationaryDiagram(BaseModel):
                     f"initial_distribution must be over {structure.state_nodes} with shape {expected_shape}, got "
                     f"{self.initial_distribution.variables} with shape {self.initial_distribution.shape}."
                 )
+                raise ValueError(msg)
+            values = np.array(self.initial_distribution.values, dtype=float)
+            if not np.isfinite(values).all():
+                msg = "initial_distribution must be finite, nonnegative and sum to 1, got non-finite values."
+                raise ValueError(msg)
+            if (values < 0).any():
+                msg = "initial_distribution must be finite, nonnegative and sum to 1, got negative values."
+                raise ValueError(msg)
+            if abs(values.sum() - 1.0) > _INITIAL_SUM_TOLERANCE:
+                msg = f"initial_distribution must be finite, nonnegative and sum to 1, got sum {values.sum()}."
                 raise ValueError(msg)
         else:
             parents = {name: potential.variables[1:] for name, potential in self.network.potentials.items()}
@@ -522,4 +551,174 @@ def evaluate_stationary_policy(
     return StationaryEvaluation(
         objectives=values,
         occupation=Potential(variables=structure.state_nodes, shape=list(occupation.shape), values=occupation.tolist()),
+    )
+
+
+class StationaryIndexMap(BaseModel):
+    """`compile_stationary_diagram`'s bookkeeping on top of the compiled step's `IndexMap`."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    index_map: IndexMap
+    """The compiled 2-slice step; pass it to `read_policy_from_solution`."""
+    state_nodes: list[str]
+    """`TwoSliceStructure.state_nodes`; flow balance `i` is their `i`-th joint state, mixed-radix."""
+    next_of: dict[str, str]
+    """`TwoSliceStructure.next_of`."""
+    discount: float
+    """`StationaryDiagram.discount`."""
+    occupation_owner: str
+    """The last state node, whose cluster holds the occupation measure x over `state_nodes`."""
+    sink_owner: str
+    """The sink node, whose cluster holds the slice-t state joint over `next_of`'s values."""
+
+
+def _step_network(diagram: StationaryDiagram) -> DiscreteNetwork:
+    """One 2-slice step: a uniform free chain over the state, slice t, the decisions and the state sink.
+
+    Each state node takes all earlier state nodes as parents. Slice-0 and atemporal chance nodes
+    that aren't state are dropped, and so are slice-t chance nodes that no next-step state node,
+    objective, decision or constraint depends on. The sink's parents are the next-step state nodes
+    and one node of each connected component they miss; its all-ones CPT keeps the semantics.
+    """
+    network = diagram.network
+    structure = diagram.structure
+    state_nodes = structure.state_nodes
+    state = set(state_nodes)
+    decisions = {decision.symbol for decision in diagram.decisions}
+    next_nodes = [structure.next_of[name] for name in state_nodes]
+
+    parents = {name: potential.variables[1:] for name, potential in network.potentials.items()}
+    parents.update({decision.symbol: decision.information_set for decision in diagram.decisions})
+    targets = [*next_nodes, *decisions]
+    targets += [parent for objective in diagram.objectives for parent in objective.parents]
+    targets += [node for constraint in diagram.constraints for node in constraint.nodes if node in parents]
+    kept = state | _ancestors(targets, parents, structure.slicet | (structure.atemporal & decisions))
+    variables = [variable for variable in network.variables if variable.name in kept]
+    cardinality = {variable.name: len(variable.labels) for variable in variables}
+
+    arcs = [(parent, child) for parent, child in network.arcs if child in kept - state and parent in kept]
+    potentials = {name: potential for name, potential in network.potentials.items() if name in kept - state}
+    for i, name in enumerate(state_nodes):
+        parents[name] = state_nodes[:i]
+        shape = [cardinality[name], *(cardinality[parent] for parent in parents[name])]
+        arcs.extend((parent, name) for parent in parents[name])
+        potentials[name] = Potential(
+            variables=[name, *parents[name]], shape=shape, values=np.full(shape, 1.0 / shape[0]).tolist()
+        )
+
+    neighbours: dict[str, set[str]] = {name: set() for name in kept}
+    for child in kept:
+        for parent in parents[child]:
+            neighbours[child].add(parent)
+            neighbours[parent].add(child)
+    sink_parents = list(next_nodes)
+    reached = _ancestors(next_nodes, neighbours)
+    for variable in variables:
+        if variable.name not in reached:
+            sink_parents.append(variable.name)
+            reached |= _ancestors([variable.name], neighbours)
+
+    variables.append(DiscreteVariable(name=_STATE_SINK, labels=["state"]))
+    arcs.extend((name, _STATE_SINK) for name in sink_parents)
+    shape = [1, *(cardinality[name] for name in sink_parents)]
+    potentials[_STATE_SINK] = Potential(
+        variables=[_STATE_SINK, *sink_parents], shape=shape, values=np.ones(shape).tolist()
+    )
+
+    return DiscreteNetwork(name=network.name, variables=variables, arcs=arcs, potentials=potentials)
+
+
+def _marginal_exprs(
+    index_map: IndexMap, owner: str, target_order: list[str], target_cardinalities: list[int]
+) -> list[list]:
+    """`Sum(Extract(mu, ...))` per joint state of `target_order` in `owner`'s cluster."""
+    cluster = index_map.clusters[owner]
+    groups = _group_flat_indices_by_projection(cluster.nodes, cluster.cardinalities, target_order, target_cardinalities)
+    return [_extract_expr(cluster.mu_symbol, group) for group in groups]
+
+
+def compile_stationary_diagram(
+    diagram: StationaryDiagram,
+    *,
+    max_cluster_size: int | None = None,
+    on_exceed: Literal["warn", "raise"] = "warn",
+) -> tuple[Problem, StationaryIndexMap]:
+    """Compile `diagram` into a MILP for its optimal deterministic stationary policy.
+
+    One 2-slice step is compiled with `compile_diagram`, the slice-0 state joint left free as
+    the occupation measure x. One flow-balance equality per joint state s of the state nodes,
+    `x(s) = (1 - gamma) mu_init(s) + gamma P(state_t = s)`, ties it to the step's own slice-t
+    state joint. The objectives are per-step averages under x, as in `evaluate_stationary_policy`;
+    multiply by 1 / (1 - gamma) for the total discounted sum.
+
+    Args:
+        diagram: the stationary diagram.
+        max_cluster_size: forwarded to `compile_diagram`.
+        on_exceed: forwarded to `compile_diagram`.
+
+    Returns:
+        tuple[Problem, StationaryIndexMap]: the compiled MILP and its bookkeeping.
+
+    Raises:
+        ValueError: the diagram has no state nodes, a network node or objective/constraint
+            symbol is named like the internal sink node, an objective/constraint symbol is named
+            like a flow-balance constraint `flow_{i}`, or `compile_diagram` raises.
+    """
+    structure = diagram.structure
+    state_nodes = structure.state_nodes
+    if not state_nodes:
+        msg = "The diagram has no state nodes, so nothing carries over between steps."
+        raise ValueError(msg)
+    symbols = {objective.symbol for objective in diagram.objectives}
+    symbols |= {constraint.symbol for constraint in diagram.constraints}
+    if _STATE_SINK in symbols | {variable.name for variable in diagram.network.variables}:
+        msg = f"'{_STATE_SINK}' is reserved for the compiled state sink; rename that node or symbol."
+        raise ValueError(msg)
+    cardinality = {variable.name: len(variable.labels) for variable in diagram.network.variables}
+    cardinalities = [cardinality[name] for name in state_nodes]
+    flow_clashes = sorted(symbols & {f"flow_{i}" for i in range(prod(cardinalities))})
+    if flow_clashes:
+        msg = f"Symbols {flow_clashes} are reserved for the flow-balance constraints; rename them."
+        raise ValueError(msg)
+
+    network = promote_to_decisions(_step_network(diagram), diagram.decisions)
+    annotation = DecisionAnnotation(
+        decisions=diagram.decisions, objectives=diagram.objectives, constraints=diagram.constraints
+    )
+    problem, index_map = compile_diagram(
+        network,
+        annotation,
+        max_cluster_size=max_cluster_size,
+        on_exceed=on_exceed,
+        free_nodes=frozenset(state_nodes),
+    )
+
+    occupation_owner = state_nodes[-1]
+    current = _marginal_exprs(index_map, occupation_owner, state_nodes, cardinalities)
+    following = _marginal_exprs(
+        index_map, _STATE_SINK, [structure.next_of[name] for name in state_nodes], cardinalities
+    )
+    gamma = diagram.discount
+    mu_init = initial_state_distribution(diagram).reshape(-1)
+    flow = [
+        Constraint(
+            name=f"Flow balance at state {i}",
+            symbol=f"flow_{i}",
+            cons_type=ConstraintTypeEnum.EQ,
+            func=["Subtract", ["Subtract", x, ["Multiply", gamma, x_next]], float((1 - gamma) * mu_init[i])],
+            is_linear=True,
+            is_convex=True,
+            is_twice_differentiable=True,
+        )
+        for i, (x, x_next) in enumerate(zip(current, following, strict=True))
+    ]
+
+    return problem.add_constraints(flow), StationaryIndexMap(
+        index_map=index_map,
+        state_nodes=state_nodes,
+        next_of=structure.next_of,
+        discount=gamma,
+        occupation_owner=occupation_owner,
+        sink_owner=_STATE_SINK,
     )
