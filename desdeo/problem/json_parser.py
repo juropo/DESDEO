@@ -9,6 +9,7 @@ import gurobipy as gp
 import numpy as np
 import polars as pl
 import pyomo.environ as pyomo
+import scipy.sparse as sps
 import sympy as sp
 from pyomo.core.expr.numeric_expr import MaxExpression as _PyomoMax
 from pyomo.core.expr.numeric_expr import MinExpression as _PyomoMin
@@ -39,13 +40,20 @@ class MathParser:
     Parses MathJSON expressions to polars, pyomo, sympy, gurobipy, or cvxpy expressions.
     """
 
-    def __init__(self, to_format: FormatEnum = "polars"):  # noqa: C901
+    def __init__(  # noqa: C901
+        self, to_format: FormatEnum = "polars", sparse_constants: dict[str, sps.sparray] | None = None
+    ):
         """Create a parser instance for parsing MathJSON notation into polars expressions.
 
         Args:
             to_format (FormatEnum, optional): to which format a JSON representation should be parsed to.
                 Defaults to "polars".
+            sparse_constants (dict[str, sps.sparray] | None, optional): sparse constants by symbol. When parsing
+                to polars, these symbols are replaced by the sparse arrays instead of dataframe columns.
+                Defaults to None.
         """
+        self.sparse_constants = sparse_constants if sparse_constants is not None else {}
+
         # Define operator names. Change these when the name is altered in the JSON format.
         # Basic arithmetic operators
         self.NEGATE: str = "Negate"
@@ -229,18 +237,52 @@ class MathParser:
             # No return dtype is declared: polars infers it from a sample, which works
             # because the surrounding +,-,*,/ are native expressions (not UDFs), so this
             # UDF is never nested inside another un-inferrable UDF.
+            # A sparse left operand is captured in the UDF, not read from the dataframe.
+            sparse = exprs[0] if sps.issparse(exprs[0]) else None
+            column_exprs = exprs[1:] if sparse is not None else exprs
+
             def _map_function(series_list):
-                acc = series_list[0].to_numpy()
-                for series in series_list[1:]:
-                    x = series.to_numpy()
+                arrays = [series.to_numpy() for series in series_list]
+                if sparse is None:
+                    acc = arrays.pop(0)
+                else:
+                    # sparse @ per-row vectors or matrices: one product with the rows stacked along axis 1
+                    x = arrays.pop(0)
+                    left = sparse.reshape(1, -1) if sparse.ndim == 1 else sparse
+                    product = left @ np.moveaxis(x, 0, 1).reshape(x.shape[1], -1)
+                    acc = np.moveaxis(product.reshape(left.shape[0], x.shape[0], *x.shape[2:]), 0, 1)
+                    if sparse.ndim == 1:
+                        acc = acc[:, 0]
+                for x in arrays:
                     if acc.ndim == 2 and x.ndim == 2:  # noqa: PLR2004
                         # row vectors -> per-row dot product (polars has no "column" vectors)
                         acc = np.einsum("ij,ij->i", acc, x, optimize=True)
+                    elif acc.ndim == 3 and x.ndim == 2:  # noqa: PLR2004
+                        # matrices @ row vectors -> per-row matrix-vector product
+                        acc = np.einsum("ijk,ik->ij", acc, x, optimize=True)
+                    elif acc.ndim == 2 and x.ndim == 3:  # noqa: PLR2004
+                        # row vectors @ matrices -> per-row vector-matrix product
+                        acc = np.einsum("ij,ijk->ik", acc, x, optimize=True)
                     else:
                         acc = np.matmul(acc, x)
                 return pl.Series(values=acc)
 
-            return pl.map_batches(exprs=[to_expr(expr) for expr in exprs], function=_map_function)
+            return pl.map_batches(exprs=[to_expr(expr) for expr in column_exprs], function=_map_function)
+
+        def _polars_literal_value(expr):
+            """Return the value of a literal polars expression, raising if the expression is not a literal."""
+            try:
+                return pl.select(expr).item()
+            except Exception as e:
+                msg = "A sparse constant can only be multiplied by a scalar literal."
+                raise ParserError(msg) from e
+
+        def _polars_multiply(*args):
+            if any(sps.issparse(arg) for arg in args):
+                return reduce(
+                    lambda a, b: a * b, [arg if sps.issparse(arg) else _polars_literal_value(arg) for arg in args]
+                )
+            return reduce(lambda a, b: to_expr(a) * to_expr(b), args)
 
         def _polars_summation(expr):
             """Polars matrix summation."""
@@ -267,7 +309,7 @@ class MathParser:
             self.NEGATE: lambda x: _polars_reduce_unary(x, np.negative),
             self.ADD: lambda *args: reduce(lambda a, b: to_expr(a) + to_expr(b), args),
             self.SUB: lambda *args: reduce(lambda a, b: to_expr(a) - to_expr(b), args),
-            self.MUL: lambda *args: reduce(lambda a, b: to_expr(a) * to_expr(b), args),
+            self.MUL: _polars_multiply,
             self.DIV: lambda *args: reduce(lambda a, b: to_expr(a) / to_expr(b), args),
             # Vector and matrix operations
             self.MATMUL: _polars_reduce_matmul,
@@ -747,6 +789,9 @@ class MathParser:
                     a = np.array(a)
                 if isinstance(b, list):
                     b = np.array(b)
+                if sps.issparse(a) and a.ndim == 1:
+                    # sparse vector . vector -> scalar expression
+                    return (a.reshape(1, -1) @ b)[0]
                 return a @ b
 
             return reduce(_matmul, args)
@@ -828,10 +873,6 @@ class MathParser:
             self.MIN: lambda *args: gp.min_(args),
         }
 
-        def _cvxpy_error():
-            msg = "The cvxpy model format only supports linear and quadratic expressions."
-            return lambda x: (_ for _ in ()).throw(ParserError(msg))
-
         def _cvxpy_matmul(*args):
             """CVXPY matrix multiplication."""
 
@@ -840,9 +881,24 @@ class MathParser:
                     a = np.array(a)
                 if isinstance(b, list):
                     b = np.array(b)
+                if sps.issparse(a) and a.ndim == 1:
+                    # sparse vector . vector -> scalar expression
+                    return (a.reshape(1, -1) @ b)[0]
                 return a @ b
 
             return reduce(_matmul, args)
+
+        def _cvxpy_multiply(*args):
+            """CVXPY multiplication."""
+
+            def _mul(a, b):
+                # a 1-D sparse array times a cvxpy scalar is built as a (1, n) product and flattened back
+                for sparse, other in ((a, b), (b, a)):
+                    if sps.issparse(sparse) and sparse.ndim == 1 and isinstance(other, cp.Expression):
+                        return cp.reshape(other * sparse.reshape(1, -1), sparse.shape, order="C")
+                return a * b
+
+            return reduce(_mul, args)
 
         def _cvxpy_summation(summand):
             """CVXPY matrix summation."""
@@ -877,7 +933,7 @@ class MathParser:
             self.NEGATE: lambda x: -x,
             self.ADD: lambda *args: reduce(lambda x, y: x + y, args),
             self.SUB: lambda *args: reduce(lambda x, y: x - y, args),
-            self.MUL: lambda *args: reduce(lambda x, y: x * y, args),
+            self.MUL: _cvxpy_multiply,
             self.DIV: lambda *args: reduce(lambda x, y: x / y, args),
             # Vector and matrix operations
             self.MATMUL: _cvxpy_matmul,
@@ -921,7 +977,7 @@ class MathParser:
         match to_format:
             case FormatEnum.polars:
                 self.env = polars_env
-                self.parse = self._parse_to_polars
+                self.parse = self._parse_to_polars_checked
             case FormatEnum.pyomo:
                 self.env = pyomo_env
                 self.parse = self._parse_to_pyomo
@@ -937,6 +993,16 @@ class MathParser:
             case _:
                 msg = f"Given target format {to_format} not supported. Must be one of {FormatEnum}."
                 raise ParserError(msg)
+
+    def _parse_to_polars_checked(self, expr: list | str | int | float) -> pl.Expr:
+        """Parse to a polars expression, raising if the whole expression is a sparse constant."""
+        parsed = self._parse_to_polars(expr)
+        if sps.issparse(parsed):
+            symbols = [symbol for symbol, value in self.sparse_constants.items() if value is parsed]
+            name = f"'{symbols[0]}'" if symbols else "a sparse constant"
+            msg = f"The expression evaluates to the sparse constant {name}, which must be used in '{self.MATMUL}'."
+            raise ParserError(msg)
+        return parsed
 
     def _parse_to_polars(self, expr: list | str | int | float) -> pl.Expr:
         """Recursively parses JSON math expressions and returns a polars expression.
@@ -956,7 +1022,9 @@ class MathParser:
             # Terminal case: polars expression
             return expr
         if isinstance(expr, str):
-            # Terminal case: str expression (represents a column name)
+            # Terminal case: str expression (represents a column name, or a sparse constant)
+            if expr in self.sparse_constants:
+                return self.sparse_constants[expr]
             return pl.col(expr)
         if isinstance(expr, self.literals):
             # Terminal case: numeric literal
@@ -966,13 +1034,16 @@ class MathParser:
             if len(expr) == 1 and isinstance(expr[0], str | self.literals):
                 # Terminal case, single symbol expression or literal
                 if isinstance(expr[0], str):
+                    if expr[0] in self.sparse_constants:
+                        return self.sparse_constants[expr[0]]
                     return pl.col(expr)
                 # just a literal
                 return pl.lit(expr[0])
 
             # Extract/Exclude: index args must stay as raw Python values, not polars expressions.
             if expr[0] in (self.EXTRACT, self.EXCLUDE):
-                collection = self.parse(expr[1])
+                collection = self._parse_to_polars(expr[1])
+                self._check_sparse_operands(expr[0], [collection])
                 raw_indices = [self._parse_raw_index(e) for e in expr[2:]]
                 return self.env[expr[0]](collection, *raw_indices)
 
@@ -980,7 +1051,8 @@ class MathParser:
             if isinstance(expr[0], str) and expr[0] in self.env:
                 op_name = expr[0]
                 # Parse the operands
-                operands = [self.parse(e) for e in expr[1:]]
+                operands = [self._parse_to_polars(e) for e in expr[1:]]
+                self._check_sparse_operands(op_name, operands)
 
                 if isinstance(operands, list) and len(operands) == 1:
                     # if the operands have redundant brackets, remove them
@@ -992,7 +1064,7 @@ class MathParser:
                 return self.env[op_name](operands)
 
             # else, assume the list contents are parseable expressions
-            return [self.parse(e) for e in expr]
+            return [self._parse_to_polars(e) for e in expr]
 
         msg = f"Encountered unsupported type '{type(expr)}' during parsing."
         raise ParserError(msg)
@@ -1148,6 +1220,7 @@ class MathParser:
         if isinstance(expr, list):
             if expr[0] in (self.EXTRACT, self.EXCLUDE):
                 collection = self._parse_to_gurobipy(expr[1], callback)
+                self._check_sparse_operands(expr[0], [collection])
                 raw_indices = [self._parse_raw_index(e) for e in expr[2:]]
                 return self.env[expr[0]](collection, *raw_indices)
 
@@ -1156,6 +1229,7 @@ class MathParser:
                 op_name = expr[0]
                 # Parse the operands
                 operands = [self._parse_to_gurobipy(e, callback) for e in expr[1:]]
+                self._check_sparse_operands(op_name, operands)
 
                 while isinstance(operands, list) and len(operands) == 1:
                     # if the operands have redundant brackets, remove them
@@ -1205,6 +1279,7 @@ class MathParser:
         if isinstance(expr, list):
             if expr[0] in (self.EXTRACT, self.EXCLUDE):
                 collection = self._parse_to_cvxpy(expr[1], callback)
+                self._check_sparse_operands(expr[0], [collection])
                 raw_indices = [self._parse_raw_index(e) for e in expr[2:]]
                 return self.env[expr[0]](collection, *raw_indices)
 
@@ -1213,6 +1288,7 @@ class MathParser:
                 op_name = expr[0]
                 # Parse the operands
                 operands = [self._parse_to_cvxpy(e, callback) for e in expr[1:]]
+                self._check_sparse_operands(op_name, operands)
 
                 while isinstance(operands, list) and len(operands) == 1:
                     # if the operands have redundant brackets, remove them
@@ -1228,6 +1304,28 @@ class MathParser:
             return parsed[0] if len(parsed) == 1 else parsed
 
         msg = f"Encountered unsupported type '{type(expr)}' during parsing."
+        raise ParserError(msg)
+
+    def _check_sparse_operands(self, op_name: str, operands: list) -> None:
+        """Raise unless sparse operands are the left operand of `MatMul` or multiplied by a scalar."""
+        is_sparse = [sps.issparse(operand) for operand in operands]
+        if not any(is_sparse):
+            return
+        if op_name == self.MATMUL and is_sparse[0] and not any(is_sparse[1:]):
+            return
+        # polars literals are checked when the multiplication is built
+        if op_name == self.MUL and sum(is_sparse) == 1:
+            others = [operand for operand, sparse in zip(operands, is_sparse, strict=True) if not sparse]
+            if all(
+                isinstance(operand, self.literals | np.integer | np.floating | pl.Expr)
+                or (isinstance(operand, cp.Expression) and operand.shape == () and operand.is_constant())
+                for operand in others
+            ):
+                return
+        msg = (
+            f"A sparse constant can only be the left operand of '{self.MATMUL}' or be multiplied by a scalar,"
+            f" but it was used in '{op_name}'."
+        )
         raise ParserError(msg)
 
     def _parse_raw_index(self, expr) -> int | tuple[int, ...]:

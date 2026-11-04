@@ -56,6 +56,7 @@ from desdeo.problem.schema import (
     ExtraFunction,
     Objective,
     ScalarizationFunction,
+    SparseTensorConstant,
     TensorConstant,
     TensorVariable,
     Variable,
@@ -495,7 +496,7 @@ def _constraints_without_stated_properties(mods: ProblemModification) -> list[st
     return symbols
 
 
-def _parse_and_merge_elements(
+def _parse_and_merge_elements(  # noqa: C901
     problem: Problem,
     mods: ProblemModification,
     symbol_to_type: dict,
@@ -511,7 +512,9 @@ def _parse_and_merge_elements(
             return TensorVariable.model_validate(d, by_name=True)
         return Variable.model_validate(d, by_name=True)
 
-    def _parse_constant(d: dict) -> Constant | TensorConstant:
+    def _parse_constant(d: dict) -> Constant | TensorConstant | SparseTensorConstant:
+        if "indices" in d:
+            return SparseTensorConstant.model_validate(d, by_name=True)
         if "shape" in d:
             return TensorConstant.model_validate(d, by_name=True)
         return Constant.model_validate(d, by_name=True)

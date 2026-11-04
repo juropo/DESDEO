@@ -13,6 +13,7 @@ from desdeo.problem import (
     ConstraintTypeEnum,
     Objective,
     Problem,
+    SparseTensorConstant,
     TensorConstant,
     TensorVariable,
     Variable,
@@ -420,7 +421,12 @@ def _cvxpy_symbol_scope(problem: Problem) -> dict[str, object]:
 
     if problem.constants is not None:
         for const in problem.constants:
-            scope[const.symbol] = np.array(const.get_values()) if isinstance(const, TensorConstant) else const.value
+            if isinstance(const, TensorConstant):
+                scope[const.symbol] = np.array(const.get_values())
+            elif isinstance(const, SparseTensorConstant):
+                scope[const.symbol] = const.to_scipy_operand()
+            else:
+                scope[const.symbol] = const.value
 
     return scope
 

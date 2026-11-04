@@ -9,6 +9,7 @@ import polars as pl
 from desdeo.problem import (
     ObjectiveTypeEnum,
     Problem,
+    SparseTensorConstant,
     VariableDimensionEnum,
     VariableDomainTypeEnum,
     numpy_array_to_objective_dict,
@@ -122,6 +123,9 @@ def find_compatible_solvers(problem: Problem) -> list[BaseSolver]:
     # check if problem has a discrete definition
     has_discrete = problem.discrete_representation is not None
 
+    # sparse constants are not supported by the Pyomo and Sympy evaluators
+    has_sparse = any(isinstance(const, SparseTensorConstant) for const in problem.constants or [])
+
     # check if problem is data-based
     if all_data_based and has_discrete and var_dim == VariableDimensionEnum.scalar:
         # problem has only data-based objectives and a discrete definition is available
@@ -130,7 +134,8 @@ def find_compatible_solvers(problem: Problem) -> list[BaseSolver]:
 
     # check if the problem is differentiable and if it is mixed integer
     if (
-        problem.is_twice_differentiable
+        not has_sparse
+        and problem.is_twice_differentiable
         and shutil.which("bonmin")
         and problem.variable_domain
         in [
@@ -142,7 +147,8 @@ def find_compatible_solvers(problem: Problem) -> list[BaseSolver]:
 
     # check if the problem is differentiable and continuous
     if (
-        problem.is_twice_differentiable
+        not has_sparse
+        and problem.is_twice_differentiable
         and shutil.which("ipopt")
         and problem.variable_domain == VariableDomainTypeEnum.continuous
     ):
@@ -155,15 +161,16 @@ def find_compatible_solvers(problem: Problem) -> list[BaseSolver]:
     # check if the problem is linear
     if problem.is_linear and check_gurobi_license():
         solvers.append(available_solvers["gurobipy"]["constructor"])
-    if problem.is_linear and shutil.which("gurobi"):
+    if not has_sparse and problem.is_linear and shutil.which("gurobi"):
         solvers.append(available_solvers["pyomo_gurobi"]["constructor"])  # gurobi has to be installed
-    if problem.is_linear and shutil.which("cbc"):
+    if not has_sparse and problem.is_linear and shutil.which("cbc"):
         solvers.append(available_solvers["pyomo_cbc"]["constructor"])
 
     # check if problem's variables are all scalars
     if var_dim == VariableDimensionEnum.scalar:
         # nevergrad and scipy solvers work with all(?) problems with only scalar valued variables
-        solvers.append(available_solvers["nevergrad"]["constructor"])
+        if not has_sparse:
+            solvers.append(available_solvers["nevergrad"]["constructor"])
         solvers.append(available_solvers["scipy_minimize"]["constructor"])
         solvers.append(available_solvers["scipy_de"]["constructor"])
     return solvers
@@ -188,6 +195,9 @@ def guess_best_solver(problem: Problem) -> BaseSolver:
 
     # check if problem has a discrete definition
     has_discrete = problem.discrete_representation is not None
+
+    # sparse constants are not supported by the Pyomo and Sympy evaluators
+    has_sparse = any(isinstance(const, SparseTensorConstant) for const in problem.constants or [])
 
     # TODO: when figured out what solver is best for problems with tensor variables: it seems that e.g. the
     # forest problems don't work with pyomo_cbc. So VERY MUCH a quick fix to get something working, as those types of
@@ -236,7 +246,8 @@ def guess_best_solver(problem: Problem) -> BaseSolver:
 
     # check if the problem is differentiable and if it is mixed integer
     if (
-        problem.is_twice_differentiable
+        not has_sparse
+        and problem.is_twice_differentiable
         and shutil.which("bonmin")
         and problem.variable_domain
         in [
@@ -248,11 +259,16 @@ def guess_best_solver(problem: Problem) -> BaseSolver:
 
     # check if the problem is differentiable and continuous
     if (
-        problem.is_twice_differentiable
+        not has_sparse
+        and problem.is_twice_differentiable
         and shutil.which("ipopt")
         and problem.variable_domain == VariableDomainTypeEnum.continuous
     ):
         return available_solvers["pyomo_ipopt"]["constructor"]
+
+    # nevergrad uses the Sympy evaluator, so fall back to the Polars-based scipy heuristic instead
+    if has_sparse:
+        return available_solvers["scipy_de"]["constructor"]
 
     # else, guess nevergrad heuristics to be the best
     return available_solvers["nevergrad"]["constructor"]

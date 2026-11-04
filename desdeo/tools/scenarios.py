@@ -9,6 +9,7 @@ from desdeo.problem.schema import (
     Objective,
     Problem,
     ScalarizationFunction,
+    SparseTensorConstant,
     TensorConstant,
     TensorVariable,
     Variable,
@@ -476,7 +477,7 @@ def _to_hashable(value: Any) -> Any:
     return value
 
 
-def _constant_value_key(const: Constant | TensorConstant) -> Any:
+def _constant_value_key(const: Constant | TensorConstant | SparseTensorConstant) -> Any:
     """Return a hashable representation of a constant's value(s), for equality comparison.
 
     ``Constant`` stores a single scalar in ``.value``. ``TensorConstant`` stores its data in
@@ -485,6 +486,8 @@ def _constant_value_key(const: Constant | TensorConstant) -> Any:
     """
     if isinstance(const, TensorConstant):
         return _to_hashable(const.get_values())
+    if isinstance(const, SparseTensorConstant):
+        return (_to_hashable(const.shape), _to_hashable(const.indices), _to_hashable(const.values))
     return const.value
 
 

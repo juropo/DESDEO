@@ -12,6 +12,7 @@ from desdeo.problem.schema import (
     Constant,
     ConstraintTypeEnum,
     Problem,
+    SparseTensorConstant,
     TensorConstant,
     TensorVariable,
     Variable,
@@ -271,6 +272,9 @@ class PyomoEvaluator:
                     initialize=self._init_rule(con.get_values()),
                     domain=domain,
                 )
+            elif isinstance(con, SparseTensorConstant):
+                msg = f"The Pyomo evaluator does not support the sparse constant '{con.symbol}'."
+                raise NotImplementedError(msg)
             else:
                 msg = f"Unsupported constant type '{type(con)}' encountered."
                 raise PyomoEvaluatorError(msg)

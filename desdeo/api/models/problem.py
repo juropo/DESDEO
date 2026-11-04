@@ -20,6 +20,7 @@ from desdeo.problem.schema import (
     Problem,
     ScalarizationFunction,
     Simulator,
+    SparseTensorConstant,
     Tensor,
     TensorConstant,
     TensorVariable,
@@ -109,6 +110,7 @@ class ProblemInfo(ProblemBase):
 
     constants: list["ConstantDB"] | None
     tensor_constants: list["TensorConstantDB"] | None
+    # sparse tensor constants can be very large, so they are not sent with every problem fetch
     variables: list["VariableDB"] | None
     tensor_variables: list["TensorVariableDB"] | None
     objectives: list["ObjectiveDB"]
@@ -167,6 +169,9 @@ class ProblemDB(ProblemBase, table=True):
     # Populated by other models
     constants: list["ConstantDB"] = Relationship(back_populates="problem", cascade_delete=True)
     tensor_constants: list["TensorConstantDB"] = Relationship(back_populates="problem", cascade_delete=True)
+    sparse_tensor_constants: list["SparseTensorConstantDB"] = Relationship(
+        back_populates="problem", cascade_delete=True
+    )
     variables: list["VariableDB"] = Relationship(back_populates="problem", cascade_delete=True)
     tensor_variables: list["TensorVariableDB"] = Relationship(back_populates="problem", cascade_delete=True)
     objectives: list["ObjectiveDB"] = Relationship(back_populates="problem", cascade_delete=True)
@@ -200,6 +205,11 @@ class ProblemDB(ProblemBase, table=True):
             if problem_instance.constants is not None
             else []
         )
+        sparse_tensor_constants = (
+            [const for const in problem_instance.constants if isinstance(const, SparseTensorConstant)]
+            if problem_instance.constants is not None
+            else []
+        )
         scalar_variables = [var for var in problem_instance.variables if isinstance(var, Variable)]
         tensor_variables = [var for var in problem_instance.variables if isinstance(var, TensorVariable)]
         return cls(
@@ -212,6 +222,7 @@ class ProblemDB(ProblemBase, table=True):
             variable_domain=problem_instance.variable_domain,
             constants=[ConstantDB.model_validate(const) for const in scalar_constants],
             tensor_constants=[TensorConstantDB.model_validate(const) for const in tensor_constants],
+            sparse_tensor_constants=[SparseTensorConstantDB.model_validate(const) for const in sparse_tensor_constants],
             variables=[VariableDB.model_validate(var) for var in scalar_variables],
             tensor_variables=[TensorVariableDB.model_validate(var) for var in tensor_variables],
             objectives=[ObjectiveDB.model_validate(obj) for obj in problem_instance.objectives],
@@ -642,6 +653,31 @@ class TensorConstantDB(_BaseTensorConstantDB, table=True):
     # Back populates
     problem: ProblemDB | None = Relationship(back_populates="tensor_constants")
     scenario_model: "ScenarioModelDB" = Relationship(back_populates="tensor_constants")
+
+
+class _SparseTensorConstant(SQLModel):
+    """Helper class to override the field types of list types."""
+
+    shape: list[int] = Field(sa_column=Column(JSON))
+    indices: list[list[int]] = Field(sa_column=Column(JSON))
+    values: list[float] = Field(sa_column=Column(JSON))
+
+
+_BaseSparseTensorConstantDB = from_pydantic(
+    SparseTensorConstant,
+    "_BaseSparseTensorConstantDB",
+    base_model=_SparseTensorConstant,
+)
+
+
+class SparseTensorConstantDB(_BaseSparseTensorConstantDB, table=True):
+    """The SQLModel equivalent to `SparseTensorConstant`."""
+
+    id: int | None = Field(primary_key=True, default=None)
+    problem_id: int | None = Field(default=None, foreign_key="problemdb.id")
+
+    # Back populates
+    problem: ProblemDB | None = Relationship(back_populates="sparse_tensor_constants")
 
 
 _ConstantDB = from_pydantic(Constant, "_ConstantDB", union_type_conversions={VariableType: float})

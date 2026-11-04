@@ -18,6 +18,7 @@ from desdeo.problem import (
     PolarsEvaluator,
     PolarsEvaluatorModesEnum,
     Problem,
+    SparseTensorConstant,
 )
 from desdeo.problem.external import ProviderParams, get_resolver, supported_schemes
 
@@ -81,7 +82,13 @@ class SimulatorEvaluator:
             for obj in list(filter(lambda x: x.objective_type == ObjectiveTypeEnum.surrogate, problem.objectives))
         ]
         if problem.scalarization_funcs is not None:
-            parser = MathParser()
+            parser = MathParser(
+                sparse_constants={
+                    c.symbol: c.to_scipy_operand()
+                    for c in problem.constants or []
+                    if isinstance(c, SparseTensorConstant)
+                }
+            )
             self.scalarization_funcs = [
                 (func.symbol, parser.parse(func.func))
                 for func in problem.scalarization_funcs

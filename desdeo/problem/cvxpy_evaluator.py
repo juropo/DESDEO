@@ -13,6 +13,7 @@ from desdeo.problem.schema import (
     Objective,
     Problem,
     ScalarizationFunction,
+    SparseTensorConstant,
     TensorConstant,
     TensorVariable,
     Variable,
@@ -136,6 +137,9 @@ class CVXPYEvaluator:
                 param.value = np.array(values)
                 parameters[con.symbol] = param
                 constants[con.symbol] = values
+            elif isinstance(con, SparseTensorConstant):
+                # kept as a sparse array, not a parameter
+                constants[con.symbol] = con.to_scipy_operand()
 
         return parameters, constants
 
