@@ -54,6 +54,8 @@ GAMMA = 0.9
 HORIZON = 400
 X_UTILITY = [1.0, 3.0]
 Y_UTILITY = [2.0, -1.0, 0.5]
+# Verified best evaluated objectives of the ci-healthcare reduced information set; 0.0 is a lower bound.
+CI_HEALTHCARE_BEST = {"illness": 0.666363, "cost": 0.327376, "dissatisfaction": 0.0, "mortality": 0.0}
 
 
 def _objective(symbol: str, parents: list[str], utility: list) -> ObjectiveNode:
@@ -662,14 +664,33 @@ def test_ci_healthcare_reduced_information_set(objective_symbol):
 
     policies = read_policy_from_solution(stationary_map.index_map, result.optimal_variables)
     evaluation = evaluate_stationary_policy(diagram, policies)
-    # CPT entries down to 1e-14 and McCormick `b = 1` leakage within solver tolerances leave
-    # relative objective errors of a few 1e-4, and absolute errors of a few 1e-6 near zero.
+    # Solver tolerances leave relative objective errors of a few 1e-4, and absolute errors of a
+    # few 1e-6 near zero.
     for symbol, value in evaluation.objectives.items():
         floor = 1e-5 if symbol == objective_symbol else 2e-5
         assert result.optimal_objectives[symbol] == pytest.approx(value, rel=1e-3, abs=floor)
 
     status_quo = evaluate_stationary_policy(diagram, {}).objectives[objective_symbol]
     assert evaluation.objectives[objective_symbol] <= status_quo + 1e-6
+
+    best = CI_HEALTHCARE_BEST[objective_symbol]
+    tolerance = {"illness": 1e-5, "cost": 2e-4 * best}.get(objective_symbol, 2e-6)
+    assert evaluation.objectives[objective_symbol] <= best + tolerance
+
+
+def test_ci_healthcare_cpt_floor_keeps_status_quo():
+    """The default CPT floor leaves the status-quo objectives unchanged within 1e-6 relative."""
+    floored = evaluate_stationary_policy(ci_healthcare_stationary_diagram(), {}).objectives
+    unfloored = evaluate_stationary_policy(ci_healthcare_stationary_diagram(cpt_floor=0), {}).objectives
+    for symbol, value in unfloored.items():
+        assert floored[symbol] == pytest.approx(value, rel=1e-6)
+
+
+@pytest.mark.parametrize("cpt_floor", [-1e-8, 1 / 7])
+def test_ci_healthcare_cpt_floor_out_of_range_raises(cpt_floor):
+    """The floor must be in [0, 1 / largest cardinality)."""
+    with pytest.raises(ValueError, match="cpt_floor must be in"):
+        ci_healthcare_stationary_diagram(cpt_floor=cpt_floor)
 
 
 # ── promote_to_decisions ───────────────────────────────────────────────────────────────────────

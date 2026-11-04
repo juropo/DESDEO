@@ -93,20 +93,25 @@ def _objective(symbol: str, name: str, parents: list[str], utility: np.ndarray, 
     )
 
 
-def _load_normalised_network() -> DiscreteNetwork:
-    """The BIF's network with each CPT rescaled to sum to 1, which the file's rounding breaks."""
+def _load_normalised_network(cpt_floor: float) -> DiscreteNetwork:
+    """The BIF's network with CPT entries below `cpt_floor` set to 0 and each CPT rescaled to sum to 1."""
     from desdeo.problem.graphical.adapters.pyagrum import load_network  # noqa: PLC0415
 
     network = load_network(_BIF_PATH)
+    max_cardinality = max(potential.shape[0] for potential in network.potentials.values())
+    if not 0 <= cpt_floor < 1 / max_cardinality:
+        msg = f"cpt_floor must be in [0, 1/{max_cardinality}), got {cpt_floor}."
+        raise ValueError(msg)
     potentials = {}
     for name, potential in network.potentials.items():
         values = np.array(potential.values, dtype=float)
+        values[values < cpt_floor] = 0.0
         potentials[name] = potential.model_copy(update={"values": (values / values.sum(axis=0)).tolist()})
     return network.model_copy(update={"potentials": potentials})
 
 
 def ci_healthcare_stationary_diagram(
-    *, lyh_information_set: list[str] | None = None, discount: float = 0.95
+    *, lyh_information_set: list[str] | None = None, discount: float = 0.95, cpt_floor: float = 1e-8
 ) -> StationaryDiagram:
     """The cross-impact healthcare 2TBN with `LYHt` and `GER` as stationary decisions.
 
@@ -118,14 +123,20 @@ def ci_healthcare_stationary_diagram(
     - `mortality`: the probability `KUOt` is "Yes", the per-step death hazard;
     - `illness`: `PISt`'s state index, 0 healthy to 3 life-threatening.
 
+    CPT entries below `cpt_floor` are set to 0 before each CPT is renormalised, because tiny
+    entries make solver presolve wrongly prune the compiled MILP. The default floor changes the
+    status-quo occupation by at most about 1e-8 and the status-quo objectives by less than 1e-6
+    relative.
+
     Args:
         lyh_information_set: the nodes `LYHt` observes; `None` uses its network parents.
         discount: the discount factor gamma, in (0, 1).
+        cpt_floor: entries below it are set to 0, in [0, 1 / largest node cardinality).
 
     Returns:
         StationaryDiagram: the diagram.
     """
-    network = _load_normalised_network()
+    network = _load_normalised_network(cpt_floor)
 
     objectives = [
         _objective(
@@ -148,17 +159,20 @@ def ci_healthcare_stationary_diagram(
 
 
 def ci_healthcare_problem(
-    *, lyh_information_set: list[str] | None = None, discount: float = 0.95
+    *, lyh_information_set: list[str] | None = None, discount: float = 0.95, cpt_floor: float = 1e-8
 ) -> tuple[Problem, StationaryIndexMap]:
     """`ci_healthcare_stationary_diagram` compiled with `compile_stationary_diagram`.
 
     Args:
         lyh_information_set: as in `ci_healthcare_stationary_diagram`.
         discount: as in `ci_healthcare_stationary_diagram`.
+        cpt_floor: as in `ci_healthcare_stationary_diagram`.
 
     Returns:
         tuple[Problem, StationaryIndexMap]: the MILP and its bookkeeping.
     """
     return compile_stationary_diagram(
-        ci_healthcare_stationary_diagram(lyh_information_set=lyh_information_set, discount=discount)
+        ci_healthcare_stationary_diagram(
+            lyh_information_set=lyh_information_set, discount=discount, cpt_floor=cpt_floor
+        )
     )
