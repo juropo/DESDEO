@@ -40,6 +40,9 @@ _INITIAL_SUM_TOLERANCE = 1e-9
 _STATE_SINK = "__state_t"
 """One-state chance node whose cluster holds the slice-t state joint."""
 
+_PROBABILITY_SUM_TOLERANCE = 1e-9
+"""How far each `RandomisedPolicy` distribution may sum from 1."""
+
 
 def _check_known_decisions(symbols: set[str], node_names: set[str]) -> None:
     """Raise `ValueError` if a decision symbol isn't a network node."""
@@ -445,8 +448,44 @@ def initial_state_distribution(diagram: StationaryDiagram) -> np.ndarray:
     return _initial_joint(factors, parents, diagram.structure.state_nodes, decided)
 
 
-def _policy_factor(decision: DecisionNode, policy: DecisionPolicy, cardinality: dict[str, int]) -> Factor:
-    """A deterministic CPT over `[decision, *policy.information_set]` from `policy`'s flat-index keys."""
+class RandomisedPolicy(BaseModel):
+    """One decision's randomised policy: a distribution over its states per information state."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    symbol: str
+    """The decision's symbol."""
+    information_set: list[str]
+    """Observed nodes, most-significant-first in `probabilities`' key encoding."""
+    states: list[str]
+    """The decision's alternatives, in state-index order."""
+    probabilities: dict[int, list[float]]
+    """Information-state flat index (mixed-radix over `information_set`, `0` when it is empty) -> the
+    probability of each state in `states`."""
+
+    @model_validator(mode="after")
+    def _check_distributions(self) -> Self:
+        for flat_index, distribution in self.probabilities.items():
+            if len(distribution) != len(self.states):
+                msg = (
+                    f"Policy for '{self.symbol}': information state {flat_index} has {len(distribution)} "
+                    f"probabilities, expected {len(self.states)}."
+                )
+                raise ValueError(msg)
+            values = np.array(distribution, dtype=float)
+            if not np.isfinite(values).all() or (values < 0).any():
+                msg = f"Policy for '{self.symbol}': information state {flat_index} has non-finite or negative values."
+                raise ValueError(msg)
+            if abs(values.sum() - 1.0) > _PROBABILITY_SUM_TOLERANCE:
+                msg = f"Policy for '{self.symbol}': information state {flat_index} sums to {values.sum()}, not 1."
+                raise ValueError(msg)
+        return self
+
+
+def _policy_factor(
+    decision: DecisionNode, policy: DecisionPolicy | RandomisedPolicy, cardinality: dict[str, int]
+) -> Factor:
+    """A CPT over `[decision, *policy.information_set]` from `policy`'s flat-index keys."""
     if policy.symbol != decision.symbol:
         msg = f"Policy for '{policy.symbol}' given for decision '{decision.symbol}'."
         raise ValueError(msg)
@@ -461,14 +500,20 @@ def _policy_factor(decision: DecisionNode, policy: DecisionPolicy, cardinality: 
         raise ValueError(msg)
 
     cards = [cardinality[name] for name in policy.information_set]
-    missing = sorted(set(range(prod(cards))) - set(policy.policy))
+    keys = policy.probabilities if isinstance(policy, RandomisedPolicy) else policy.policy
+    missing = sorted(set(range(prod(cards))) - set(keys))
     if missing:
         msg = f"Policy for '{decision.symbol}' has no choice for information states {missing}."
         raise ValueError(msg)
-    extra = sorted(set(policy.policy) - set(range(prod(cards))))
+    extra = sorted(set(keys) - set(range(prod(cards))))
     if extra:
         msg = f"Policy for '{decision.symbol}' has keys {extra} outside the {prod(cards)} information states."
         raise ValueError(msg)
+
+    if isinstance(policy, RandomisedPolicy):
+        # Mixed-radix keys, most significant first, are C order over the information set's axes.
+        rows = np.array([policy.probabilities[flat_index] for flat_index in range(prod(cards))], dtype=float)
+        return [decision.symbol, *policy.information_set], rows.T.reshape([len(decision.states), *cards])
 
     values = np.zeros([len(decision.states), *cards])
     for flat_index in range(prod(cards)):
@@ -481,14 +526,15 @@ def _policy_factor(decision: DecisionNode, policy: DecisionPolicy, cardinality: 
 
 
 def evaluate_stationary_policy(
-    diagram: StationaryDiagram, policies: dict[str, DecisionPolicy | None]
+    diagram: StationaryDiagram, policies: dict[str, DecisionPolicy | RandomisedPolicy | None]
 ) -> StationaryEvaluation:
     """Objective values and occupation measure of `diagram` under `policies`.
 
     Args:
         diagram: the stationary diagram.
-        policies: decision symbol -> policy, keyed as `read_policy_from_solution` produces them.
-            `None` or a missing key uses the node's status-quo CPT from `diagram.network`.
+        policies: decision symbol -> deterministic or randomised policy, keyed as
+            `read_policy_from_solution` produces them. `None` or a missing key uses the node's
+            status-quo CPT from `diagram.network`.
 
     Raises:
         ValueError: a policy doesn't match its decision, or status-quo decisions need state nodes

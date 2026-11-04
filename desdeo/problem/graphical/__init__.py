@@ -27,6 +27,7 @@ from .compile import (
     read_policy_from_solution,
 )
 from .dynamic import (
+    RandomisedPolicy,
     StationaryDiagram,
     StationaryEvaluation,
     StationaryIndexMap,
@@ -56,6 +57,13 @@ from .schema import (
     RiskMeasure,
     RiskMeasureKind,
 )
+from .stationary_lp import (
+    FlattenedBranch,
+    FlattenedStep,
+    flatten_stationary_step,
+    full_observation_information_set,
+    stationary_value_iteration,
+)
 
 __all__ = [
     "CURRENT_SCHEMA_VERSION",
@@ -72,9 +80,12 @@ __all__ = [
     "DiscreteNetwork",
     "DiscreteVariable",
     "DiscreteVariableKind",
+    "FlattenedBranch",
+    "FlattenedStep",
     "IndexMap",
     "ObjectiveNode",
     "Potential",
+    "RandomisedPolicy",
     "RiskMeasure",
     "RiskMeasureIndexMap",
     "RiskMeasureKind",
@@ -94,8 +105,11 @@ __all__ = [
     "effective_information_sets",
     "evaluate_stationary_policy",
     "fixed_decision_constraints",
+    "flatten_stationary_step",
+    "full_observation_information_set",
     "initial_state_distribution",
     "promote_to_decisions",
     "read_policy_from_solution",
+    "stationary_value_iteration",
     "validate_assumptions",
 ]
