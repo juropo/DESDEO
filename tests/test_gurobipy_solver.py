@@ -245,3 +245,94 @@ def test_custom_options_keep_defaults(solver_class):
     assert params.LogToConsole == 0
     assert params.TimeLimit == 30
     assert params.OutputFlag == 1
+
+
+def _knapsack_problem() -> tuple[Problem, list[int], int]:
+    """A small binary knapsack, returned with its item weights and capacity."""
+    values = [10, 13, 7, 8, 9, 12, 6, 11]
+    weights = [5, 7, 4, 5, 6, 8, 3, 6]
+    capacity = 20
+    symbols = [f"x_{i + 1}" for i in range(len(values))]
+
+    return (
+        Problem(
+            name="Knapsack",
+            description="Binary knapsack.",
+            variables=[
+                Variable(name=s, symbol=s, variable_type=VariableTypeEnum.binary, lowerbound=0, upperbound=1)
+                for s in symbols
+            ],
+            objectives=[
+                Objective(
+                    name="f",
+                    symbol="f",
+                    func=["Add", *[["Multiply", v, s] for v, s in zip(values, symbols, strict=True)]],
+                    maximize=True,
+                    objective_type=ObjectiveTypeEnum.analytical,
+                    is_linear=True,
+                    is_convex=True,
+                    is_twice_differentiable=True,
+                )
+            ],
+            constraints=[
+                Constraint(
+                    name="capacity",
+                    symbol="g",
+                    func=["Add", *[["Multiply", w, s] for w, s in zip(weights, symbols, strict=True)], -capacity],
+                    cons_type=ConstraintTypeEnum.LTE,
+                    is_linear=True,
+                    is_convex=True,
+                    is_twice_differentiable=True,
+                )
+            ],
+        ),
+        weights,
+        capacity,
+    )
+
+
+@pytest.mark.gurobipy
+@pytest.mark.parametrize("solver_class", [GurobipySolver, PersistentGurobipySolver])
+def test_incumbent_returned_when_not_optimal(solver_class):
+    """When the solve stops with a feasible incumbent, its values are returned with success=False."""
+    problem, weights, capacity = _knapsack_problem()
+    solver = solver_class(problem, options={"SolutionLimit": 1})
+    results = solver.solve("f")
+
+    assert solver.evaluator.model.status == gp.GRB.SOLUTION_LIMIT
+    assert results.success is False
+    assert "not proven optimal" in results.message
+
+    xs = [results.optimal_variables[f"x_{i + 1}"] for i in range(len(weights))]
+    assert all(np.isfinite(x) for x in xs)
+    assert all(np.isclose(x, 0) or np.isclose(x, 1) for x in xs)
+    assert sum(w * x for w, x in zip(weights, xs, strict=True)) <= capacity + 1e-6
+    assert np.isfinite(results.optimal_objectives["f"])
+
+
+@pytest.mark.gurobipy
+@pytest.mark.parametrize("solver_class", [GurobipySolver, PersistentGurobipySolver])
+def test_infeasible_returns_nan(solver_class):
+    """An infeasible model has no incumbent, so NaN values are returned with success=False."""
+    problem, _, _ = _knapsack_problem()
+    infeasible = problem.model_copy(
+        update={
+            "constraints": [
+                *problem.constraints,
+                Constraint(
+                    name="impossible",
+                    symbol="h",
+                    func=["Add", "x_1", 1],
+                    cons_type=ConstraintTypeEnum.LTE,
+                    is_linear=True,
+                    is_convex=True,
+                    is_twice_differentiable=True,
+                ),
+            ]
+        }
+    )
+    results = solver_class(infeasible).solve("f")
+
+    assert results.success is False
+    assert all(np.isnan(x) for x in results.optimal_variables.values())
+    assert all(np.isnan(f) for f in results.optimal_objectives.values())

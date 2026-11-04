@@ -1,5 +1,6 @@
 """Defines solver interfaces for gurobipy."""
 
+import contextlib
 import io
 import sys
 
@@ -43,11 +44,27 @@ def parse_gurobipy_optimizer_results(problem: Problem, evaluator: GurobipyEvalua
         status = "Model is unbounded."
     elif model_status == gp.GRB.INF_OR_UNBD:
         status = "Model is either infeasible or unbounded."
+    elif model_status == gp.GRB.TIME_LIMIT:
+        status = "Time limit reached."
+    elif model_status == gp.GRB.SOLUTION_LIMIT:
+        status = "Solution limit reached."
     else:
         status = f"Optimization ended with status: {model_status}"
     msg = f"Gurobipy solver status is: '{status}'"
 
-    if not success:
+    # An incumbent is returned unless the model is infeasible or unbounded.
+    has_incumbent = evaluator.model.SolCount > 0 and model_status not in (
+        gp.GRB.INFEASIBLE,
+        gp.GRB.UNBOUNDED,
+        gp.GRB.INF_OR_UNBD,
+    )
+    if not success and has_incumbent:
+        msg += " A feasible solution was found, but it is not proven optimal."
+        if evaluator.model.IsMIP:
+            with contextlib.suppress(AttributeError):
+                msg += f" MIP gap: {evaluator.model.MIPGap:.4g}."
+
+    if not success and not has_incumbent:
         return SolverResults(
             optimal_variables={var.symbol: float("nan") for var in problem.variables},
             optimal_objectives={obj.symbol: float("nan") for obj in problem.objectives},
@@ -92,7 +109,7 @@ def parse_gurobipy_optimizer_results(problem: Problem, evaluator: GurobipyEvalua
         extra_func_values=extra_func_values,
         scalarization_values=scalarization_values,
         lagrange_multipliers=lagrange_multipliers,
-        success=True,
+        success=success,
         message=msg,
     )
 
