@@ -6,7 +6,9 @@ D_{k+1} observes except D_k and its descendants. With s the joint state, o_k the
 observes and D_{k-1} doesn't, and a_k D_k's action, the step flattens into a kernel
 `T[s', (s, o_1, a_1, ..., o_n, a_n)] = P(o_1..o_n, s' | s, do(a_1..a_n))` and objective
 coefficients `W[(s, o_1, a_1, ..., o_n, a_n)] = Σ P(o_1..o_n, rest | s, do(a_1..a_n)) u`. Each joint
-value of the atemporal decisions is a branch with its own kernel and coefficients. Over the
+value of the atemporal decisions is a branch with its own kernel and coefficients. With renewal,
+the kernel holds the steps without a renewal, and a vector `R[(s, o_1, a_1, ..., o_n, a_n)] =
+P(o_1..o_n, renew | s, do(a_1..a_n))` sends the renewed mass back to mu0. Over the
 discounted occupations `y_0 = x(s)` and `y_k = y_{k-1} π_k(a_k | s, o_1, a_1, ..., o_k)` the step is
 linear: `stationary_value_iteration` solves it for one objective, and `compile_stationary_lp` compiles it
 into an LP `Problem` over the occupations.
@@ -42,6 +44,7 @@ from .dynamic import (
     _ancestors,
     _contract,
     _network_factors,
+    _renewal_factors,
     initial_state_distribution,
 )
 from .schema import DecisionNode
@@ -62,9 +65,11 @@ class FlattenedBranch(BaseModel):
     """Per level k, each kept p_k's entry in y_{k-1}: its state s for level 1, otherwise
     `j * A_{k-1} + a_{k-1}` with j its parent's position among level k-1's kept prefixes."""
     kernel: sp.csr_array
-    """`P(o_1..o_n, s' | s, do(a_1..a_n))`, rows the next state s', columns the entries of y_n."""
+    """`P(o_1..o_n, s', no renewal | s, do(a_1..a_n))`, rows the next state s', columns the entries of y_n."""
     objective_coefficients: dict[str, np.ndarray]
     """Objective symbol -> `Σ P(o_1..o_n, rest | s, do(a_1..a_n)) u` per entry of y_n, unsigned."""
+    renewal: np.ndarray | None = None
+    """`P(o_1..o_n, renewal | s, do(a_1..a_n))` per entry of y_n; `None` without `StationaryDiagram.renewal`."""
 
 
 class FlattenedStep(BaseModel):
@@ -200,12 +205,14 @@ def _kept_prefixes(
     return prefixes, parents
 
 
-def flatten_stationary_step(diagram: StationaryDiagram) -> FlattenedStep:
+def flatten_stationary_step(diagram: StationaryDiagram) -> FlattenedStep:  # noqa: C901
     """Flatten `diagram`'s 2-slice step over its decision chain, one branch per atemporal choice.
 
     Each chain decision's CPT is replaced by an all-ones factor on its axis, and each atemporal
     decision's by a point mass on the branch's value. A prefix p_k whose newest observation has
-    probability exactly 0 given its parent is dropped, together with everything below it.
+    probability exactly 0 given its parent is dropped, together with everything below it. With
+    `diagram.renewal`, each branch's kernel holds only the steps without a renewal, and its
+    `renewal` vector the probability of one.
 
     Raises:
         ValueError: the diagram has constraints, has no slice-t decisions, its slice-t decisions
@@ -279,7 +286,11 @@ def flatten_stationary_step(diagram: StationaryDiagram) -> FlattenedStep:
 
     all_observations = [name for nodes in observation_nodes for name in nodes]
     next_slicet = [axis for axis in next_axes if axis in structure.slicet]
-    transition_names = sorted(_ancestors([*next_slicet, *all_observations], parents, step) - set(chain_symbols))
+    renewal, alive, renew = _renewal_factors(diagram.renewal, cardinality)
+    transition_names = sorted(
+        _ancestors([*next_slicet, *all_observations, *renewal], parents, step) - set(chain_symbols)
+    )
+    renewal_names = sorted(_ancestors([*renewal, *all_observations], parents, step) - set(chain_symbols))
     prefix_names = [
         sorted(
             _ancestors([name for nodes in observation_nodes[: k + 1] for name in nodes], parents, step)
@@ -313,7 +324,8 @@ def flatten_stationary_step(diagram: StationaryDiagram) -> FlattenedStep:
         row_of[prefixes[-1]] = np.arange(len(prefixes[-1]))
 
         transition = _contract(
-            [branch_factors[name] for name in transition_names] + identities + list(ones.values()), kernel_axes
+            [branch_factors[name] for name in transition_names] + identities + list(ones.values()) + alive,
+            kernel_axes,
         )
         entries = np.nonzero(transition)
         size = len(entries[0])
@@ -336,6 +348,11 @@ def flatten_stationary_step(diagram: StationaryDiagram) -> FlattenedStep:
             )
             coefficients[objective.symbol] = table.reshape(-1, n_actions[-1])[prefixes[-1]].reshape(-1)
 
+        renewal_vector = None
+        if renew:
+            table = _contract([branch_factors[name] for name in renewal_names] + list(ones.values()) + renew, flat_axes)
+            renewal_vector = table.reshape(-1, n_actions[-1])[prefixes[-1]].reshape(-1)
+
         branches.append(
             FlattenedBranch(
                 atemporal={
@@ -345,6 +362,7 @@ def flatten_stationary_step(diagram: StationaryDiagram) -> FlattenedStep:
                 parents=prefix_parents,
                 kernel=kernel,
                 objective_coefficients=coefficients,
+                renewal=renewal_vector,
             )
         )
 
@@ -409,16 +427,45 @@ def _reached_entries(
     return active * n_actions[-1] + greedy[-1][active], owner
 
 
+def _next_values(branch: FlattenedBranch, backward: sp.csr_array, mu0: np.ndarray, value: np.ndarray) -> np.ndarray:
+    """E[V(s')] per entry of y_n: by the kernel, plus the renewal probability times `mu0 V`."""
+    expected = backward @ value
+    if branch.renewal is None:
+        return expected
+    return expected + branch.renewal * (mu0 @ value)
+
+
+def _policy_value(
+    flat: FlattenedStep, branch: FlattenedBranch, columns: np.ndarray, owner: np.ndarray, reward: np.ndarray
+) -> np.ndarray:
+    """V(s) of the deterministic chain policy reaching the entries `columns` of y_n from the states `owner`.
+
+    The rank-one renewal term `gamma R mu0 V` is solved for by Sherman-Morrison.
+    """
+    gamma, mu0 = flat.discount, flat.mu0
+    n_states = len(mu0)
+    owner_matrix = sp.csr_array((np.ones(len(owner)), (np.arange(len(owner)), owner)), shape=(len(owner), n_states))
+    closed_loop = branch.kernel[:, columns] @ owner_matrix
+    step_reward = np.bincount(owner, weights=reward[columns], minlength=n_states)
+    system = (sp.eye_array(n_states) - gamma * closed_loop.T).tocsc()
+    if branch.renewal is None:
+        return spla.spsolve(system, step_reward)
+    renewed = np.bincount(owner, weights=branch.renewal[columns], minlength=n_states)
+    base, response = spla.spsolve(system, np.column_stack([step_reward, renewed])).T
+    return base + gamma * response * (mu0 @ base) / (1 - gamma * mu0 @ response)
+
+
 def stationary_value_iteration(
     flat: FlattenedStep, objective_symbol: str, *, tol: float = 1e-12, max_iterations: int = 1000
 ) -> tuple[float, dict[str, RandomisedPolicy]]:
     """The full-observation optimum of one objective, by policy iteration warm-started by value iteration.
 
     On each branch, 100 value-iteration sweeps of the nested backup `V(s) = Σ_{o_1} min_{a_1} ...
-    Σ_{o_n} min_{a_n} [W + gamma T V]`, with W negated for a maximised objective, give a starting
-    greedy policy per chain decision. Policy iteration then evaluates the greedy policies exactly by
-    a sparse linear solve and re-greedies on that V, from the last level up: Q_k sums level k+1's Q
-    at its chosen actions, and an action of level k switches only where that lowers Q_k by more than
+    Σ_{o_n} min_{a_n} [W + gamma (T V + R mu0 V)]`, with W negated for a maximised objective and R
+    the renewal vector (0 without renewal), give a starting greedy policy per chain decision. Policy
+    iteration then evaluates the greedy policies exactly by a sparse linear solve and re-greedies on
+    that V, from the last level up: Q_k sums level k+1's Q at its chosen actions, and an action of
+    level k switches only where that lowers Q_k by more than
     `max((1 - gamma) * tol * max(1, ‖V‖∞), 64 * eps * ‖Q_k‖∞)`. It stops when no action switches.
     The atemporal decisions take the branch with the best exact value.
 
@@ -470,23 +517,18 @@ def stationary_value_iteration(
         # A fixed number of value-iteration sweeps gives the starting policy.
         value = np.zeros(n_states)
         for _ in range(100):
-            q_last = (reward + gamma * (backward @ value)).reshape(-1, n_actions[-1])
+            q_last = (reward + gamma * _next_values(branch, backward, flat.mu0, value)).reshape(-1, n_actions[-1])
             _, value = _nested_backup(branch, n_actions, n_states, q_last)
 
         # Policy iteration from the greedy policy, with each policy's value from a linear solve.
-        q_last = (reward + gamma * (backward @ value)).reshape(-1, n_actions[-1])
+        q_last = (reward + gamma * _next_values(branch, backward, flat.mu0, value)).reshape(-1, n_actions[-1])
         qs, _ = _nested_backup(branch, n_actions, n_states, q_last)
         greedy = [q.argmin(axis=1) for q in qs]
         for _ in range(max_iterations):
             columns, owner = _reached_entries(branch, n_actions, greedy)
-            owner_matrix = sp.csr_array(
-                (np.ones(len(owner)), (np.arange(len(owner)), owner)), shape=(len(owner), n_states)
-            )
-            closed_loop = branch.kernel[:, columns] @ owner_matrix
-            step_reward = np.bincount(owner, weights=reward[columns], minlength=n_states)
-            value = spla.spsolve((sp.eye_array(n_states) - gamma * closed_loop.T).tocsc(), step_reward)
+            value = _policy_value(flat, branch, columns, owner, reward)
             # Switch bottom-up: Q_k sums the realised Q_{k+1} at level k+1's chosen actions.
-            q = (reward + gamma * (backward @ value)).reshape(-1, n_actions[-1])
+            q = (reward + gamma * _next_values(branch, backward, flat.mu0, value)).reshape(-1, n_actions[-1])
             switched = False
             for k in range(len(n_actions) - 1, -1, -1):
                 # The floor keeps rounding noise in Q from switching actions near gamma = 1.
@@ -545,8 +587,15 @@ class StationaryLPBranch(BaseModel):
     """`FlattenedBranch.prefixes`."""
     parents: list[list[int]]
     """`FlattenedBranch.parents`."""
-    m_symbol: str
-    """The `Variable` of the branch's mass, the probability of its atemporal values."""
+    m_symbol: str | None
+    """The `Variable` of the branch's mass, the probability of its atemporal values; `None` with renewal."""
+    nu_symbol: str | None = None
+    """The `Variable` of the branch's inflow `nu`, the discounted mass arriving in it; `None` without renewal."""
+    z_symbol: str | None = None
+    """The binary `Variable` choosing the branch, with renewal and deterministic atemporal decisions;
+    otherwise `None`."""
+    nu_bound_symbol: str | None = None
+    """The constraint `nu - z <= 0`; `None` without `z_symbol`."""
     x_symbol: str
     """The `TensorVariable` of the state occupation y_0 = x, one entry per joint state s."""
     y_symbols: list[str]
@@ -562,7 +611,14 @@ class StationaryLPBranch(BaseModel):
     consistency_symbols: list[str]
     """Per level k, the vector-valued constraint `B_k y_k - P_k y_{k-1} == 0`."""
     flow_symbol: str
-    """The vector-valued flow constraint `x - gamma T w - (1 - gamma) m mu0 == 0`."""
+    """The vector-valued flow constraint `x - gamma T w - (1 - gamma) m mu0 == 0`, or `x - gamma T w -
+    nu mu0 == 0` with renewal."""
+    delta_symbol: str | None = None
+    """The `Variable` of the renewed mass `delta = R w`; `None` without renewal."""
+    renewal_symbol: str | None = None
+    """The 1-D `SparseTensorConstant` R of `FlattenedBranch.renewal`; `None` without renewal."""
+    renewal_balance_symbol: str | None = None
+    """The constraint `delta - R w == 0`; `None` without renewal."""
 
 
 class StationaryLPIndexMap(BaseModel):
@@ -586,8 +642,12 @@ class StationaryLPIndexMap(BaseModel):
     """One per `FlattenedStep.branches`, in the same order."""
     mu0_symbol: str
     """The `TensorConstant` of `FlattenedStep.mu0`."""
-    mass_symbol: str
-    """The constraint `Σ_g m_g == 1`."""
+    mass_symbol: str | None
+    """The constraint `Σ_g m_g == 1`; `None` with renewal."""
+    inflow_symbol: str | None = None
+    """The constraint `Σ_g nu_g - gamma Σ_g delta_g == 1 - gamma`; `None` without renewal."""
+    choice_symbol: str | None = None
+    """The constraint `Σ_g z_g == 1`; `None` without `StationaryLPBranch.z_symbol`."""
     discount: float
     """`StationaryDiagram.discount`."""
 
@@ -633,6 +693,15 @@ def compile_stationary_lp(
     - `x_g = (1 - gamma) m_g mu0 + gamma T_g w_g`,
     - `Σ_g m_g = 1`.
 
+    With `diagram.renewal`, each new patient, initial or renewed, draws its branch afresh. Each
+    branch then has the renewed mass `delta_g = R_g w_g` and an inflow `nu_g >= 0` instead of `m_g`:
+
+    - `delta_g = R_g w_g`,
+    - `x_g = nu_g mu0 + gamma T_g w_g`,
+    - `Σ_g nu_g - gamma Σ_g delta_g = 1 - gamma`, instead of `Σ_g m_g = 1`.
+
+    Every arrival draws the same branch probabilities, so they are `q_g = nu_g / Σ_h nu_h`.
+
     Each objective is `Σ_g W_g w_g`, the per-step average as in `evaluate_stationary_policy`;
     multiply by 1 / (1 - gamma) for the total discounted sum. All added symbols start with `slp_`.
 
@@ -644,6 +713,8 @@ def compile_stationary_lp(
         diagram: the stationary diagram; its chain decisions must observe their full observation sets.
         atemporal: `"randomised"` lets the masses take any value in [0, 1]; `"deterministic"` makes
             them binary when there is more than one branch, so the atemporal decisions take one value.
+            With renewal and more than one branch, `"deterministic"` adds binary `z_g` with
+            `Σ_g z_g = 1` and `nu_g <= z_g`.
 
     Returns:
         tuple[Problem, StationaryLPIndexMap]: the LP (a MILP for deterministic atemporal decisions)
@@ -665,6 +736,7 @@ def compile_stationary_lp(
     n_states = prod(flat.state_cardinalities)
     n_actions = [len(decision.states) for decision in flat.decisions]
     binary = atemporal == "deterministic" and len(flat.branches) > 1
+    renewing = bool(diagram.renewal)
     linear = {"is_linear": True, "is_convex": True, "is_twice_differentiable": True}
 
     mu0_symbol = f"{_PREFIX}mu0"
@@ -679,16 +751,49 @@ def compile_stationary_lp(
         ys, blocks, selections, consistencies = (
             [f"{_PREFIX}{name}_{g}_{k}" for k in range(len(n_actions))] for name in ("y", "B", "P", "consistency")
         )
-        variables += [
-            Variable(
-                name=f"Mass of branch {g}",
-                symbol=m,
-                variable_type=VariableTypeEnum.binary if binary else VariableTypeEnum.real,
-                lowerbound=0.0,
-                upperbound=1.0,
-            ),
-            _occupation_variable(f"State occupation of branch {g}", x, n_states),
-        ]
+        nu = z = nu_bound = None
+        if renewing:
+            m, nu = None, f"{_PREFIX}nu_{g}"
+            variables.append(
+                Variable(
+                    name=f"Inflow of branch {g}",
+                    symbol=nu,
+                    variable_type=VariableTypeEnum.real,
+                    lowerbound=0.0,
+                    upperbound=1.0,
+                )
+            )
+            if binary:
+                z, nu_bound = f"{_PREFIX}z_{g}", f"{_PREFIX}nu_bound_{g}"
+                variables.append(
+                    Variable(
+                        name=f"Choice of branch {g}",
+                        symbol=z,
+                        variable_type=VariableTypeEnum.binary,
+                        lowerbound=0.0,
+                        upperbound=1.0,
+                    )
+                )
+                constraints.append(
+                    Constraint(
+                        name=f"Inflow of branch {g} only if chosen",
+                        symbol=nu_bound,
+                        cons_type=ConstraintTypeEnum.LTE,
+                        func=["Subtract", nu, z],
+                        **linear,
+                    )
+                )
+        else:
+            variables.append(
+                Variable(
+                    name=f"Mass of branch {g}",
+                    symbol=m,
+                    variable_type=VariableTypeEnum.binary if binary else VariableTypeEnum.real,
+                    lowerbound=0.0,
+                    upperbound=1.0,
+                )
+            )
+        variables.append(_occupation_variable(f"State occupation of branch {g}", x, n_states))
         previous, previous_size = x, n_states
         for k, (prefixes, parents, actions) in enumerate(zip(branch.prefixes, branch.parents, n_actions, strict=True)):
             rows = len(prefixes)
@@ -714,6 +819,33 @@ def compile_stationary_lp(
             previous, previous_size = ys[k], rows * actions
 
         constants.append(_sparse_constant(f"Transition kernel of branch {g}", kernel, branch.kernel))
+        arrivals = ["Multiply", nu, mu0_symbol] if renewing else ["Multiply", m, ["Multiply", 1 - gamma, mu0_symbol]]
+        delta = renewal = renewal_balance = None
+        if renewing:
+            delta, renewal, renewal_balance = (f"{_PREFIX}{name}_{g}" for name in ("delta", "R", "renewal"))
+            variables.append(
+                Variable(
+                    name=f"Renewed mass of branch {g}",
+                    symbol=delta,
+                    variable_type=VariableTypeEnum.real,
+                    lowerbound=0.0,
+                    upperbound=1.0,
+                )
+            )
+            constants.append(
+                _sparse_constant(
+                    f"Renewal probabilities of branch {g}", renewal, sp.csr_array(branch.renewal[None, :]), vector=True
+                )
+            )
+            constraints.append(
+                Constraint(
+                    name=f"Renewed mass of branch {g}",
+                    symbol=renewal_balance,
+                    cons_type=ConstraintTypeEnum.EQ,
+                    func=["Subtract", delta, ["MatMul", renewal, ys[-1]]],
+                    **linear,
+                )
+            )
         coefficient_symbols = {}
         for i, (symbol, coefficients) in enumerate(branch.objective_coefficients.items()):
             coefficient_symbols[symbol] = f"{_PREFIX}W_{g}_{i}"
@@ -730,12 +862,7 @@ def compile_stationary_lp(
                 name=f"Flow balance of branch {g}",
                 symbol=flow,
                 cons_type=ConstraintTypeEnum.EQ,
-                func=[
-                    "Subtract",
-                    x,
-                    ["Multiply", gamma, ["MatMul", kernel, ys[-1]]],
-                    ["Multiply", m, ["Multiply", 1 - gamma, mu0_symbol]],
-                ],
+                func=["Subtract", x, ["Multiply", gamma, ["MatMul", kernel, ys[-1]]], arrivals],
                 **linear,
             )
         )
@@ -745,6 +872,9 @@ def compile_stationary_lp(
                 prefixes=[prefixes.tolist() for prefixes in branch.prefixes],
                 parents=[parents.tolist() for parents in branch.parents],
                 m_symbol=m,
+                nu_symbol=nu,
+                z_symbol=z,
+                nu_bound_symbol=nu_bound,
                 x_symbol=x,
                 y_symbols=ys,
                 kernel_symbol=kernel,
@@ -753,20 +883,51 @@ def compile_stationary_lp(
                 parent_symbols=selections,
                 consistency_symbols=consistencies,
                 flow_symbol=flow,
+                delta_symbol=delta,
+                renewal_symbol=renewal,
+                renewal_balance_symbol=renewal_balance,
             )
         )
 
-    mass_symbol = f"{_PREFIX}mass"
-    masses = [branch.m_symbol for branch in branches]
-    constraints.append(
-        Constraint(
-            name="Branch masses sum to one",
-            symbol=mass_symbol,
-            cons_type=ConstraintTypeEnum.EQ,
-            func=["Subtract", ["Add", *masses] if len(masses) > 1 else masses[0], 1],
-            **linear,
+    def total(symbols: list[str]) -> str | list:
+        return ["Add", *symbols] if len(symbols) > 1 else symbols[0]
+
+    mass_symbol = inflow_symbol = choice_symbol = None
+    if renewing:
+        inflow_symbol = f"{_PREFIX}inflow"
+        inflows = total([branch.nu_symbol for branch in branches])
+        renewed = total([branch.delta_symbol for branch in branches])
+        constraints.append(
+            Constraint(
+                name="Branch inflows are the initial and the renewed mass",
+                symbol=inflow_symbol,
+                cons_type=ConstraintTypeEnum.EQ,
+                func=["Subtract", inflows, ["Multiply", gamma, renewed], 1 - gamma],
+                **linear,
+            )
         )
-    )
+        if binary:
+            choice_symbol = f"{_PREFIX}choice"
+            constraints.append(
+                Constraint(
+                    name="One branch is chosen",
+                    symbol=choice_symbol,
+                    cons_type=ConstraintTypeEnum.EQ,
+                    func=["Subtract", total([branch.z_symbol for branch in branches]), 1],
+                    **linear,
+                )
+            )
+    else:
+        mass_symbol = f"{_PREFIX}mass"
+        constraints.append(
+            Constraint(
+                name="Branch masses sum to one",
+                symbol=mass_symbol,
+                cons_type=ConstraintTypeEnum.EQ,
+                func=["Subtract", total([branch.m_symbol for branch in branches]), 1],
+                **linear,
+            )
+        )
 
     objectives = []
     for objective in diagram.objectives:
@@ -803,6 +964,8 @@ def compile_stationary_lp(
         branches=branches,
         mu0_symbol=mu0_symbol,
         mass_symbol=mass_symbol,
+        inflow_symbol=inflow_symbol,
+        choice_symbol=choice_symbol,
         discount=gamma,
     )
 
@@ -816,17 +979,19 @@ def read_randomised_policy(
     to 0, where the parent entry of p_k in y_{k-1} is above `tol` in a branch with normalised mass
     above 0; every other information state, unreachable or dropped, gets the uniform distribution.
     Each atemporal decision gets the marginal of the normalised masses, those `<= tol` set to 0.
+    With renewal, the inflows take the masses' place, so the marginals are those of the arrival
+    probabilities `q_g = nu_g / Σ_h nu_h`.
 
     Args:
         index_map: the `StationaryLPIndexMap` of the problem.
         optimal_variables: `SolverResults.optimal_variables` of a solve of it.
-        tol: the occupation and mass at or below which a branch or prefix counts as unreached.
+        tol: the occupation and mass or inflow at or below which a branch or prefix counts as unreached.
 
     Returns:
         dict[str, RandomisedPolicy]: a policy for each chain decision and each atemporal decision.
 
     Raises:
-        ValueError: no mass is above `tol`; a decision's information keys collide across branches;
+        ValueError: no mass or inflow is above `tol`; a decision's information keys collide across branches;
             or, with several atemporal decisions, the masses aren't the product of their marginals,
             so independent policies can't represent them.
     """
@@ -837,10 +1002,10 @@ def read_randomised_policy(
         for level, actions in enumerate(n_actions)
     ]
 
-    masses = np.array([float(optimal_variables[branch.m_symbol]) for branch in index_map.branches])
+    masses = np.array([float(optimal_variables[branch.nu_symbol or branch.m_symbol]) for branch in index_map.branches])
     masses[masses <= tol] = 0.0
     if masses.sum() == 0:
-        msg = f"No branch mass is above {tol}."
+        msg = f"No branch mass or inflow is above {tol}."
         raise ValueError(msg)
     masses /= masses.sum()
 

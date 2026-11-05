@@ -9,6 +9,7 @@ status-quo slice-0 population.
 
 import itertools
 from collections.abc import Hashable, Sequence
+from functools import reduce
 from math import prod
 from typing import Literal, Self
 
@@ -233,6 +234,26 @@ def _check_objectives(
             raise ValueError(msg)
 
 
+def _check_renewal(
+    renewal: dict[str, list[int]], structure: TwoSliceStructure, decisions: set[str], labels: dict[str, list[str]]
+) -> None:
+    """Raise `ValueError` if a renewal node isn't a slice-t chance node or its states are empty or out of range."""
+    for name, states in renewal.items():
+        if not states:
+            msg = f"Renewal node '{name}' has no renewal states."
+            raise ValueError(msg)
+        if name in decisions:
+            msg = f"Renewal node '{name}' is a decision; renewals need a slice-t chance node."
+            raise ValueError(msg)
+        if name not in structure.slicet:
+            msg = f"Renewal node '{name}' must be a slice-t chance node."
+            raise ValueError(msg)
+        out_of_range = [state for state in states if not 0 <= state < len(labels[name])]
+        if out_of_range:
+            msg = f"Renewal node '{name}': states {out_of_range} are out of range for its {len(labels[name])} states."
+            raise ValueError(msg)
+
+
 class StationaryDiagram(BaseModel):
     """A status-quo 2TBN with some nodes overridden as decisions taking one stationary policy.
 
@@ -240,6 +261,10 @@ class StationaryDiagram(BaseModel):
     `information_set` replaces its network parents, and its `states` must equal the node's labels.
     An atemporal decision's information set may only contain atemporal nodes, and no atemporal
     chance state node may have a decision ancestor.
+
+    With `renewal`, a step in which a renewal state occurs still counts its utilities, but the next
+    state is drawn from the initial distribution instead of the slice-t CPTs: the population stays
+    constant. Each new patient draws the atemporal decisions afresh.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -258,6 +283,8 @@ class StationaryDiagram(BaseModel):
     initial_distribution: Potential | None = None
     """Joint over `TwoSliceStructure.state_nodes`, in that order, nonnegative and summing to 1. `None`
     contracts the slice-0 and atemporal CPTs."""
+    renewal: dict[str, list[int]] | None = None
+    """Slice-t chance node -> the state indices that trigger a renewal."""
 
     @model_validator(mode="after")
     def _check_diagram(self) -> Self:
@@ -310,6 +337,8 @@ class StationaryDiagram(BaseModel):
                 )
                 raise ValueError(msg)
 
+        _check_renewal(self.renewal or {}, structure, set(decision_symbols), labels)
+
         parents = {name: potential.variables[1:] for name, potential in self.network.potentials.items()}
         _check_undecided_atemporal_state(structure, parents, set(decision_symbols))
 
@@ -354,6 +383,7 @@ class StationaryDiagram(BaseModel):
         discount: float,
         constraints: list[DiagramConstraint] | None = None,
         initial_distribution: Potential | None = None,
+        renewal: dict[str, list[int]] | None = None,
     ) -> Self:
         """Build a diagram whose decisions take their states and default information sets from `network`.
 
@@ -365,6 +395,7 @@ class StationaryDiagram(BaseModel):
             discount: as in `StationaryDiagram.discount`.
             constraints: as in `StationaryDiagram.constraints`.
             initial_distribution: as in `StationaryDiagram.initial_distribution`.
+            renewal: as in `StationaryDiagram.renewal`.
         """
         variables = {variable.name: variable for variable in network.variables}
         _check_known_decisions(set(decisions), set(variables))
@@ -386,6 +417,7 @@ class StationaryDiagram(BaseModel):
             constraints=constraints or [],
             discount=discount,
             initial_distribution=initial_distribution,
+            renewal=renewal,
         )
 
 
@@ -422,6 +454,22 @@ def _initial_joint(
     ancestors = _ancestors(state_nodes, parents)
     _check_no_decided_ancestors(ancestors, decided)
     return _contract([factors[name] for name in sorted(ancestors)], state_nodes)
+
+
+def _renewal_factors(
+    renewal: dict[str, list[int]] | None, cardinality: dict[str, int]
+) -> tuple[list[str], list[Factor], list[Factor]]:
+    """The renewal nodes, and indicators over them that no renewal state occurs and that one does.
+
+    All three are empty without renewal.
+    """
+    if not renewal:
+        return [], [], []
+    alive = reduce(
+        np.multiply.outer,
+        [np.isin(np.arange(cardinality[name]), states, invert=True).astype(float) for name, states in renewal.items()],
+    )
+    return list(renewal), [(list(renewal), alive)], [(list(renewal), 1.0 - alive)]
 
 
 def _network_factors(network: DiscreteNetwork) -> dict[str, Factor]:
@@ -538,7 +586,14 @@ def _mix_atemporal_draws(
 
     Raises:
         ValueError: there are more than `_MAX_ATEMPORAL_DRAWS` draws.
+        NotImplementedError: the diagram has a renewal, which redraws the atemporal decisions.
     """
+    if diagram.renewal:
+        msg = (
+            f"Randomised atemporal policies for {sorted(drawn)} with both initial_distribution and renewal aren't "
+            "supported: a renewal would redraw them from an initial distribution that doesn't include them."
+        )
+        raise NotImplementedError(msg)
     n_draws = prod(
         int(support)
         for _, values in drawn.values()
@@ -592,10 +647,11 @@ def evaluate_stationary_policy(
 ) -> StationaryEvaluation:
     """Objective values and occupation measure of `diagram` under `policies`.
 
-    A randomised atemporal policy is drawn once, not at every step. Without
+    A randomised atemporal policy is drawn once per patient, not at every step. Without
     `diagram.initial_distribution`, every atemporal policy is then a state node's CPT, like a
     status-quo atemporal node's. With it, the objectives and the occupation are the
-    probability-weighted mix of those of the deterministic draws.
+    probability-weighted mix of those of the deterministic draws. A renewal draws the next state,
+    atemporal nodes included, from the initial distribution, so a new patient gets a fresh draw.
 
     Args:
         diagram: the stationary diagram.
@@ -606,6 +662,8 @@ def evaluate_stationary_policy(
     Raises:
         ValueError: a policy doesn't match its decision, status-quo decisions need state nodes
             outside `diagram.initial_distribution`'s, or there are too many draws to mix.
+        NotImplementedError: a randomised atemporal policy with both `diagram.initial_distribution`
+            and `diagram.renewal`.
     """
     network = diagram.network
     structure = diagram.structure
@@ -671,11 +729,16 @@ def evaluate_stationary_policy(
         else:
             next_axes.append(f"{name[:-1]}t")
             next_slicet.append(f"{name[:-1]}t")
-    transition = [factors[name] for name in sorted(_ancestors(next_slicet, parents, step))]
+    renewal, alive, renew = _renewal_factors(diagram.renewal, cardinality)
+    transition = [factors[name] for name in sorted(_ancestors([*next_slicet, *renewal], parents, step))]
     # All-ones factors keep state axes the transition CPTs don't mention.
     state_axes = [([name], np.ones(cardinality[name])) for name in state]
     size = mu.size
-    kernel = _contract(transition + identities + state_axes, [*state, *next_axes]).reshape(size, size)
+    kernel = _contract(transition + alive + identities + state_axes, [*state, *next_axes]).reshape(size, size)
+    if renew:
+        # A renewed step draws the next state from mu.
+        renewed = _contract(transition + renew + state_axes, state).reshape(size)
+        kernel = kernel + np.outer(renewed, mu.reshape(size))
 
     gamma = diagram.discount
     x = np.linalg.solve(np.eye(size) - gamma * kernel.T, (1 - gamma) * mu.reshape(size))
@@ -793,7 +856,8 @@ def compile_stationary_diagram(
     the occupation measure x. One flow-balance equality per joint state s of the state nodes,
     `x(s) = (1 - gamma) mu_init(s) + gamma P(state_t = s)`, ties it to the step's own slice-t
     state joint. The objectives are per-step averages under x, as in `evaluate_stationary_policy`;
-    multiply by 1 / (1 - gamma) for the total discounted sum.
+    multiply by 1 / (1 - gamma) for the total discounted sum. Diagrams with `renewal` aren't
+    supported.
 
     Args:
         diagram: the stationary diagram.
@@ -807,7 +871,11 @@ def compile_stationary_diagram(
         ValueError: the diagram has no state nodes, a network node or objective/constraint
             symbol is named like the internal sink node, an objective/constraint symbol is named
             like a flow-balance constraint `flow_{i}`, or `compile_diagram` raises.
+        NotImplementedError: the diagram has a `renewal`; use `compile_stationary_lp`.
     """
+    if diagram.renewal:
+        msg = "compile_stationary_diagram doesn't support renewal; use compile_stationary_lp."
+        raise NotImplementedError(msg)
     structure = diagram.structure
     state_nodes = structure.state_nodes
     if not state_nodes:

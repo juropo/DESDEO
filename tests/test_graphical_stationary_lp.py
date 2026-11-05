@@ -7,6 +7,8 @@ Oracles:
 2. **Brute-force enumeration** of deterministic policies, against `stationary_value_iteration`.
 3. **pyAgrum-unrolled marginals** (`_unrolled_average`), against randomised policy evaluation.
 4. **`stationary_value_iteration`** and enumeration, against `compile_stationary_lp`'s LP optimum.
+5. **A propagated population** (`_renewal_oracle`), whose renewed mass restarts from mu0 with fresh
+   atemporal draws, against evaluation with renewal.
 """
 
 import itertools
@@ -24,6 +26,7 @@ from fixtures import (
     mdp_2tbn_network,
     same_slice_2tbn_network,
 )
+from scipy.linalg import block_diag
 from test_graphical_stationary import GAMMA, _replace_cpt, _unrolled_average
 
 from desdeo.problem.graphical import (
@@ -39,6 +42,7 @@ from desdeo.problem.graphical import (
     StationaryDiagram,
     StationaryLPBranch,
     StationaryLPIndexMap,
+    compile_stationary_diagram,
     compile_stationary_lp,
     dynamic,
     evaluate_stationary_policy,
@@ -49,7 +53,7 @@ from desdeo.problem.graphical import (
     stationary_value_iteration,
 )
 from desdeo.problem.graphical.index_map import mixed_radix_encode
-from desdeo.problem.schema import Problem
+from desdeo.problem.schema import Constraint, ConstraintTypeEnum, Problem
 from desdeo.tools.cvxpy_solver_interfaces import CVXPYSolver, CVXPYSolverOptions
 from desdeo.tools.generics import SolverResults
 from desdeo.tools.gurobipy_solver_interfaces import GurobipySolver
@@ -152,8 +156,8 @@ def _mirror_diagram() -> StationaryDiagram:
     return _full_observation_diagram(ci_healthcare_mirror_network(), ["GER", "LYHt"], objectives)
 
 
-def _per_step_mirror_diagram() -> StationaryDiagram:
-    """Per-step mirror with atemporal OMA and the full-observation chain GERt -> LYHt."""
+def _per_step_mirror_diagram(*, renewal: bool = False) -> StationaryDiagram:
+    """Per-step mirror with atemporal OMA and the full-observation chain GERt -> LYHt; `KUOt = 0` renews if asked."""
     objectives = [
         *_MIRROR_OBJECTIVES,
         _objective(
@@ -163,7 +167,20 @@ def _per_step_mirror_diagram() -> StationaryDiagram:
             maximize=False,
         ),
     ]
-    return _full_observation_diagram(ci_healthcare_per_step_mirror_network(), ["OMA", "GERt", "LYHt"], objectives)
+    diagram = _full_observation_diagram(ci_healthcare_per_step_mirror_network(), ["OMA", "GERt", "LYHt"], objectives)
+    return StationaryDiagram(**{**dict(diagram), "renewal": {"KUOt": [0]}}) if renewal else diagram
+
+
+def _renewal_diagram(*, chain: bool = False, atemporal: bool = False) -> StationaryDiagram:
+    """`decision_chain_2tbn_network` with `Kt = hi` renewing; full-observation Dt, Et if `chain`, G if `atemporal`."""
+    objectives = [
+        _objective("x", ["Xt"], [1.0, 3.0], maximize=True),
+        _objective("c", ["Dt", "Yt", "Kt"], [[[0.3, 2.0], [0.5, 1.5]], [[0.1, 1.9], [1.0, 1.2]]], maximize=False),
+    ]
+    decisions = [*(["G"] if atemporal else []), "Dt", *(["Et"] if chain else [])]
+    network = decision_chain_2tbn_network(atemporal, death=True)
+    diagram = _full_observation_diagram(network, decisions, objectives)
+    return StationaryDiagram(**{**dict(diagram), "renewal": {"Kt": [1]}})
 
 
 _SMALL_DIAGRAMS = {
@@ -173,6 +190,10 @@ _SMALL_DIAGRAMS = {
     "atemporal": _atemporal_diagram,
     "chain": _chain_diagram,
     "chain_atemporal": lambda: _chain_diagram(atemporal=True),
+    "renewal": _renewal_diagram,
+    "renewal_atemporal": lambda: _renewal_diagram(atemporal=True),
+    "renewal_chain": lambda: _renewal_diagram(chain=True),
+    "renewal_chain_atemporal": lambda: _renewal_diagram(chain=True, atemporal=True),
 }
 
 
@@ -211,8 +232,11 @@ def _prefix_information_keys(flat: FlattenedStep, branch_index: int, level: int)
 
 def _closed_loop(
     flat: FlattenedStep, branch_index: int, tables: dict[str, np.ndarray]
-) -> tuple[np.ndarray, dict[str, np.ndarray]]:
-    """Oracle: one branch's state transition `P[s', s]` and per-state rewards under the chain's policy tables."""
+) -> tuple[np.ndarray, dict[str, np.ndarray], np.ndarray]:
+    """Oracle: one branch's transition `P[s', s]` without renewals, rewards and renewal probabilities per state.
+
+    Under the chain's policy tables; the renewal probabilities are 0 without renewal.
+    """
     branch = flat.branches[branch_index]
     n_states = prod(flat.state_cardinalities)
     weight, owner = np.ones(n_states), np.arange(n_states)
@@ -223,10 +247,11 @@ def _closed_loop(
         owner = np.repeat(owner[parent], len(decision.states))
     owner_matrix = np.eye(n_states)[owner]
     transition = (branch.kernel.toarray() * weight) @ owner_matrix
+    renewed = np.zeros(n_states) if branch.renewal is None else (branch.renewal * weight) @ owner_matrix
     rewards = {
         symbol: (coefficients * weight) @ owner_matrix for symbol, coefficients in branch.objective_coefficients.items()
     }
-    return transition, rewards
+    return transition, rewards, renewed
 
 
 def _discounted_values(flat: FlattenedStep, transition: np.ndarray, rewards: dict[str, np.ndarray]) -> dict[str, float]:
@@ -239,18 +264,25 @@ def _discounted_values(flat: FlattenedStep, transition: np.ndarray, rewards: dic
 def _flat_value(
     flat: FlattenedStep, tables: dict[str, np.ndarray], marginals: dict[str, np.ndarray] | None = None
 ) -> dict[str, float]:
-    """Oracle: linear solves on the flattened kernels, mixed over the branches by the atemporal marginals."""
+    """Oracle: a linear solve over (branch, state) on the flattened kernels.
+
+    Every arrival, initial or renewed, draws its branch from the product of the atemporal marginals
+    and its state from mu0.
+    """
     marginals = marginals or {}
-    values = dict.fromkeys(flat.maximize, 0.0)
-    for index, branch in enumerate(flat.branches):
-        weight = prod(
-            marginals[symbol][value] if symbol in marginals else 1.0 for symbol, value in branch.atemporal.items()
-        )
-        if weight == 0:
-            continue
-        for symbol, value in _discounted_values(flat, *_closed_loop(flat, index, tables)).items():
-            values[symbol] += weight * value
-    return values
+    weights = np.array(
+        [
+            prod(marginals[symbol][value] if symbol in marginals else 1.0 for symbol, value in branch.atemporal.items())
+            for branch in flat.branches
+        ]
+    )
+    loops = [_closed_loop(flat, index, tables) for index in range(len(flat.branches))]
+    arrivals = np.kron(weights, flat.mu0)
+    transition = block_diag(*(loop[0] for loop in loops))
+    transition += np.outer(arrivals, np.concatenate([loop[2] for loop in loops]))
+    gamma = flat.discount
+    x = np.linalg.solve(np.eye(len(arrivals)) - gamma * transition, (1.0 - gamma) * arrivals)
+    return {symbol: float(x @ np.concatenate([loop[1][symbol] for loop in loops])) for symbol in flat.maximize}
 
 
 def _deterministic_combinations(
@@ -313,6 +345,79 @@ def _random_policies(
             probabilities=dict(enumerate(table.tolist())),
         )
     return marginals, tables, policies
+
+
+def _pinned_network(diagram: StationaryDiagram, policies: dict[str, RandomisedPolicy]) -> DiscreteNetwork:
+    """`diagram.network` with each decision's CPT replaced by its policy."""
+    cardinality = {variable.name: len(variable.labels) for variable in diagram.network.variables}
+    network = diagram.network
+    for decision in diagram.decisions:
+        probabilities = policies[decision.symbol].probabilities
+        rows = np.array([probabilities[key] for key in range(len(probabilities))])
+        shape = [len(decision.states), *(cardinality[name] for name in decision.information_set)]
+        cpt = Potential(
+            variables=[decision.symbol, *decision.information_set], shape=shape, values=rows.T.reshape(shape).tolist()
+        )
+        network = _replace_cpt(network, decision.symbol, cpt)
+    return network
+
+
+def _cpt_product(cpts: dict[str, tuple[list[str], np.ndarray]], nodes: list[str], assignment: dict[str, int]) -> float:
+    """The product of `nodes`' CPT entries at `assignment`."""
+    return prod(float(cpts[name][1][tuple(assignment[axis] for axis in cpts[name][0])]) for name in nodes)
+
+
+def _renewal_oracle(
+    network: DiscreteNetwork,
+    next_of: dict[str, str],
+    renewal: dict[str, list[int]],
+    objectives: list[ObjectiveNode],
+    gamma: float,
+    *,
+    horizon: int = 2000,
+) -> dict[str, float]:
+    """Oracle: per-step averages over `horizon` steps of a population whose renewed members restart from mu0.
+
+    Enumerates the joint of the state nodes (`next_of`'s keys, whose parents must be state nodes)
+    and the slice-t nodes from `network`'s CPTs. An atemporal node maps to itself in `next_of`: it
+    is drawn from its CPT in mu0 and kept while alive. Each step, the state distribution moves along
+    the steps without a renewal, and the renewed mass is reset to mu0, which redraws the atemporal
+    nodes.
+    """
+    cpts = {name: (potential.variables, np.array(potential.values)) for name, potential in network.potentials.items()}
+    cards = {variable.name: len(variable.labels) for variable in network.variables}
+    state = list(next_of)
+    step = [variable.name for variable in network.variables if variable.name.endswith("t")]
+    state_cards = [cards[name] for name in state]
+    n_states = prod(state_cards)
+
+    mu0 = np.zeros(n_states)
+    for values in itertools.product(*(range(card) for card in state_cards)):
+        mu0[np.ravel_multi_index(values, state_cards)] = _cpt_product(
+            cpts, state, dict(zip(state, values, strict=True))
+        )
+
+    alive, renewed = np.zeros((n_states, n_states)), np.zeros(n_states)
+    utilities = {objective.symbol: np.zeros(n_states) for objective in objectives}
+    nodes = [*state, *step]
+    for values in itertools.product(*(range(cards[name]) for name in nodes)):
+        assignment = dict(zip(nodes, values, strict=True))
+        weight = _cpt_product(cpts, step, assignment)
+        s = np.ravel_multi_index([assignment[name] for name in state], state_cards)
+        if any(assignment[name] in states for name, states in renewal.items()):
+            renewed[s] += weight
+        else:
+            alive[s, np.ravel_multi_index([assignment[next_of[name]] for name in state], state_cards)] += weight
+        for objective in objectives:
+            utility = np.array(objective.utility.values)[tuple(assignment[parent] for parent in objective.parents)]
+            utilities[objective.symbol][s] += weight * utility
+
+    distribution, totals = mu0, dict.fromkeys(utilities, 0.0)
+    for k in range(horizon):
+        for symbol, utility in utilities.items():
+            totals[symbol] += gamma**k * float(distribution @ utility)
+        distribution = distribution @ alive + float(distribution @ renewed) * mu0
+    return {symbol: (1 - gamma) * total for symbol, total in totals.items()}
 
 
 # ── Tests ──────────────────────────────────────────────────────────────────────────────────────
@@ -383,7 +488,11 @@ def test_kernel_matches_evaluation_small(name: str) -> None:
             assert actual[symbol] == pytest.approx(expected[symbol], abs=1e-10)
 
 
-@pytest.mark.parametrize("builder", [_mirror_diagram, _per_step_mirror_diagram])
+@pytest.mark.parametrize(
+    "builder",
+    [_mirror_diagram, _per_step_mirror_diagram, lambda: _per_step_mirror_diagram(renewal=True)],
+    ids=["mirror", "per_step_mirror", "per_step_mirror_renewal"],
+)
 def test_kernel_matches_evaluation_mirror(builder: Callable[[], StationaryDiagram]) -> None:
     """The flattened oracle matches evaluate_stationary_policy on the mirrors with randomised policies."""
     diagram = builder()
@@ -430,7 +539,11 @@ def test_value_iteration_exact_at_high_discount(builder: Callable[[], Stationary
         assert evaluate_stationary_policy(diagram, vi_policies).objectives[symbol] == pytest.approx(vi_value, abs=1e-10)
 
 
-@pytest.mark.parametrize("builder", [_mirror_diagram, _per_step_mirror_diagram])
+@pytest.mark.parametrize(
+    "builder",
+    [_mirror_diagram, _per_step_mirror_diagram, lambda: _per_step_mirror_diagram(renewal=True)],
+    ids=["mirror", "per_step_mirror", "per_step_mirror_renewal"],
+)
 def test_value_iteration_on_mirror_beats_random_policies(builder: Callable[[], StationaryDiagram]) -> None:
     """VI value on the mirrors is at least as good as 20 random randomised policies per objective."""
     diagram = builder()
@@ -606,6 +719,101 @@ def test_randomised_atemporal_draws_with_initial_distribution(monkeypatch: pytes
     monkeypatch.setattr(dynamic, "_MAX_ATEMPORAL_DRAWS", 8)
     with pytest.raises(ValueError, match="9 deterministic draws"):
         evaluate_stationary_policy(explicit, {"G": policy})
+
+
+@pytest.mark.parametrize("chain", [False, True])
+@pytest.mark.parametrize("atemporal", [False, True])
+def test_renewal_matches_propagated_population(chain: bool, atemporal: bool) -> None:
+    """The status quo and random randomised policies evaluate to the propagated population's averages.
+
+    G, status quo or randomised, is a state node drawn from its CPT or policy in mu0, so every
+    renewal redraws it.
+    """
+    diagram = _renewal_diagram(chain=chain, atemporal=atemporal)
+    next_of = {"G": "G", "X0": "Xt"} if atemporal else {"X0": "Xt"}
+
+    def oracle(network: DiscreteNetwork) -> dict[str, float]:
+        return _renewal_oracle(network, next_of, diagram.renewal, diagram.objectives, diagram.discount)
+
+    status_quo = evaluate_stationary_policy(diagram, {}).objectives
+    assert status_quo == pytest.approx(oracle(diagram.network), abs=1e-8)
+    rng = np.random.default_rng(11)
+    for _ in range(3):
+        _, _, policies = _random_policies(diagram, rng)
+        expected = oracle(_pinned_network(diagram, policies))
+        assert evaluate_stationary_policy(diagram, policies).objectives == pytest.approx(expected, abs=1e-8)
+
+
+def test_renewal_redraws_randomised_atemporal_policy() -> None:
+    """A fractional G with renewal differs from mixing its point-mass evaluations, which keep G across renewals."""
+    diagram = _renewal_diagram(chain=True, atemporal=True)
+    _, _, policies = _random_policies(diagram, np.random.default_rng(5))
+    q = [0.3, 0.7]
+    fresh = evaluate_stationary_policy(
+        diagram, {**policies, "G": policies["G"].model_copy(update={"probabilities": {0: q}})}
+    ).objectives
+    point_masses = [
+        evaluate_stationary_policy(
+            diagram,
+            {**policies, "G": DecisionPolicy(symbol="G", information_set=[], states=["lo", "hi"], policy={0: g})},
+        ).objectives
+        for g in range(2)
+    ]
+    kept = {
+        symbol: sum(weight * values[symbol] for weight, values in zip(q, point_masses, strict=True)) for symbol in fresh
+    }
+    assert max(abs(fresh[symbol] - kept[symbol]) for symbol in fresh) > 1e-6
+
+
+def test_renewal_with_initial_distribution_and_randomised_atemporal_policy_raises() -> None:
+    """With renewal and initial_distribution, a randomised atemporal policy raises; a point mass doesn't."""
+    diagram = _renewal_diagram(atemporal=True)
+    mu = initial_state_distribution(diagram)
+    explicit = StationaryDiagram(
+        **{
+            **dict(diagram),
+            "initial_distribution": Potential(
+                variables=diagram.structure.state_nodes, shape=list(mu.shape), values=mu.tolist()
+            ),
+        }
+    )
+    _, _, policies = _random_policies(diagram, np.random.default_rng(3))
+    with pytest.raises(NotImplementedError, match="initial_distribution and renewal"):
+        evaluate_stationary_policy(explicit, policies)
+    point_mass = {**policies, "G": policies["G"].model_copy(update={"probabilities": {0: [0.0, 1.0]}})}
+    assert evaluate_stationary_policy(explicit, point_mass) == evaluate_stationary_policy(diagram, point_mass)
+
+
+def test_renewal_changes_the_value() -> None:
+    """Without renewal the oracle matches the plain evaluation, and the renewal moves both objectives."""
+    diagram = _renewal_diagram(chain=True)
+    plain = StationaryDiagram(**{**dict(diagram), "renewal": None})
+    without = evaluate_stationary_policy(plain, {}).objectives
+    oracle = _renewal_oracle(diagram.network, {"X0": "Xt"}, {}, diagram.objectives, diagram.discount)
+    assert without == pytest.approx(oracle, abs=1e-8)
+    with_renewal = evaluate_stationary_policy(diagram, {}).objectives
+    assert all(abs(with_renewal[symbol] - without[symbol]) > 1e-3 for symbol in without)
+
+
+@pytest.mark.parametrize(
+    ("renewal", "match"),
+    [
+        ({"Dt": [0]}, "is a decision"),
+        ({"X0": [0]}, "must be a slice-t chance node"),
+        ({"Kt": [2]}, "out of range"),
+        ({"Kt": []}, "no renewal states"),
+    ],
+)
+def test_invalid_renewal_raises(renewal: dict[str, list[int]], match: str) -> None:
+    """A decision or state node as renewal node, or an out-of-range renewal state, raises."""
+    with pytest.raises(ValueError, match=match):
+        StationaryDiagram(**{**dict(_renewal_diagram()), "renewal": renewal})
+
+
+def test_compile_stationary_diagram_with_renewal_raises() -> None:
+    """The MILP path doesn't support renewal."""
+    with pytest.raises(NotImplementedError, match="renewal"):
+        compile_stationary_diagram(_renewal_diagram())
 
 
 def test_flatten_without_slicet_decisions() -> None:
@@ -795,11 +1003,30 @@ def _with_fixed_masses(problem: Problem, index_map: StationaryLPIndexMap, masses
     return problem.model_copy(update={"variables": variables})
 
 
+def _with_arrival_probabilities(problem: Problem, index_map: StationaryLPIndexMap, q: list[float]) -> Problem:
+    """`problem` with renewal and each branch's arrival probability fixed by `nu_g - q_g Σ_h nu_h == 0`."""
+    inflows = [branch.nu_symbol for branch in index_map.branches]
+    return problem.add_constraints(
+        [
+            Constraint(
+                name=f"Arrival probability of branch {g}",
+                symbol=f"q_{g}",
+                cons_type=ConstraintTypeEnum.EQ,
+                func=["Subtract", inflow, ["Multiply", probability, ["Add", *inflows]]],
+                is_linear=True,
+                is_convex=True,
+                is_twice_differentiable=True,
+            )
+            for g, (inflow, probability) in enumerate(zip(inflows, q, strict=True))
+        ]
+    )
+
+
 def _check_lp_matches_value_iteration(diagram: StationaryDiagram, solver: str) -> None:
     """The LP optimum equals VI for each objective, and the read-back policies evaluate to it."""
     flat = flatten_stationary_step(diagram)
     problem, index_map = compile_stationary_lp(diagram)
-    assert len(problem.constraints) == len(flat.branches) * (len(flat.decisions) + 1) + 1
+    assert len(problem.constraints) == len(flat.branches) * (len(flat.decisions) + 1 + bool(diagram.renewal)) + 1
     for symbol in flat.maximize:
         results = _solve(problem, symbol, solver)
         value = results.optimal_objectives[symbol]
@@ -816,10 +1043,20 @@ def test_lp_matches_value_iteration(name: str, solver: str) -> None:
     _check_lp_matches_value_iteration(_SMALL_DIAGRAMS[name](), solver)
 
 
-@pytest.mark.cvxpy
-def test_lp_matches_value_iteration_per_step_mirror() -> None:
-    """On the per-step mirror, the LP optimum equals VI and the read-back policies evaluate to it."""
-    _check_lp_matches_value_iteration(_per_step_mirror_diagram(), "cvxpy")
+@pytest.mark.parametrize(
+    ("renewal", "solver"),
+    [
+        pytest.param(False, "cvxpy", marks=pytest.mark.cvxpy),
+        pytest.param(True, "cvxpy", marks=pytest.mark.cvxpy),
+        pytest.param(True, "gurobipy", marks=[pytest.mark.gurobipy, pytest.mark.githubskip]),
+    ],
+)
+def test_lp_matches_value_iteration_per_step_mirror(renewal: bool, solver: str) -> None:
+    """On the per-step mirror, the LP optimum equals VI and the read-back policies evaluate to it.
+
+    With renewal the LP is too large for gurobipy's size-limited license.
+    """
+    _check_lp_matches_value_iteration(_per_step_mirror_diagram(renewal=renewal), solver)
 
 
 @pytest.mark.cvxpy
@@ -844,6 +1081,31 @@ def test_lp_fixed_fractional_masses_per_step_mirror(masses: list[float]) -> None
         assert evaluate_stationary_policy(diagram, policies).objectives[objective.symbol] == pytest.approx(
             results.optimal_objectives[objective.symbol], abs=1e-8
         )
+
+
+@pytest.mark.cvxpy
+@pytest.mark.parametrize("q", [[0.35, 0.65, 0.0], [0.2, 0.35, 0.45]])
+def test_lp_fixed_arrival_probabilities_per_step_mirror_renewal(q: list[float]) -> None:
+    """With renewal and OMA's arrival probabilities fixed, the read-back gives them and attains the LP value.
+
+    The propagated population with OMA drawn from q at every arrival agrees.
+    """
+    diagram = _per_step_mirror_diagram(renewal=True)
+    compiled, index_map = compile_stationary_lp(diagram)
+    problem = _with_arrival_probabilities(compiled, index_map, q)
+    next_of = {"HHA": "HHA", "OMA": "OMA", "PIS0": "PISt", "PIH0": "PIHt", "LYS0": "LYSt", "LYH0": "LYHt"}
+    for objective in diagram.objectives:
+        results = _solve(problem, objective.symbol, "cvxpy")
+        value = results.optimal_objectives[objective.symbol]
+        policies = read_randomised_policy(index_map, results.optimal_variables)
+        assert policies["OMA"].probabilities[0] == pytest.approx(q, abs=1e-8)
+        assert evaluate_stationary_policy(diagram, policies).objectives[objective.symbol] == pytest.approx(
+            value, abs=1e-8
+        )
+        oracle = _renewal_oracle(
+            _pinned_network(diagram, policies), next_of, diagram.renewal, diagram.objectives, diagram.discount
+        )
+        assert oracle[objective.symbol] == pytest.approx(value, abs=1e-8)
 
 
 def _asf(values: dict[str, float], problem: Problem, reference: dict[str, float], rho: float, delta: float) -> float:
@@ -931,23 +1193,31 @@ def test_lp_asf_beats_deterministic_policies(builder: Callable[[], StationaryDia
 
 @pytest.mark.parametrize("solver", _SOLVERS)
 @pytest.mark.parametrize(
-    "builder", [_atemporal_diagram, lambda: _chain_diagram(atemporal=True)], ids=["atemporal", "chain_atemporal"]
+    "builder",
+    [
+        _atemporal_diagram,
+        lambda: _chain_diagram(atemporal=True),
+        lambda: _renewal_diagram(atemporal=True),
+        lambda: _renewal_diagram(chain=True, atemporal=True),
+    ],
+    ids=["atemporal", "chain_atemporal", "renewal_atemporal", "renewal_chain_atemporal"],
 )
 def test_lp_atemporal_options(builder: Callable[[], StationaryDiagram], solver: str) -> None:
     """Deterministic and randomised atemporal choices both give the best single-branch LP."""
     diagram = builder()
     randomised, index_map = compile_stationary_lp(diagram)
-    deterministic, _ = compile_stationary_lp(diagram, atemporal="deterministic")
+    deterministic, deterministic_map = compile_stationary_lp(diagram, atemporal="deterministic")
     n_branches = len(index_map.branches)
-    masses = [branch.m_symbol for branch in index_map.branches]
+    masses = [branch.z_symbol or branch.m_symbol for branch in deterministic_map.branches]
+    fix = _with_arrival_probabilities if diagram.renewal else _with_fixed_masses
 
     for objective in diagram.objectives:
         symbol, sign = objective.symbol, -1.0 if objective.maximize else 1.0
         single = [
             sign
-            * _solve(
-                _with_fixed_masses(randomised, index_map, np.eye(n_branches)[g].tolist()), symbol, solver
-            ).optimal_objectives[symbol]
+            * _solve(fix(randomised, index_map, np.eye(n_branches)[g].tolist()), symbol, solver).optimal_objectives[
+                symbol
+            ]
             for g in range(n_branches)
         ]
         results = _solve(deterministic, symbol, solver)

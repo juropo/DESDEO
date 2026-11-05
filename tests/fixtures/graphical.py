@@ -327,13 +327,14 @@ def _random_potentials(
     return potentials
 
 
-def decision_chain_2tbn_network(atemporal: bool = False, seed: int = 0) -> DiscreteNetwork:
+def decision_chain_2tbn_network(atemporal: bool = False, seed: int = 0, *, death: bool = False) -> DiscreteNetwork:
     """A binary 2TBN with the decision chain `Dt -> Et` and random CPTs.
 
     `Zt | X0` can't be `hi` after `X0 = lo`, `Dt | X0`, `Yt | X0, Dt` can't be `hi` after
     `Dt = lo`, `Et | X0, Zt, Dt, Yt` and `Xt | X0, Zt, Yt, Et`. So `Et` observes `Dt` and
     `Yt`, which `Dt` causes, and `Dt` can observe `Zt`, which it doesn't cause. With `atemporal`,
-    a binary atemporal G is a parent of `Yt` and `Xt`.
+    a binary atemporal G is a parent of `Yt` and `Xt`. With `death`, the leaf `Kt | X0, Xt` has no
+    slice-0 copy.
     """
     g = ["G"] if atemporal else []
     parents: dict[str, list[str]] = {
@@ -348,6 +349,7 @@ def decision_chain_2tbn_network(atemporal: bool = False, seed: int = 0) -> Discr
         "Yt": ["X0", "Dt", *g],
         "E0": [],
         "Et": ["X0", "Zt", "Dt", "Yt"],
+        **({"Kt": ["X0", "Xt"]} if death else {}),
     }
     card = dict.fromkeys(parents, 2)
     potentials = _random_potentials(parents, card, np.random.default_rng(seed))
