@@ -7,6 +7,7 @@ normalised discounted occupation measure x = (1 - gamma) Σ_k gamma^k P(state_k)
 status-quo slice-0 population.
 """
 
+import itertools
 from collections.abc import Hashable, Sequence
 from math import prod
 from typing import Literal, Self
@@ -42,6 +43,9 @@ _STATE_SINK = "__state_t"
 
 _PROBABILITY_SUM_TOLERANCE = 1e-9
 """How far each `RandomisedPolicy` distribution may sum from 1."""
+
+_MAX_ATEMPORAL_DRAWS = 1024
+"""The most deterministic draws `_mix_atemporal_draws` evaluates."""
 
 
 def _check_known_decisions(symbols: set[str], node_names: set[str]) -> None:
@@ -525,10 +529,76 @@ def _policy_factor(
     return [decision.symbol, *policy.information_set], values
 
 
+def _mix_atemporal_draws(
+    diagram: StationaryDiagram,
+    policies: dict[str, DecisionPolicy | RandomisedPolicy | None],
+    drawn: dict[str, Factor],
+) -> StationaryEvaluation:
+    """Mix the evaluations of every deterministic draw of the atemporal policies `drawn`.
+
+    Each draw picks one state per information state of each drawn decision and is weighted by the
+    product of those states' probabilities.
+
+    Raises:
+        ValueError: there are more than `_MAX_ATEMPORAL_DRAWS` draws.
+    """
+    n_draws = prod(
+        int(support)
+        for _, values in drawn.values()
+        for support in np.count_nonzero(values.reshape(len(values), -1), axis=0)
+    )
+    if n_draws > _MAX_ATEMPORAL_DRAWS:
+        msg = (
+            f"With initial_distribution set, randomised atemporal policies are evaluated by mixing their "
+            f"{n_draws} deterministic draws, more than the {_MAX_ATEMPORAL_DRAWS} allowed; leave "
+            f"initial_distribution unset or randomise fewer information states."
+        )
+        raise ValueError(msg)
+    alternatives = []
+    for symbol, (axes, values) in drawn.items():
+        decision = next(decision for decision in diagram.decisions if decision.symbol == symbol)
+        # Rows in C order over the information set are its mixed-radix keys.
+        rows = values.reshape(len(decision.states), -1).T
+        alternatives.append(
+            [
+                (
+                    prod(row[choice] for row, choice in zip(rows, choices, strict=True)),
+                    DecisionPolicy(
+                        symbol=symbol,
+                        information_set=list(axes[1:]),
+                        states=decision.states,
+                        policy={key: int(choice) for key, choice in enumerate(choices)},
+                    ),
+                )
+                for choices in itertools.product(*(np.flatnonzero(row) for row in rows))
+            ]
+        )
+
+    objectives = dict.fromkeys((objective.symbol for objective in diagram.objectives), 0.0)
+    occupation = 0.0
+    for draw in itertools.product(*alternatives):
+        weight = prod(probability for probability, _ in draw)
+        evaluation = evaluate_stationary_policy(diagram, policies | {policy.symbol: policy for _, policy in draw})
+        for symbol, value in evaluation.objectives.items():
+            objectives[symbol] += weight * value
+        occupation = occupation + weight * np.array(evaluation.occupation.values, dtype=float)
+    return StationaryEvaluation(
+        objectives=objectives,
+        occupation=Potential(
+            variables=evaluation.occupation.variables, shape=evaluation.occupation.shape, values=occupation.tolist()
+        ),
+    )
+
+
 def evaluate_stationary_policy(
     diagram: StationaryDiagram, policies: dict[str, DecisionPolicy | RandomisedPolicy | None]
 ) -> StationaryEvaluation:
     """Objective values and occupation measure of `diagram` under `policies`.
+
+    A randomised atemporal policy is drawn once, not at every step. Without
+    `diagram.initial_distribution`, every atemporal policy is then a state node's CPT, like a
+    status-quo atemporal node's. With it, the objectives and the occupation are the
+    probability-weighted mix of those of the deterministic draws.
 
     Args:
         diagram: the stationary diagram.
@@ -537,8 +607,8 @@ def evaluate_stationary_policy(
             status-quo CPT from `diagram.network`.
 
     Raises:
-        ValueError: a policy doesn't match its decision, or status-quo decisions need state nodes
-            outside `diagram.initial_distribution`'s.
+        ValueError: a policy doesn't match its decision, status-quo decisions need state nodes
+            outside `diagram.initial_distribution`'s, or there are too many draws to mix.
     """
     network = diagram.network
     structure = diagram.structure
@@ -555,6 +625,16 @@ def evaluate_stationary_policy(
         if policy is not None:
             factors[symbol] = _policy_factor(decisions[symbol], policy, cardinality)
             decided.add(symbol)
+    drawn = {
+        symbol: factors[symbol]
+        for symbol in policies
+        if symbol in decided & structure.atemporal and not np.isin(factors[symbol][1], (0.0, 1.0)).all()
+    }
+    if drawn:
+        if diagram.initial_distribution is not None:
+            return _mix_atemporal_draws(diagram, policies, drawn)
+        # Undecided atemporal nodes are state nodes, drawn once from their CPTs.
+        decided -= structure.atemporal
     parents = {name: axes[1:] for name, (axes, _) in factors.items()}
 
     # Status-quo decisions are chance nodes here, so the state may need more nodes than the diagram's.

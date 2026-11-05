@@ -310,3 +310,89 @@ def ci_healthcare_mirror_network(seed: int = 0) -> DiscreteNetwork:
             values=arr.tolist(),
         )
     return DiscreteNetwork(variables=variables, arcs=arcs, potentials=potentials)
+
+
+def _random_potentials(
+    parents: dict[str, list[str]], card: dict[str, int], rng: np.random.Generator
+) -> dict[str, Potential]:
+    """Dirichlet-random CPTs for `parents`, each over `[node, *parents]`."""
+    potentials = {}
+    for node, node_parents in parents.items():
+        parent_shape = [card[p] for p in node_parents]
+        arr = rng.dirichlet(np.ones(card[node]), size=int(np.prod(parent_shape)))
+        arr = np.moveaxis(arr.reshape([*parent_shape, card[node]]), -1, 0)
+        potentials[node] = Potential(
+            variables=[node, *node_parents], shape=[card[node], *parent_shape], values=arr.tolist()
+        )
+    return potentials
+
+
+def decision_chain_2tbn_network(atemporal: bool = False, seed: int = 0) -> DiscreteNetwork:
+    """A binary 2TBN with the decision chain `Dt -> Et` and random CPTs.
+
+    `Zt | X0` can't be `hi` after `X0 = lo`, `Dt | X0`, `Yt | X0, Dt` can't be `hi` after
+    `Dt = lo`, `Et | X0, Zt, Dt, Yt` and `Xt | X0, Zt, Yt, Et`. So `Et` observes `Dt` and
+    `Yt`, which `Dt` causes, and `Dt` can observe `Zt`, which it doesn't cause. With `atemporal`,
+    a binary atemporal G is a parent of `Yt` and `Xt`.
+    """
+    g = ["G"] if atemporal else []
+    parents: dict[str, list[str]] = {
+        **{name: [] for name in g},
+        "X0": [],
+        "Xt": ["X0", "Zt", "Yt", "Et", *g],
+        "Z0": ["X0"],
+        "Zt": ["X0"],
+        "D0": [],
+        "Dt": ["X0"],
+        "Y0": [],
+        "Yt": ["X0", "Dt", *g],
+        "E0": [],
+        "Et": ["X0", "Zt", "Dt", "Yt"],
+    }
+    card = dict.fromkeys(parents, 2)
+    potentials = _random_potentials(parents, card, np.random.default_rng(seed))
+    for node, impossible in [("Zt", (1, 0)), ("Yt", (1, slice(None), 0))]:
+        values = np.array(potentials[node].values)
+        values[impossible] = 0.0
+        values /= values.sum(axis=0, keepdims=True)
+        potentials[node] = Potential(
+            variables=potentials[node].variables, shape=list(values.shape), values=values.tolist()
+        )
+    return DiscreteNetwork(
+        variables=[binary_variable(name) for name in parents],
+        arcs=[(p, node) for node, pars in parents.items() for p in pars],
+        potentials=potentials,
+    )
+
+
+def ci_healthcare_per_step_mirror_network(seed: int = 0) -> DiscreteNetwork:
+    """`ci_healthcare_mirror_network` with the atemporal GER split into `GER0` and the slice-t `GERt`.
+
+    `GERt` takes GER's arcs into slice t and `GER0` its arc into `AST0`; both have GER's prior.
+    """
+    network = ci_healthcare_mirror_network(seed)
+
+    def rename(child: str, name: str) -> str:
+        if name != "GER":
+            return name
+        return "GER0" if child == "AST0" else "GERt"
+
+    variables = []
+    for variable in network.variables:
+        if variable.name == "GER":
+            variables += [binary_variable("GER0"), binary_variable("GERt")]
+        else:
+            variables.append(variable)
+    potentials = {}
+    for name, potential in network.potentials.items():
+        if name == "GER":
+            potentials["GER0"] = potential.model_copy(update={"variables": ["GER0"]})
+            potentials["GERt"] = potential.model_copy(update={"variables": ["GERt"]})
+        else:
+            renamed = [potential.variables[0], *(rename(name, parent) for parent in potential.variables[1:])]
+            potentials[name] = potential.model_copy(update={"variables": renamed})
+    return DiscreteNetwork(
+        variables=variables,
+        arcs=[(rename(child, parent), child) for parent, child in network.arcs],
+        potentials=potentials,
+    )
