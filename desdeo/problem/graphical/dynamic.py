@@ -88,15 +88,15 @@ class TwoSliceStructure(BaseModel):
 def classify_2tbn(network: DiscreteNetwork, decisions: Sequence[DecisionNode] = ()) -> TwoSliceStructure:
     """Split `network`'s nodes into time slices and find the Markov state.
 
-    A name ending in `t` is a slice-t node, and its slice-0 copy (the same name ending in `0`)
-    must exist with the same number of states. A name ending in `0` is a slice-0 node if its
+    A name ending in `t` is a slice-t node; its slice-0 copy (the same name ending in `0`), if
+    it exists, must have the same number of states. A name ending in `0` is a slice-0 node if its
     slice-t copy exists. Every other name is atemporal.
 
     `decisions` override network nodes; each decision's parents are its information set instead
     of its network parents.
 
     Raises:
-        ValueError: a slice-t node lacks its slice-0 copy or their domains differ, a decision isn't
+        ValueError: a slice-t node and its slice-0 copy have different domains, a decision isn't
             a network node or is in slice 0, an information set references an unknown node, an
             arc goes from slice t to slice 0, an atemporal node has a parent in a time slice, or
             the information sets create a cycle.
@@ -111,10 +111,7 @@ def classify_2tbn(network: DiscreteNetwork, decisions: Sequence[DecisionNode] = 
     for name in names:
         if name.endswith("t"):
             partner = f"{name[:-1]}0"
-            if partner not in name_set:
-                msg = f"Node '{name}' ends in 't', so it is in slice t, but its slice-0 copy '{partner}' is missing."
-                raise ValueError(msg)
-            if cardinality[partner] != cardinality[name]:
+            if partner in name_set and cardinality[partner] != cardinality[name]:
                 msg = f"Nodes '{partner}' and '{name}' must have the same number of states."
                 raise ValueError(msg)
             slicet.add(name)

@@ -19,6 +19,7 @@ from fixtures import (
     ci_healthcare_mirror_network,
     mdp_2tbn_network,
     same_slice_2tbn_network,
+    ternary_variable,
 )
 from pyagrum.lib.dynamicBN import unroll2TBN
 
@@ -223,6 +224,47 @@ def test_classify_ci_healthcare_mirror():
     assert diagram.initial_distribution is None
     assert diagram.structure.state_nodes == structure.state_nodes
     assert initial_state_distribution(diagram).shape == (3, 3, 2, 3, 3)
+
+
+def _lone_slice_t_network() -> DiscreteNetwork:
+    """`mdp_2tbn_network` without `D0`, plus an output `Kt` that copies `Xt`."""
+    network = mdp_2tbn_network()
+    return DiscreteNetwork(
+        variables=[variable for variable in network.variables if variable.name != "D0"] + [binary_variable("Kt")],
+        arcs=[arc for arc in network.arcs if "D0" not in arc] + [("Xt", "Kt")],
+        potentials={
+            **{name: potential for name, potential in network.potentials.items() if name != "D0"},
+            "Kt": Potential(variables=["Kt", "Xt"], shape=[2, 2], values=np.eye(2).tolist()),
+        },
+    )
+
+
+def test_classify_lone_slice_t_nodes():
+    """A per-step decision and an output without slice-0 copies are slice-t nodes."""
+    decision = DecisionNode(symbol="Dt", states=["a", "b", "c"], information_set=["X0"])
+    structure = classify_2tbn(_lone_slice_t_network(), [decision])
+    assert structure.slice0 == {"X0"}
+    assert structure.slicet == {"Xt", "Dt", "Kt"}
+    assert structure.atemporal == set()
+    assert structure.state_nodes == ["X0"]
+    assert structure.next_of == {"X0": "Xt"}
+
+
+def test_lone_slice_t_nodes_match_mdp():
+    """An objective on the lone `Kt` evaluates like the MDP's objective on `Xt`."""
+    diagram = StationaryDiagram.with_default_information_sets(
+        _lone_slice_t_network(), {"Dt": None}, [_objective("u", ["Kt"], X_UTILITY)], discount=GAMMA
+    )
+    mdp = _mdp_diagram()
+    decision = diagram.decisions[0]
+    for choices in itertools.product(range(3), repeat=2):
+        policy = {"Dt": _policy(decision, ["X0"], list(choices))}
+        assert evaluate_stationary_policy(diagram, policy).objectives["u"] == pytest.approx(
+            evaluate_stationary_policy(mdp, policy).objectives["u"]
+        )
+    assert evaluate_stationary_policy(diagram, {}).objectives["u"] == pytest.approx(
+        evaluate_stationary_policy(mdp, {}).objectives["u"]
+    )
 
 
 # ── Oracle 2: initial state distribution against LazyPropagation ─────────────────────────────────
@@ -734,10 +776,12 @@ def test_slice_t_to_slice_0_arc_raises():
         classify_2tbn(network)
 
 
-def test_slice_t_node_without_slice_0_copy_raises():
-    """A name ending in `t` needs its `0` copy."""
-    with pytest.raises(ValueError, match="slice-0 copy 'Y0' is missing"):
-        classify_2tbn(_network({"X0": [], "Xt": ["X0"], "Yt": ["Xt"]}))
+def test_slice_t_node_with_different_slice_0_domain_raises():
+    """A slice-t node and its slice-0 copy need the same number of states."""
+    network = mdp_2tbn_network()
+    variables = [ternary_variable("X0") if variable.name == "X0" else variable for variable in network.variables]
+    with pytest.raises(ValueError, match="'X0' and 'Xt' must have the same number of states"):
+        classify_2tbn(network.model_copy(update={"variables": variables}))
 
 
 def test_atemporal_node_with_time_slice_parent_raises():

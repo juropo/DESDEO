@@ -366,33 +366,35 @@ def decision_chain_2tbn_network(atemporal: bool = False, seed: int = 0) -> Discr
 
 
 def ci_healthcare_per_step_mirror_network(seed: int = 0) -> DiscreteNetwork:
-    """`ci_healthcare_mirror_network` with the atemporal GER split into `GER0` and the slice-t `GERt`.
+    """`ci_healthcare_mirror_network` with the atemporal GER replaced by the slice-t `GERt`.
 
-    `GERt` takes GER's arcs into slice t and `GER0` its arc into `AST0`; both have GER's prior.
+    `GERt` has GER's prior and takes GER's arcs into slice t. `AST0`'s CPT is averaged over GER's prior.
     """
     network = ci_healthcare_mirror_network(seed)
+    prior = np.array(network.potentials["GER"].values)
 
-    def rename(child: str, name: str) -> str:
-        if name != "GER":
-            return name
-        return "GER0" if child == "AST0" else "GERt"
-
-    variables = []
-    for variable in network.variables:
-        if variable.name == "GER":
-            variables += [binary_variable("GER0"), binary_variable("GERt")]
-        else:
-            variables.append(variable)
+    variables = [binary_variable("GERt") if variable.name == "GER" else variable for variable in network.variables]
     potentials = {}
     for name, potential in network.potentials.items():
         if name == "GER":
-            potentials["GER0"] = potential.model_copy(update={"variables": ["GER0"]})
             potentials["GERt"] = potential.model_copy(update={"variables": ["GERt"]})
+        elif name == "AST0":
+            axis = potential.variables.index("GER")
+            averaged = np.tensordot(np.array(potential.values), prior, axes=([axis], [0]))
+            potentials[name] = Potential(
+                variables=[variable for variable in potential.variables if variable != "GER"],
+                shape=list(averaged.shape),
+                values=averaged.tolist(),
+            )
         else:
-            renamed = [potential.variables[0], *(rename(name, parent) for parent in potential.variables[1:])]
+            renamed = ["GERt" if variable == "GER" else variable for variable in potential.variables]
             potentials[name] = potential.model_copy(update={"variables": renamed})
     return DiscreteNetwork(
         variables=variables,
-        arcs=[(rename(child, parent), child) for parent, child in network.arcs],
+        arcs=[
+            ("GERt" if parent == "GER" else parent, child)
+            for parent, child in network.arcs
+            if (parent, child) != ("GER", "AST0")
+        ],
         potentials=potentials,
     )
