@@ -60,8 +60,12 @@ from .schema import (
 from .stationary_lp import (
     FlattenedBranch,
     FlattenedStep,
+    StationaryLPBranch,
+    StationaryLPIndexMap,
+    compile_stationary_lp,
     flatten_stationary_step,
     full_observation_information_set,
+    read_randomised_policy,
     stationary_value_iteration,
 )
 
@@ -93,6 +97,8 @@ __all__ = [
     "StationaryDiagram",
     "StationaryEvaluation",
     "StationaryIndexMap",
+    "StationaryLPBranch",
+    "StationaryLPIndexMap",
     "TwoSliceStructure",
     "build_outcome_distributions",
     "build_rooted_junction_tree",
@@ -100,6 +106,7 @@ __all__ = [
     "clear_rjt_cache",
     "compile_diagram",
     "compile_stationary_diagram",
+    "compile_stationary_lp",
     "compile_with_assumptions",
     "condition_network",
     "effective_information_sets",
@@ -110,6 +117,7 @@ __all__ = [
     "initial_state_distribution",
     "promote_to_decisions",
     "read_policy_from_solution",
+    "read_randomised_policy",
     "stationary_value_iteration",
     "validate_assumptions",
 ]

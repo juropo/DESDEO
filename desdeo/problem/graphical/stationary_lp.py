@@ -8,17 +8,32 @@ observes and D_{k-1} doesn't, and a_k D_k's action, the step flattens into a ker
 coefficients `W[(s, o_1, a_1, ..., o_n, a_n)] = Σ P(o_1..o_n, rest | s, do(a_1..a_n)) u`. Each joint
 value of the atemporal decisions is a branch with its own kernel and coefficients. Over the
 discounted occupations `y_0 = x(s)` and `y_k = y_{k-1} π_k(a_k | s, o_1, a_1, ..., o_k)` the step is
-linear, and `stationary_value_iteration` solves it for one objective.
+linear: `stationary_value_iteration` solves it for one objective, and `compile_stationary_lp` compiles it
+into an LP `Problem` over the occupations.
 """
 
 import itertools
 from collections.abc import Hashable
+from functools import reduce
 from math import prod
+from typing import Literal
 
 import numpy as np
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 from pydantic import BaseModel, ConfigDict
+
+from desdeo.problem.schema import (
+    Constraint,
+    ConstraintTypeEnum,
+    Objective,
+    Problem,
+    SparseTensorConstant,
+    TensorConstant,
+    TensorVariable,
+    Variable,
+    VariableTypeEnum,
+)
 
 from .dynamic import (
     Factor,
@@ -153,7 +168,7 @@ def _flat_indices(axis_indices: list[np.ndarray], cardinalities: list[int], size
     return np.ravel_multi_index(axis_indices, cardinalities)
 
 
-def _prefix_axes(flat: FlattenedStep, level: int) -> tuple[list[str], list[int]]:
+def _prefix_axes(flat: "FlattenedStep | StationaryLPIndexMap", level: int) -> tuple[list[str], list[int]]:
     """The names and cardinalities of the prefix axes (s, o_1, a_1, ..., o_k) of chain decision `level`, from 0."""
     names, cards = [*flat.state_nodes], [*flat.state_cardinalities]
     for k in range(level):
@@ -347,7 +362,9 @@ def flatten_stationary_step(diagram: StationaryDiagram) -> FlattenedStep:
     )
 
 
-def _information_keys(flat: FlattenedStep, branch: FlattenedBranch, level: int) -> np.ndarray:
+def _information_keys(
+    flat: "FlattenedStep | StationaryLPIndexMap", branch: "FlattenedBranch | StationaryLPBranch", level: int
+) -> np.ndarray:
     """The information-state key of chain decision `level` for each of `branch`'s kept prefixes at that level.
 
     Keys are as in that decision's `RandomisedPolicy`, with the branch's atemporal values.
@@ -511,3 +528,367 @@ def stationary_value_iteration(
             symbol=atemporal.symbol, information_set=[], states=atemporal.states, probabilities={0: point_mass.tolist()}
         )
     return float(sign * best_value), policies
+
+
+_PREFIX = "slp_"
+"""Prefix of the symbols `compile_stationary_lp` adds; objective symbols may not start with it."""
+
+
+class StationaryLPBranch(BaseModel):
+    """One branch's prefixes and symbols in the problem `compile_stationary_lp` builds."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    atemporal: dict[str, int]
+    """`FlattenedBranch.atemporal`."""
+    prefixes: list[list[int]]
+    """`FlattenedBranch.prefixes`."""
+    parents: list[list[int]]
+    """`FlattenedBranch.parents`."""
+    m_symbol: str
+    """The `Variable` of the branch's mass, the probability of its atemporal values."""
+    x_symbol: str
+    """The `TensorVariable` of the state occupation y_0 = x, one entry per joint state s."""
+    y_symbols: list[str]
+    """Per level k, the `TensorVariable` of the occupation y_k over (p_k, a_k); the last is w."""
+    kernel_symbol: str
+    """The `SparseTensorConstant` of `FlattenedBranch.kernel`."""
+    coefficient_symbols: dict[str, str]
+    """Objective symbol -> the 1-D `SparseTensorConstant` of its coefficients over w."""
+    block_symbols: list[str]
+    """Per level k, the `SparseTensorConstant` B_k summing y_k over a_k for each kept p_k."""
+    parent_symbols: list[str]
+    """Per level k, the `SparseTensorConstant` P_k selecting each kept p_k's entry in y_{k-1}."""
+    consistency_symbols: list[str]
+    """Per level k, the vector-valued constraint `B_k y_k - P_k y_{k-1} == 0`."""
+    flow_symbol: str
+    """The vector-valued flow constraint `x - gamma T w - (1 - gamma) m mu0 == 0`."""
+
+
+class StationaryLPIndexMap(BaseModel):
+    """`compile_stationary_lp`'s bookkeeping, for `read_randomised_policy`."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    state_nodes: list[str]
+    """`FlattenedStep.state_nodes`."""
+    state_cardinalities: list[int]
+    """`FlattenedStep.state_cardinalities`."""
+    decisions: list[DecisionNode]
+    """`FlattenedStep.decisions`."""
+    observation_nodes: list[list[str]]
+    """`FlattenedStep.observation_nodes`."""
+    observation_cardinalities: list[list[int]]
+    """`FlattenedStep.observation_cardinalities`."""
+    atemporal_decisions: list[DecisionNode]
+    """`FlattenedStep.atemporal_decisions`."""
+    branches: list[StationaryLPBranch]
+    """One per `FlattenedStep.branches`, in the same order."""
+    mu0_symbol: str
+    """The `TensorConstant` of `FlattenedStep.mu0`."""
+    mass_symbol: str
+    """The constraint `Σ_g m_g == 1`."""
+    discount: float
+    """`StationaryDiagram.discount`."""
+
+
+def _sparse_constant(name: str, symbol: str, matrix: sp.sparray, *, vector: bool = False) -> SparseTensorConstant:
+    """`matrix` as a `SparseTensorConstant`, 1-D over its columns if `vector`."""
+    coo = matrix.tocoo()
+    if vector:
+        return SparseTensorConstant(
+            name=name, symbol=symbol, shape=[coo.shape[1]], indices=[coo.col.tolist()], values=coo.data.tolist()
+        )
+    return SparseTensorConstant(
+        name=name,
+        symbol=symbol,
+        shape=list(coo.shape),
+        indices=[coo.row.tolist(), coo.col.tolist()],
+        values=coo.data.tolist(),
+    )
+
+
+def _occupation_variable(name: str, symbol: str, size: int) -> TensorVariable:
+    """A real occupation vector in [0, 1]^size."""
+    return TensorVariable(
+        name=name,
+        symbol=symbol,
+        variable_type=VariableTypeEnum.real,
+        shape=[size],
+        lowerbounds=0.0,
+        upperbounds=1.0,
+    )
+
+
+def compile_stationary_lp(
+    diagram: StationaryDiagram, *, atemporal: Literal["randomised", "deterministic"] = "randomised"
+) -> tuple[Problem, StationaryLPIndexMap]:
+    """Compile `diagram` into an LP for its optimal randomised stationary policy under full observation.
+
+    The step is flattened with `flatten_stationary_step`. Each branch g, one joint value of the
+    atemporal decisions, has a mass `m_g`, a state occupation `x_g = y_{0,g}` and per chain level k
+    an occupation `y_{k,g}` over the kept (p_k, a_k), with `w_g = y_{n,g}` and
+
+    - `B_k y_{k,g} - P_k y_{k-1,g} = 0` per level, `Σ_{a_k} y_k(p_k, a_k) = y_{k-1}(parent of p_k)`,
+    - `x_g = (1 - gamma) m_g mu0 + gamma T_g w_g`,
+    - `Σ_g m_g = 1`.
+
+    Each objective is `Σ_g W_g w_g`, the per-step average as in `evaluate_stationary_policy`;
+    multiply by 1 / (1 - gamma) for the total discounted sum. All added symbols start with `slp_`.
+
+    With several atemporal decisions, the masses are a joint over their values, so the LP optimises
+    over correlated choices, a relaxation of independent randomisation; `read_randomised_policy`
+    raises when the optimal joint isn't a product of its marginals.
+
+    Args:
+        diagram: the stationary diagram; its chain decisions must observe their full observation sets.
+        atemporal: `"randomised"` lets the masses take any value in [0, 1]; `"deterministic"` makes
+            them binary when there is more than one branch, so the atemporal decisions take one value.
+
+    Returns:
+        tuple[Problem, StationaryLPIndexMap]: the LP (a MILP for deterministic atemporal decisions)
+            and its bookkeeping.
+
+    Raises:
+        ValueError: `atemporal` isn't one of its options, an objective symbol starts with `slp_`, or
+            `flatten_stationary_step` raises.
+    """
+    if atemporal not in ("randomised", "deterministic"):
+        msg = f"atemporal must be 'randomised' or 'deterministic', got {atemporal!r}."
+        raise ValueError(msg)
+    clashes = sorted(objective.symbol for objective in diagram.objectives if objective.symbol.startswith(_PREFIX))
+    if clashes:
+        msg = f"Objective symbols {clashes} start with '{_PREFIX}', which is reserved for the LP's own symbols."
+        raise ValueError(msg)
+    flat = flatten_stationary_step(diagram)
+    gamma = flat.discount
+    n_states = prod(flat.state_cardinalities)
+    n_actions = [len(decision.states) for decision in flat.decisions]
+    binary = atemporal == "deterministic" and len(flat.branches) > 1
+    linear = {"is_linear": True, "is_convex": True, "is_twice_differentiable": True}
+
+    mu0_symbol = f"{_PREFIX}mu0"
+    constants: list[TensorConstant | SparseTensorConstant] = [
+        TensorConstant(name="Initial state distribution", symbol=mu0_symbol, shape=[n_states], values=flat.mu0.tolist())
+    ]
+    variables: list[Variable | TensorVariable] = []
+    constraints: list[Constraint] = []
+    branches: list[StationaryLPBranch] = []
+    for g, branch in enumerate(flat.branches):
+        m, x, kernel, flow = (f"{_PREFIX}{name}_{g}" for name in ("m", "x", "T", "flow"))
+        ys, blocks, selections, consistencies = (
+            [f"{_PREFIX}{name}_{g}_{k}" for k in range(len(n_actions))] for name in ("y", "B", "P", "consistency")
+        )
+        variables += [
+            Variable(
+                name=f"Mass of branch {g}",
+                symbol=m,
+                variable_type=VariableTypeEnum.binary if binary else VariableTypeEnum.real,
+                lowerbound=0.0,
+                upperbound=1.0,
+            ),
+            _occupation_variable(f"State occupation of branch {g}", x, n_states),
+        ]
+        previous, previous_size = x, n_states
+        for k, (prefixes, parents, actions) in enumerate(zip(branch.prefixes, branch.parents, n_actions, strict=True)):
+            rows = len(prefixes)
+            variables.append(_occupation_variable(f"Occupation of level {k} in branch {g}", ys[k], rows * actions))
+            block = sp.csr_array(
+                (np.ones(rows * actions), (np.repeat(np.arange(rows), actions), np.arange(rows * actions))),
+                shape=(rows, rows * actions),
+            )
+            selection = sp.csr_array((np.ones(rows), (np.arange(rows), parents)), shape=(rows, previous_size))
+            constants += [
+                _sparse_constant(f"Action sums of level {k} in branch {g}", blocks[k], block),
+                _sparse_constant(f"Parent entries of level {k} in branch {g}", selections[k], selection),
+            ]
+            constraints.append(
+                Constraint(
+                    name=f"Consistency of level {k} in branch {g}",
+                    symbol=consistencies[k],
+                    cons_type=ConstraintTypeEnum.EQ,
+                    func=["Subtract", ["MatMul", blocks[k], ys[k]], ["MatMul", selections[k], previous]],
+                    **linear,
+                )
+            )
+            previous, previous_size = ys[k], rows * actions
+
+        constants.append(_sparse_constant(f"Transition kernel of branch {g}", kernel, branch.kernel))
+        coefficient_symbols = {}
+        for i, (symbol, coefficients) in enumerate(branch.objective_coefficients.items()):
+            coefficient_symbols[symbol] = f"{_PREFIX}W_{g}_{i}"
+            constants.append(
+                _sparse_constant(
+                    f"Coefficients of objective '{symbol}' in branch {g}",
+                    coefficient_symbols[symbol],
+                    sp.csr_array(coefficients[None, :]),
+                    vector=True,
+                )
+            )
+        constraints.append(
+            Constraint(
+                name=f"Flow balance of branch {g}",
+                symbol=flow,
+                cons_type=ConstraintTypeEnum.EQ,
+                func=[
+                    "Subtract",
+                    x,
+                    ["Multiply", gamma, ["MatMul", kernel, ys[-1]]],
+                    ["Multiply", m, ["Multiply", 1 - gamma, mu0_symbol]],
+                ],
+                **linear,
+            )
+        )
+        branches.append(
+            StationaryLPBranch(
+                atemporal=branch.atemporal,
+                prefixes=[prefixes.tolist() for prefixes in branch.prefixes],
+                parents=[parents.tolist() for parents in branch.parents],
+                m_symbol=m,
+                x_symbol=x,
+                y_symbols=ys,
+                kernel_symbol=kernel,
+                coefficient_symbols=coefficient_symbols,
+                block_symbols=blocks,
+                parent_symbols=selections,
+                consistency_symbols=consistencies,
+                flow_symbol=flow,
+            )
+        )
+
+    mass_symbol = f"{_PREFIX}mass"
+    masses = [branch.m_symbol for branch in branches]
+    constraints.append(
+        Constraint(
+            name="Branch masses sum to one",
+            symbol=mass_symbol,
+            cons_type=ConstraintTypeEnum.EQ,
+            func=["Subtract", ["Add", *masses] if len(masses) > 1 else masses[0], 1],
+            **linear,
+        )
+    )
+
+    objectives = []
+    for objective in diagram.objectives:
+        terms = [["MatMul", branch.coefficient_symbols[objective.symbol], branch.y_symbols[-1]] for branch in branches]
+        objectives.append(
+            Objective(
+                name=objective.name or objective.symbol,
+                symbol=objective.symbol,
+                unit=objective.unit,
+                func=["Add", *terms] if len(terms) > 1 else terms[0],
+                maximize=objective.maximize,
+                **linear,
+            )
+        )
+
+    problem = Problem(
+        name="Stationary randomised policy LP",
+        description=(
+            "The occupation-measure LP of a stationary diagram's randomised policies under full observation; "
+            "objectives are per-step averages."
+        ),
+        constants=constants,
+        variables=variables,
+        objectives=objectives,
+        constraints=constraints,
+    )
+    return problem, StationaryLPIndexMap(
+        state_nodes=flat.state_nodes,
+        state_cardinalities=flat.state_cardinalities,
+        decisions=flat.decisions,
+        observation_nodes=flat.observation_nodes,
+        observation_cardinalities=flat.observation_cardinalities,
+        atemporal_decisions=flat.atemporal_decisions,
+        branches=branches,
+        mu0_symbol=mu0_symbol,
+        mass_symbol=mass_symbol,
+        discount=gamma,
+    )
+
+
+def read_randomised_policy(
+    index_map: StationaryLPIndexMap, optimal_variables: dict[str, list[float] | float], *, tol: float = 1e-10
+) -> dict[str, RandomisedPolicy]:
+    """Read the randomised policies from a solution of `compile_stationary_lp`'s problem.
+
+    Chain decision k takes `π_k(a | p_k) = y_k(p_k, a) / Σ_a y_k(p_k, ·)`, negative entries clipped
+    to 0, where the parent entry of p_k in y_{k-1} is above `tol` in a branch with normalised mass
+    above 0; every other information state, unreachable or dropped, gets the uniform distribution.
+    Each atemporal decision gets the marginal of the normalised masses, those `<= tol` set to 0.
+
+    Args:
+        index_map: the `StationaryLPIndexMap` of the problem.
+        optimal_variables: `SolverResults.optimal_variables` of a solve of it.
+        tol: the occupation and mass at or below which a branch or prefix counts as unreached.
+
+    Returns:
+        dict[str, RandomisedPolicy]: a policy for each chain decision and each atemporal decision.
+
+    Raises:
+        ValueError: no mass is above `tol`; a decision's information keys collide across branches;
+            or, with several atemporal decisions, the masses aren't the product of their marginals,
+            so independent policies can't represent them.
+    """
+    atemporal_cards = [len(atemporal.states) for atemporal in index_map.atemporal_decisions]
+    n_actions = [len(decision.states) for decision in index_map.decisions]
+    probabilities = [
+        np.full((prod(_prefix_axes(index_map, level)[1]) * prod(atemporal_cards), actions), 1.0 / actions)
+        for level, actions in enumerate(n_actions)
+    ]
+
+    masses = np.array([float(optimal_variables[branch.m_symbol]) for branch in index_map.branches])
+    masses[masses <= tol] = 0.0
+    if masses.sum() == 0:
+        msg = f"No branch mass is above {tol}."
+        raise ValueError(msg)
+    masses /= masses.sum()
+
+    written = [[] for _ in n_actions]
+    for branch, mass in zip(index_map.branches, masses, strict=True):
+        if mass == 0:
+            continue
+        previous = np.asarray(optimal_variables[branch.x_symbol], dtype=float)
+        for level, (table, actions) in enumerate(zip(probabilities, n_actions, strict=True)):
+            y = np.clip(np.asarray(optimal_variables[branch.y_symbols[level]], dtype=float), 0.0, None)
+            y = y.reshape(-1, actions)
+            totals = y.sum(axis=1)
+            reached = (previous[branch.parents[level]] > tol) & (totals > 0)
+            rows = np.full_like(y, 1.0 / actions)
+            rows[reached] = y[reached] / totals[reached, None]
+            keys = _information_keys(index_map, branch, level)
+            table[keys] = rows
+            written[level].append(keys)
+            previous = y.reshape(-1)
+
+    for decision, level_keys in zip(index_map.decisions, written, strict=True):
+        keys = np.concatenate(level_keys)
+        if len(np.unique(keys)) < len(keys):
+            msg = (
+                f"Branches write the same information-state keys of decision '{decision.symbol}'; its information "
+                "set must cover the prefix axes and all atemporal decisions."
+            )
+            raise ValueError(msg)
+
+    policies = {
+        decision.symbol: RandomisedPolicy(
+            symbol=decision.symbol,
+            information_set=decision.information_set,
+            states=decision.states,
+            probabilities=dict(enumerate(table.tolist())),
+        )
+        for decision, table in zip(index_map.decisions, probabilities, strict=True)
+    }
+    if not index_map.atemporal_decisions:
+        return policies
+    # Branches enumerate the atemporal decisions' joint values, the last varying fastest.
+    joint = masses.reshape(atemporal_cards)
+    marginals = [joint.sum(axis=tuple(j for j in range(joint.ndim) if j != i)) for i in range(joint.ndim)]
+    if not np.allclose(joint, reduce(np.multiply.outer, marginals), rtol=0, atol=tol):
+        msg = "The atemporal decisions' joint masses aren't a product of their marginals."
+        raise ValueError(msg)
+    for atemporal, marginal in zip(index_map.atemporal_decisions, marginals, strict=True):
+        policies[atemporal.symbol] = RandomisedPolicy(
+            symbol=atemporal.symbol, information_set=[], states=atemporal.states, probabilities={0: marginal.tolist()}
+        )
+    return policies

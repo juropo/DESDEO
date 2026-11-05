@@ -6,6 +6,7 @@ Oracles:
    the flattened kernel.
 2. **Brute-force enumeration** of deterministic policies, against `stationary_value_iteration`.
 3. **pyAgrum-unrolled marginals** (`_unrolled_average`), against randomised policy evaluation.
+4. **`stationary_value_iteration`** and enumeration, against `compile_stationary_lp`'s LP optimum.
 """
 
 import itertools
@@ -26,6 +27,7 @@ from fixtures import (
 from test_graphical_stationary import GAMMA, _replace_cpt, _unrolled_average
 
 from desdeo.problem.graphical import (
+    DecisionNode,
     DecisionPolicy,
     DiagramConstraint,
     DiagramConstraintKind,
@@ -35,14 +37,23 @@ from desdeo.problem.graphical import (
     Potential,
     RandomisedPolicy,
     StationaryDiagram,
+    StationaryLPBranch,
+    StationaryLPIndexMap,
+    compile_stationary_lp,
     dynamic,
     evaluate_stationary_policy,
     flatten_stationary_step,
     full_observation_information_set,
     initial_state_distribution,
+    read_randomised_policy,
     stationary_value_iteration,
 )
 from desdeo.problem.graphical.index_map import mixed_radix_encode
+from desdeo.problem.schema import Problem
+from desdeo.tools.cvxpy_solver_interfaces import CVXPYSolver, CVXPYSolverOptions
+from desdeo.tools.generics import SolverResults
+from desdeo.tools.gurobipy_solver_interfaces import GurobipySolver
+from desdeo.tools.scalarization import add_asf_diff
 
 pytestmark = pytest.mark.graphical
 
@@ -757,3 +768,299 @@ def test_value_iteration_mirror_near_one_discount() -> None:
     flat = flatten_stationary_step(diagram)
     value, policies = stationary_value_iteration(flat, "k")
     assert evaluate_stationary_policy(diagram, policies).objectives["k"] == pytest.approx(value, abs=1e-10)
+
+
+_SOLVERS = [pytest.param("cvxpy", marks=pytest.mark.cvxpy), pytest.param("gurobipy", marks=pytest.mark.gurobipy)]
+
+
+def _solve(problem: Problem, target: str, solver: str) -> SolverResults:
+    """Solve `problem` for `target` with CVXPY + HiGHS or gurobipy."""
+    if solver == "cvxpy":
+        results = CVXPYSolver(problem, CVXPYSolverOptions(solver="HIGHS")).solve(target)
+    else:
+        results = GurobipySolver(problem).solve(target)
+    assert results.success, results.message
+    return results
+
+
+def _with_fixed_masses(problem: Problem, index_map: StationaryLPIndexMap, masses: list[float]) -> Problem:
+    """`problem` with each branch mass fixed through its bounds."""
+    fixed = {branch.m_symbol: mass for branch, mass in zip(index_map.branches, masses, strict=True)}
+    variables = [
+        variable.model_copy(update={"lowerbound": fixed[variable.symbol], "upperbound": fixed[variable.symbol]})
+        if variable.symbol in fixed
+        else variable
+        for variable in problem.variables
+    ]
+    return problem.model_copy(update={"variables": variables})
+
+
+def _check_lp_matches_value_iteration(diagram: StationaryDiagram, solver: str) -> None:
+    """The LP optimum equals VI for each objective, and the read-back policies evaluate to it."""
+    flat = flatten_stationary_step(diagram)
+    problem, index_map = compile_stationary_lp(diagram)
+    assert len(problem.constraints) == len(flat.branches) * (len(flat.decisions) + 1) + 1
+    for symbol in flat.maximize:
+        results = _solve(problem, symbol, solver)
+        value = results.optimal_objectives[symbol]
+        assert value == pytest.approx(stationary_value_iteration(flat, symbol)[0], abs=1e-8)
+        policies = read_randomised_policy(index_map, results.optimal_variables)
+        assert set(policies) == {decision.symbol for decision in diagram.decisions}
+        assert evaluate_stationary_policy(diagram, policies).objectives[symbol] == pytest.approx(value, abs=1e-8)
+
+
+@pytest.mark.parametrize("solver", _SOLVERS)
+@pytest.mark.parametrize("name", list(_SMALL_DIAGRAMS))
+def test_lp_matches_value_iteration(name: str, solver: str) -> None:
+    """On the small fixtures, the LP optimum equals VI and the read-back policies evaluate to it."""
+    _check_lp_matches_value_iteration(_SMALL_DIAGRAMS[name](), solver)
+
+
+@pytest.mark.cvxpy
+def test_lp_matches_value_iteration_per_step_mirror() -> None:
+    """On the per-step mirror, the LP optimum equals VI and the read-back policies evaluate to it."""
+    _check_lp_matches_value_iteration(_per_step_mirror_diagram(), "cvxpy")
+
+
+@pytest.mark.cvxpy
+@pytest.mark.parametrize("masses", [[0.35, 0.65, 0.0], [0.2, 0.35, 0.45]])
+def test_lp_fixed_fractional_masses_per_step_mirror(masses: list[float]) -> None:
+    """With OMA's masses fixed, the LP value weights each branch's optimum by its mass; read-back policies attain it."""
+    diagram = _per_step_mirror_diagram()
+    compiled, index_map = compile_stationary_lp(diagram)
+    problem = _with_fixed_masses(compiled, index_map, masses)
+    units = np.eye(len(index_map.branches)).tolist()
+    for objective in diagram.objectives:
+        results = _solve(problem, objective.symbol, "cvxpy")
+        single = [
+            _solve(_with_fixed_masses(compiled, index_map, unit), objective.symbol, "cvxpy").optimal_objectives[
+                objective.symbol
+            ]
+            for unit in units
+        ]
+        assert results.optimal_objectives[objective.symbol] == pytest.approx(np.dot(masses, single), abs=1e-8)
+        policies = read_randomised_policy(index_map, results.optimal_variables)
+        assert policies["OMA"].probabilities[0] == pytest.approx(masses, abs=1e-8)
+        assert evaluate_stationary_policy(diagram, policies).objectives[objective.symbol] == pytest.approx(
+            results.optimal_objectives[objective.symbol], abs=1e-8
+        )
+
+
+def _asf(values: dict[str, float], problem: Problem, reference: dict[str, float], rho: float, delta: float) -> float:
+    """`add_asf_diff`'s scalarization at objective values `values`, with the problem's ideal and nadir."""
+    terms, augmentation = [], 0.0
+    for objective in problem.objectives:
+        sign = -1.0 if objective.maximize else 1.0
+        scale = sign * objective.nadir - (sign * objective.ideal - delta)
+        terms.append(sign * (values[objective.symbol] - reference[objective.symbol]) / scale)
+        augmentation += sign * values[objective.symbol] / scale
+    return max(terms) + rho * augmentation
+
+
+def _three_objective_chain_diagram() -> StationaryDiagram:
+    """`_chain_diagram` with a third objective, the share of `Dt = hi`, minimised."""
+    objectives = [*_chain_diagram().objectives, _objective("d", ["Dt"], [0.0, 1.0], maximize=False)]
+    return _full_observation_diagram(decision_chain_2tbn_network(), ["Dt", "Et"], objectives)
+
+
+def _fractional_counts(index_map: StationaryLPIndexMap, variables: dict[str, list[float] | float]) -> list[int]:
+    """Per chain decision, the number of reached prefixes at which the LP's policy isn't a point mass."""
+    counts = []
+    for level, decision in enumerate(index_map.decisions):
+        count = 0
+        for branch in index_map.branches:
+            y = np.array(variables[branch.y_symbols[level]]).reshape(-1, len(decision.states))
+            totals = y.sum(axis=1)
+            reached = totals > 1e-8
+            count += int(((y[reached] / totals[reached, None]).max(axis=1) < 1 - 1e-6).sum())
+        counts.append(count)
+    return counts
+
+
+@pytest.mark.parametrize("solver", _SOLVERS)
+@pytest.mark.parametrize(
+    "builder",
+    [
+        _mdp_diagram,
+        _same_slice_diagram,
+        _chain_diagram,
+        lambda: _chain_diagram(atemporal=True),
+        _three_objective_chain_diagram,
+    ],
+    ids=["mdp", "same_slice", "chain", "chain_atemporal", "chain_three_objectives"],
+)
+def test_lp_asf_beats_deterministic_policies(builder: Callable[[], StationaryDiagram], solver: str) -> None:
+    """The ASF optimum reads back exactly, is no worse than any deterministic policy's ASF and isn't dominated.
+
+    The reference point is the midpoint of the best and worst deterministic values. On the
+    three-objective chain, the optimum randomises both chain decisions.
+    """
+    diagram = builder()
+    flat = flatten_stationary_step(diagram)
+    deterministic = [
+        evaluate_stationary_policy(diagram, policies).objectives
+        for _, _, policies in _deterministic_combinations(diagram, flat)
+    ]
+    best = {s: (max if m else min)(values[s] for values in deterministic) for s, m in flat.maximize.items()}
+    worst = {s: (min if m else max)(values[s] for values in deterministic) for s, m in flat.maximize.items()}
+    reference = {s: (best[s] + worst[s]) / 2 for s in flat.maximize}
+
+    problem, index_map = compile_stationary_lp(diagram)
+    problem = problem.update_ideal_and_nadir(new_ideal=best, new_nadir=worst)
+    rho, delta = 1e-6, 1e-6
+    asf_problem, target = add_asf_diff(problem, "asf", reference, rho=rho, delta=delta)
+    results = _solve(asf_problem, target, solver)
+    values = results.optimal_objectives
+
+    policies = read_randomised_policy(index_map, results.optimal_variables)
+    evaluated = evaluate_stationary_policy(diagram, policies).objectives
+    for symbol in flat.maximize:
+        assert evaluated[symbol] == pytest.approx(values[symbol], abs=1e-8)
+
+    asf_value = _asf(values, problem, reference, rho, delta)
+    assert results.scalarization_values[target] == pytest.approx(asf_value, abs=1e-8)
+    assert asf_value <= min(_asf(other, problem, reference, rho, delta) for other in deterministic) + 1e-8
+    signs = {s: -1.0 if m else 1.0 for s, m in flat.maximize.items()}
+    for other in deterministic:
+        no_worse = all(signs[s] * other[s] <= signs[s] * values[s] + 1e-9 for s in signs)
+        better = any(signs[s] * other[s] < signs[s] * values[s] - 1e-9 for s in signs)
+        assert not (no_worse and better)
+    if builder is _three_objective_chain_diagram:
+        assert all(count > 0 for count in _fractional_counts(index_map, results.optimal_variables))
+
+
+@pytest.mark.parametrize("solver", _SOLVERS)
+@pytest.mark.parametrize(
+    "builder", [_atemporal_diagram, lambda: _chain_diagram(atemporal=True)], ids=["atemporal", "chain_atemporal"]
+)
+def test_lp_atemporal_options(builder: Callable[[], StationaryDiagram], solver: str) -> None:
+    """Deterministic and randomised atemporal choices both give the best single-branch LP."""
+    diagram = builder()
+    randomised, index_map = compile_stationary_lp(diagram)
+    deterministic, _ = compile_stationary_lp(diagram, atemporal="deterministic")
+    n_branches = len(index_map.branches)
+    masses = [branch.m_symbol for branch in index_map.branches]
+
+    for objective in diagram.objectives:
+        symbol, sign = objective.symbol, -1.0 if objective.maximize else 1.0
+        single = [
+            sign
+            * _solve(
+                _with_fixed_masses(randomised, index_map, np.eye(n_branches)[g].tolist()), symbol, solver
+            ).optimal_objectives[symbol]
+            for g in range(n_branches)
+        ]
+        results = _solve(deterministic, symbol, solver)
+        assert sign * results.optimal_objectives[symbol] == pytest.approx(min(single), abs=1e-8)
+        for mass in masses:
+            assert min(abs(results.optimal_variables[mass]), abs(results.optimal_variables[mass] - 1)) < 1e-8
+        assert sign * _solve(randomised, symbol, solver).optimal_objectives[symbol] == pytest.approx(
+            min(single), abs=1e-8
+        )
+
+
+def test_compile_lp_reserved_symbol() -> None:
+    """An objective symbol with the reserved prefix raises."""
+    diagram = _mdp_diagram()
+    objectives = [diagram.objectives[0].model_copy(update={"symbol": "slp_x"}), diagram.objectives[1]]
+    diagram = StationaryDiagram(**{**dict(diagram), "objectives": objectives})
+    with pytest.raises(ValueError, match="slp_x"):
+        compile_stationary_lp(diagram)
+
+
+def test_compile_lp_invalid_atemporal() -> None:
+    """An unknown `atemporal` option raises."""
+    with pytest.raises(ValueError, match="atemporal must be"):
+        compile_stationary_lp(_mdp_diagram(), atemporal="mixed")
+
+
+def test_compile_lp_atemporal_observations() -> None:
+    """An atemporal decision with observations raises."""
+    full_set = full_observation_information_set(_mirror_diagram(), "LYHt")
+    diagram = StationaryDiagram.with_default_information_sets(
+        ci_healthcare_mirror_network(), {"GER": ["OMA"], "LYHt": full_set}, _MIRROR_OBJECTIVES, discount=GAMMA
+    )
+    with pytest.raises(ValueError, match="Atemporal decision 'GER' observes"):
+        compile_stationary_lp(diagram)
+
+
+def _two_atemporal_index_map() -> StationaryLPIndexMap:
+    """A hand-built index map: state S (2), atemporal decisions G1 (2) and G2 (3), decision D (2) observing all."""
+    g1 = DecisionNode(symbol="G1", states=["a", "b"])
+    g2 = DecisionNode(symbol="G2", states=["a", "b", "c"])
+    decision = DecisionNode(symbol="D", states=["u", "v"], information_set=["S", "G1", "G2"])
+    branches = [
+        StationaryLPBranch(
+            atemporal={"G1": i, "G2": j},
+            prefixes=[[0, 1]],
+            parents=[[0, 1]],
+            m_symbol=f"m_{k}",
+            x_symbol=f"x_{k}",
+            y_symbols=[f"w_{k}"],
+            kernel_symbol=f"T_{k}",
+            coefficient_symbols={},
+            block_symbols=[f"B_{k}"],
+            parent_symbols=[f"P_{k}"],
+            consistency_symbols=[f"c_{k}"],
+            flow_symbol=f"flow_{k}",
+        )
+        for k, (i, j) in enumerate(itertools.product(range(2), range(3)))
+    ]
+    return StationaryLPIndexMap(
+        state_nodes=["S"],
+        state_cardinalities=[2],
+        decisions=[decision],
+        observation_nodes=[[]],
+        observation_cardinalities=[[]],
+        atemporal_decisions=[g1, g2],
+        branches=branches,
+        mu0_symbol="mu0",
+        mass_symbol="mass",
+        discount=GAMMA,
+    )
+
+
+def _branch_solution(masses: np.ndarray) -> dict[str, list[float] | float]:
+    """A solution of `_two_atemporal_index_map` with branch masses `masses`, D choosing u in S=0 and v in S=1."""
+    variables: dict[str, list[float] | float] = {}
+    for k, mass in enumerate(masses):
+        variables[f"m_{k}"] = float(mass)
+        variables[f"x_{k}"] = [mass / 2, mass / 2]
+        variables[f"w_{k}"] = [mass / 2, 0.0, 0.0, mass / 2]
+    return variables
+
+
+def test_read_policy_two_atemporal_product() -> None:
+    """A product joint of masses reads back as its marginals."""
+    index_map = _two_atemporal_index_map()
+    g1, g2 = np.array([0.3, 0.7]), np.array([0.2, 0.5, 0.3])
+    policies = read_randomised_policy(index_map, _branch_solution(np.outer(g1, g2).ravel()))
+
+    assert policies["G1"].probabilities[0] == pytest.approx(g1.tolist(), abs=1e-12)
+    assert policies["G2"].probabilities[0] == pytest.approx(g2.tolist(), abs=1e-12)
+    for g1_value, g2_value in itertools.product(range(2), range(3)):
+        for s_value, action in [(0, [1.0, 0.0]), (1, [0.0, 1.0])]:
+            key = mixed_radix_encode([s_value, g1_value, g2_value], [2, 2, 3])
+            assert policies["D"].probabilities[key] == pytest.approx(action)
+
+
+def test_read_policy_two_atemporal_correlated() -> None:
+    """A joint of masses that isn't a product of its marginals raises."""
+    masses = np.array([0.5, 0.0, 0.0, 0.0, 0.5, 0.0])
+    with pytest.raises(ValueError, match="product of their marginals"):
+        read_randomised_policy(_two_atemporal_index_map(), _branch_solution(masses))
+
+
+def test_read_policy_colliding_keys() -> None:
+    """A chain decision whose information set omits the atemporal decisions raises."""
+    index_map = _two_atemporal_index_map()
+    decision = index_map.decisions[0].model_copy(update={"information_set": ["S"]})
+    index_map = index_map.model_copy(update={"decisions": [decision]})
+    with pytest.raises(ValueError, match="information-state keys of decision 'D'"):
+        read_randomised_policy(index_map, _branch_solution(np.outer([0.3, 0.7], [0.2, 0.5, 0.3]).ravel()))
+
+
+def test_read_policy_no_mass() -> None:
+    """All masses at or below `tol` raise."""
+    with pytest.raises(ValueError, match="No branch mass"):
+        read_randomised_policy(_two_atemporal_index_map(), _branch_solution(np.full(6, 1e-12)))
