@@ -11,6 +11,7 @@ Oracles:
    atemporal draws, against evaluation with renewal.
 """
 
+import inspect
 import itertools
 from collections.abc import Callable, Iterator
 from math import prod
@@ -54,6 +55,8 @@ from desdeo.problem.graphical import (
 )
 from desdeo.problem.graphical.index_map import mixed_radix_encode
 from desdeo.problem.schema import Constraint, ConstraintTypeEnum, Problem
+from desdeo.problem.testproblems import ci_healthcare_lp_diagram, ci_healthcare_lp_problem
+from desdeo.problem.testproblems.ci_healthcare_problem import _PURE_BIF_PATH, _load_normalised_network
 from desdeo.tools.cvxpy_solver_interfaces import CVXPYSolver, CVXPYSolverOptions
 from desdeo.tools.generics import SolverResults
 from desdeo.tools.gurobipy_solver_interfaces import GurobipySolver
@@ -981,12 +984,12 @@ def test_value_iteration_mirror_near_one_discount() -> None:
 _SOLVERS = [pytest.param("cvxpy", marks=pytest.mark.cvxpy), pytest.param("gurobipy", marks=pytest.mark.gurobipy)]
 
 
-def _solve(problem: Problem, target: str, solver: str) -> SolverResults:
-    """Solve `problem` for `target` with CVXPY + HiGHS or gurobipy."""
+def _solve(problem: Problem, target: str, solver: str, options: dict[str, object] | None = None) -> SolverResults:
+    """Solve `problem` for `target` with CVXPY + HiGHS or gurobipy, passing `options` to the solver."""
     if solver == "cvxpy":
-        results = CVXPYSolver(problem, CVXPYSolverOptions(solver="HIGHS")).solve(target)
+        results = CVXPYSolver(problem, CVXPYSolverOptions(solver="HIGHS", extra_options=options)).solve(target)
     else:
-        results = GurobipySolver(problem).solve(target)
+        results = GurobipySolver(problem, options).solve(target)
     assert results.success, results.message
     return results
 
@@ -1334,3 +1337,87 @@ def test_read_policy_no_mass() -> None:
     """All masses at or below `tol` raise."""
     with pytest.raises(ValueError, match="No branch mass"):
         read_randomised_policy(_two_atemporal_index_map(), _branch_solution(np.full(6, 1e-12)))
+
+
+_CI_SOLVER_OPTIONS = {
+    "cvxpy": {"primal_feasibility_tolerance": 1e-10, "dual_feasibility_tolerance": 1e-10},
+    "gurobipy": {"FeasibilityTol": 1e-9, "OptimalityTol": 1e-9},
+}
+"""The tightest tolerances, without which the near-zero optima and their read-back policies miss VI."""
+
+
+@pytest.fixture(scope="module")
+def ci_diagram() -> tuple[StationaryDiagram, FlattenedStep]:
+    """`ci_healthcare_lp_diagram` and its flattened step."""
+    diagram = ci_healthcare_lp_diagram()
+    return diagram, flatten_stationary_step(diagram)
+
+
+@pytest.fixture(scope="module")
+def ci_lp(ci_diagram: tuple[StationaryDiagram, FlattenedStep]) -> tuple[Problem, StationaryLPIndexMap]:
+    """`ci_healthcare_lp_problem`, checked against compiling `ci_diagram`."""
+    problem, index_map = ci_healthcare_lp_problem()
+    expected_problem, expected_index_map = compile_stationary_lp(ci_diagram[0])
+    assert index_map == expected_index_map
+    assert [v.symbol for v in problem.variables] == [v.symbol for v in expected_problem.variables]
+    assert [c.symbol for c in problem.constraints] == [c.symbol for c in expected_problem.constraints]
+    assert [o.symbol for o in problem.objectives] == [o.symbol for o in expected_problem.objectives]
+    return problem, index_map
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize(
+    "solver",
+    [
+        pytest.param("cvxpy", marks=[pytest.mark.cvxpy, pytest.mark.githubskip]),
+        pytest.param("gurobipy", marks=[pytest.mark.gurobipy, pytest.mark.githubskip]),
+    ],
+)
+@pytest.mark.parametrize("objective_symbol", ["cost", "dissatisfaction", "mortality", "illness"])
+def test_ci_healthcare_lp_matches_value_iteration(
+    ci_diagram: tuple[StationaryDiagram, FlattenedStep],
+    ci_lp: tuple[Problem, StationaryLPIndexMap],
+    objective_symbol: str,
+    solver: str,
+) -> None:
+    """On ci-healthcare, the LP optimum equals VI and the read-back policies evaluate to it.
+
+    The LP is too large for gurobipy's size-limited license. For near-zero optima, the LP-vs-VI
+    check effectively runs at its 1e-9 absolute tolerance. The read-back value can miss the LP's
+    because flow-constraint residuals at the solver's feasibility tolerance let the LP occupation
+    differ from the read-back policies' exact one, by up to about residual times max utility
+    (measured on cost: Gurobi 9.5e-9, HiGHS 1.4e-9). 2e-8 absolute is an empirical margin over these.
+    """
+    diagram, flat = ci_diagram
+    problem, index_map = ci_lp
+    results = _solve(problem, objective_symbol, solver, _CI_SOLVER_OPTIONS[solver])
+    value = results.optimal_objectives[objective_symbol]
+    assert value == pytest.approx(stationary_value_iteration(flat, objective_symbol)[0], rel=1e-6, abs=1e-9)
+
+    policies = read_randomised_policy(index_map, results.optimal_variables)
+    evaluation = evaluate_stationary_policy(diagram, policies).objectives[objective_symbol]
+    assert evaluation == pytest.approx(value, rel=1e-6, abs=2e-8)
+
+
+@pytest.mark.slow
+@pytest.mark.githubskip
+def test_ci_healthcare_lp_beats_ger_chosen_once(ci_diagram: tuple[StationaryDiagram, FlattenedStep]) -> None:
+    """Each per-step optimum is no worse than that with OMA at its prior and GER chosen once."""
+    diagram, flat = ci_diagram
+    cpt_floor = inspect.signature(ci_healthcare_lp_diagram).parameters["cpt_floor"].default
+    network = _load_normalised_network(_PURE_BIF_PATH, cpt_floor)
+    provisional = StationaryDiagram.with_default_information_sets(
+        network, {"GER": [], "LYHt": None}, diagram.objectives, discount=diagram.discount, renewal=diagram.renewal
+    )
+    reference = StationaryDiagram.with_default_information_sets(
+        network,
+        {"GER": [], "LYHt": full_observation_information_set(provisional, "LYHt")},
+        diagram.objectives,
+        discount=diagram.discount,
+        renewal=diagram.renewal,
+    )
+    reference_flat = flatten_stationary_step(reference)
+    for symbol, maximize in flat.maximize.items():
+        sign = -1.0 if maximize else 1.0
+        value = stationary_value_iteration(flat, symbol)[0]
+        assert sign * value <= sign * stationary_value_iteration(reference_flat, symbol)[0] + 1e-9

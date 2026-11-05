@@ -4,9 +4,14 @@ The network, `datasets/ci_healthcare_2tbn.bif`, is a 2-time-slice Bayesian netwo
 expert estimates of how a patient's illnesses and care evolve. Its states are labelled by index;
 `NODE_NAMES` and `STATE_NAMES` give their meanings. The decisions are acute care `LYHt` and
 whether a geriatric team works at the emergency department, `GER`.
+
+The LP path, `ci_healthcare_lp_diagram`, uses the updated `datasets/ci_healthcare_2tbn_pure.bif`
+by default, with `GER` decided every step as `GERt` and the own doctor `OMA` decided once per
+patient.
 """
 
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 
@@ -16,7 +21,10 @@ from desdeo.problem.graphical import (
     Potential,
     StationaryDiagram,
     StationaryIndexMap,
+    StationaryLPIndexMap,
     compile_stationary_diagram,
+    compile_stationary_lp,
+    full_observation_information_set,
 )
 from desdeo.problem.schema import Problem
 
@@ -80,7 +88,9 @@ PIH_COSTS = [0.0, 1.0, 2.0, 4.0, 6.0]
 LYH_COSTS = [0.0, 1.0, 2.0, 5.0, 3.0, 3.0, 2.0]
 """Placeholder per-step cost of each acute care state, in `STATE_NAMES["LYH"]` order."""
 
-_BIF_PATH = Path(__file__).parent.parent.parent.parent / "datasets/ci_healthcare_2tbn.bif"
+_DATASETS = Path(__file__).parent.parent.parent.parent / "datasets"
+_BIF_PATH = _DATASETS / "ci_healthcare_2tbn.bif"
+_PURE_BIF_PATH = _DATASETS / "ci_healthcare_2tbn_pure.bif"
 
 
 def _objective(symbol: str, name: str, parents: list[str], utility: np.ndarray, unit: str) -> ObjectiveNode:
@@ -93,11 +103,27 @@ def _objective(symbol: str, name: str, parents: list[str], utility: np.ndarray, 
     )
 
 
-def _load_normalised_network(cpt_floor: float) -> DiscreteNetwork:
+def _objectives() -> list[ObjectiveNode]:
+    """The four minimised objectives, as described in `ci_healthcare_stationary_diagram`."""
+    return [
+        _objective(
+            "cost",
+            "Care cost",
+            ["PIHt", "LYHt"],
+            np.add.outer(PIH_COSTS, LYH_COSTS),
+            "cost units per step",
+        ),
+        _objective("dissatisfaction", "Customer dissatisfaction", ["ASTt"], np.arange(3.0), "dissatisfaction level"),
+        _objective("mortality", "Mortality", ["KUOt"], np.array([1.0, 0.0]), "probability per step"),
+        _objective("illness", "Long-term illness severity", ["PISt"], np.arange(4.0), "severity level"),
+    ]
+
+
+def _load_normalised_network(bif_path: Path, cpt_floor: float) -> DiscreteNetwork:
     """The BIF's network with CPT entries below `cpt_floor` set to 0 and each CPT rescaled to sum to 1."""
     from desdeo.problem.graphical.adapters.pyagrum import load_network  # noqa: PLC0415
 
-    network = load_network(_BIF_PATH)
+    network = load_network(bif_path)
     max_cardinality = max(potential.shape[0] for potential in network.potentials.values())
     if not 0 <= cpt_floor < 1 / max_cardinality:
         msg = f"cpt_floor must be in [0, 1/{max_cardinality}), got {cpt_floor}."
@@ -136,22 +162,9 @@ def ci_healthcare_stationary_diagram(
     Returns:
         StationaryDiagram: the diagram.
     """
-    network = _load_normalised_network(cpt_floor)
-
-    objectives = [
-        _objective(
-            "cost",
-            "Care cost",
-            ["PIHt", "LYHt"],
-            np.add.outer(PIH_COSTS, LYH_COSTS),
-            "cost units per step",
-        ),
-        _objective("dissatisfaction", "Customer dissatisfaction", ["ASTt"], np.arange(3.0), "dissatisfaction level"),
-        _objective("mortality", "Mortality", ["KUOt"], np.array([1.0, 0.0]), "probability per step"),
-        _objective("illness", "Long-term illness severity", ["PISt"], np.arange(4.0), "severity level"),
-    ]
+    network = _load_normalised_network(_BIF_PATH, cpt_floor)
     diagram = StationaryDiagram.with_default_information_sets(
-        network, {"LYHt": lyh_information_set, "GER": []}, objectives, discount=discount
+        network, {"LYHt": lyh_information_set, "GER": []}, _objectives(), discount=discount
     )
     names = {"LYHt": NODE_NAMES["LYH"], "GER": NODE_NAMES["GER"]}
     decisions = [decision.model_copy(update={"name": names[decision.symbol]}) for decision in diagram.decisions]
@@ -175,4 +188,89 @@ def ci_healthcare_problem(
         ci_healthcare_stationary_diagram(
             lyh_information_set=lyh_information_set, discount=discount, cpt_floor=cpt_floor
         )
+    )
+
+
+def _renamed(network: DiscreteNetwork, old: str, new: str) -> DiscreteNetwork:
+    """`network` with node `old` renamed to `new` in its variables, arcs and CPTs."""
+
+    def rename(name: str) -> str:
+        return new if name == old else name
+
+    return DiscreteNetwork(
+        name=network.name,
+        variables=[variable.model_copy(update={"name": rename(variable.name)}) for variable in network.variables],
+        arcs=[(rename(parent), rename(child)) for parent, child in network.arcs],
+        potentials={
+            rename(name): potential.model_copy(update={"variables": [rename(v) for v in potential.variables]})
+            for name, potential in network.potentials.items()
+        },
+    )
+
+
+def ci_healthcare_lp_diagram(
+    *, bif_path: Path = _PURE_BIF_PATH, discount: float = 0.95, cpt_floor: float = 1e-8, renewal: bool = True
+) -> StationaryDiagram:
+    """The cross-impact healthcare 2TBN for `compile_stationary_lp`.
+
+    `GER` is renamed to the slice-t decision `GERt`, made every step. `OMA` is an atemporal
+    decision that observes nothing, drawn once per patient. `GERt` and `LYHt` observe their
+    full-observation sets. With `renewal`, a patient who dies (`KUOt` "Yes") is replaced by a new
+    patient drawn from the slice-0 distribution, so the objectives are per-step averages over a
+    constant population. The objectives and the CPT floor are as in
+    `ci_healthcare_stationary_diagram`.
+
+    Args:
+        bif_path: the 2TBN, with no arcs from `GER` into slice-0 nodes, since `GERt` is slice-t;
+            the default is `datasets/ci_healthcare_2tbn_pure.bif`. The pure and reduced files
+            qualify; the original's `GER` -> `AST0` arc is rejected by `classify_2tbn`.
+        discount: the discount factor gamma, in (0, 1).
+        cpt_floor: entries below it are set to 0, in [0, 1 / largest node cardinality).
+        renewal: whether death renews the patient.
+
+    Returns:
+        StationaryDiagram: the diagram.
+    """
+    network = _renamed(_load_normalised_network(bif_path, cpt_floor), "GER", "GERt")
+    objectives = _objectives()
+    renewal_states = {"KUOt": [0]} if renewal else None
+    provisional = StationaryDiagram.with_default_information_sets(
+        network, {"OMA": [], "GERt": None, "LYHt": None}, objectives, discount=discount, renewal=renewal_states
+    )
+    information_sets = {
+        "OMA": [],
+        "GERt": full_observation_information_set(provisional, "GERt"),
+        "LYHt": full_observation_information_set(provisional, "LYHt"),
+    }
+    diagram = StationaryDiagram.with_default_information_sets(
+        network, information_sets, objectives, discount=discount, renewal=renewal_states
+    )
+    names = {"OMA": NODE_NAMES["OMA"], "GERt": NODE_NAMES["GER"], "LYHt": NODE_NAMES["LYH"]}
+    decisions = [decision.model_copy(update={"name": names[decision.symbol]}) for decision in diagram.decisions]
+    return diagram.model_copy(update={"decisions": decisions})
+
+
+def ci_healthcare_lp_problem(
+    *,
+    bif_path: Path = _PURE_BIF_PATH,
+    discount: float = 0.95,
+    cpt_floor: float = 1e-8,
+    renewal: bool = True,
+    atemporal: Literal["randomised", "deterministic"] = "randomised",
+) -> tuple[Problem, StationaryLPIndexMap]:
+    """`ci_healthcare_lp_diagram` compiled with `compile_stationary_lp`.
+
+    Args:
+        bif_path: as in `ci_healthcare_lp_diagram`.
+        discount: as in `ci_healthcare_lp_diagram`.
+        cpt_floor: as in `ci_healthcare_lp_diagram`.
+        renewal: as in `ci_healthcare_lp_diagram`.
+        atemporal: as in `compile_stationary_lp`.
+
+    Returns:
+        tuple[Problem, StationaryLPIndexMap]: the LP and its bookkeeping.
+    """
+    return compile_stationary_lp(
+        ci_healthcare_lp_diagram(bif_path=bif_path, discount=discount, cpt_floor=cpt_floor, renewal=renewal),
+        atemporal=atemporal,
     )
