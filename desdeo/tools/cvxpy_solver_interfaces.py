@@ -1,6 +1,7 @@
 """Defines solver interfaces for cvxpy."""
 
 import cvxpy as cp
+import numpy as np
 from pydantic import BaseModel, Field
 
 from desdeo.problem import (
@@ -65,8 +66,11 @@ def parse_cvxpy_optimizer_results(problem: Problem, evaluator: CVXPYEvaluator) -
 
     variable_values = {var.symbol: results[var.symbol] for var in problem.variables}
     objective_values = {obj.symbol: results[obj.symbol] for obj in problem.objectives}
+    # Vector-valued constraints give arrays and scalar ones numpy scalars; lists and floats serialise.
     constraint_values = (
-        {con.symbol: results[con.symbol] for con in problem.constraints} if problem.constraints is not None else None
+        {con.symbol: np.asarray(results[con.symbol]).tolist() for con in problem.constraints}
+        if problem.constraints is not None
+        else None
     )
     extra_func_values = (
         {extra.symbol: results[extra.symbol] for extra in problem.extra_funcs}
