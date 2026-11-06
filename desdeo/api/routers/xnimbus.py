@@ -40,7 +40,7 @@ from desdeo.api.routers.generic import solve_intermediate
 from desdeo.api.routers.nimbus import (
     get_multipliers_info as nimbus_get_multipliers_info,
 )
-from desdeo.api.routers.problem import check_solver
+from desdeo.api.routers.problem import check_solver, effective_solver_options
 from desdeo.mcdm.nimbus import generate_starting_point, solve_sub_problems
 from desdeo.problem import Problem
 from desdeo.tools import SolverResults
@@ -72,7 +72,7 @@ def solve_solutions(
         num_desired=request.num_desired,
         scalarization_options=request.scalarization_options,
         solver=solver,
-        solver_options=request.solver_options,
+        solver_options=effective_solver_options(problem_db, request.solver_options),
     )
 
     nimbus_state = NIMBUSClassificationState(
@@ -152,7 +152,7 @@ def initialize(
         reference_point=starting_point,
         scalarization_options=request.scalarization_options,
         solver=solver,
-        solver_options=request.solver_options,
+        solver_options=effective_solver_options(problem_db, request.solver_options),
     )
 
     initialization_state = NIMBUSInitializationState(

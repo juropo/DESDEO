@@ -329,6 +329,8 @@ if __name__ == "__main__":
                     "who dies is replaced by a new one. Objectives are per-step averages."
                 ),
                 solver="gurobipy",
+                # Gurobi's minimum tolerances, so the solutions match value iteration closely.
+                solver_options={"FeasibilityTol": 1e-9, "OptimalityTol": 1e-9},
             )
             print(f"ci-healthcare stationary LP problem added (id={ci_db.id}) in {time.perf_counter() - start:.1f} s.")
 

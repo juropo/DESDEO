@@ -3,7 +3,7 @@
 import json
 from pathlib import Path
 from types import UnionType
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from fastapi import UploadFile
 from pydantic import BaseModel, ConfigDict, create_model, field_validator
@@ -60,6 +60,9 @@ class ProblemSelectSolverRequest(SQLModel):
     problem_id: int = Field(description="ID of the problem that the solver is assigned to.")
     solver_string_representation: str = Field(
         description=f"One of the following: {[x for x, _ in available_solvers.items()]}"
+    )
+    solver_options: dict[str, Any] | None = Field(
+        default=None, description="Options stored with the solver and passed to it when solving."
     )
 
 
@@ -318,6 +321,11 @@ class SolverSelectionMetadata(SQLModel, table=True):
 
     # The solver's string representation is used in endpoints to fetch the proper solver from available solvers.
     solver_string_representation: str = Field(description="The string representation of the selected solver.")
+    solver_options: dict[str, Any] | None = Field(
+        sa_column=Column(JSON),
+        default=None,
+        description="Options passed to the solver; requests' solver options override them per key.",
+    )
 
     metadata_instance: "ProblemMetaDataDB" = Relationship(back_populates="solver_selection_metadata")
 

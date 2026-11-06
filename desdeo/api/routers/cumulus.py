@@ -8,6 +8,7 @@ from typing import Annotated, Any
 import numpy as np
 import polars as pl
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+from pydantic import BaseModel
 from sqlmodel import Session, select
 
 from desdeo.api.db import engine, get_session
@@ -62,7 +63,7 @@ from desdeo.api.models.problem import (
 from desdeo.api.models.scenario import ScenarioModelDB
 from desdeo.api.models.state import CumulusClassificationState
 from desdeo.api.routers.graphical import _fetch_graphical_metadata
-from desdeo.api.routers.problem import check_solver
+from desdeo.api.routers.problem import check_solver, effective_solver_options
 from desdeo.api.routers.solution_description import _substitute_values, validate_description_parts
 from desdeo.api.routers.user_authentication import get_current_user
 from desdeo.mcdm.cumulus import (
@@ -329,8 +330,9 @@ def _build_combined_problem_and_initialize(
 
     # Estimate ideal/nadir via payoff table so scalarizations are well-scaled.
     solver = check_solver(problem_db=base_problem_db)
+    solver_options = effective_solver_options(base_problem_db, request.solver_options)
     try:
-        estimated_ideal, estimated_nadir = payoff_table_method(combined_problem, solver)
+        estimated_ideal, estimated_nadir = payoff_table_method(combined_problem, solver, solver_options=solver_options)
         combined_problem = combined_problem.update_ideal_and_nadir(estimated_ideal, estimated_nadir)
     except Exception:  # noqa: S110
         pass  # proceed without ideal/nadir if payoff table fails
@@ -437,7 +439,7 @@ def solve_solutions(
         scalarizations=scalarizations,
         scalarization_options=request.scalarization_options,
         solver=solver,
-        solver_options=request.solver_options,
+        solver_options=effective_solver_options(problem_db, request.solver_options),
         soft_constraints=soft_constraints,
         scenario_model=scenario_model,
     )
@@ -536,6 +538,7 @@ def initialize(
     parent_state = context.parent_state
 
     solver = check_solver(problem_db=problem_db)
+    solver_options = effective_solver_options(problem_db, request.solver_options)
     problem = load_problem(problem_db)
 
     # Tracked per field, so the fallback below never overwrites a value that is already set.
@@ -547,7 +550,9 @@ def initialize(
         # result, as `_build_combined_problem_and_initialize` does. The estimate depends only on
         # the problem, so it is persisted regardless of who owns the problem.
         try:
-            estimated_ideal, estimated_nadir = payoff_table_method(problem, solver, require_success=True)
+            estimated_ideal, estimated_nadir = payoff_table_method(
+                problem, solver, require_success=True, solver_options=solver_options
+            )
         except Exception:  # noqa: S110
             pass  # proceed without ideal/nadir -- generate_starting_point raises its own clean error
         else:
@@ -598,7 +603,7 @@ def initialize(
         reference_point=starting_point,
         scalarization_options=request.scalarization_options,
         solver=solver,
-        solver_options=request.solver_options,
+        solver_options=solver_options,
     )
 
     effective_original_problem_id = (
@@ -1020,7 +1025,7 @@ def solve_intermediate(
         num_desired=request.num_desired or 1,
         scalarization_options=request.scalarization_options,
         solver=solver,
-        solver_options=request.solver_options,
+        solver_options=effective_solver_options(problem_db, request.solver_options),
     )
 
     intermediate_state = IntermediateSolutionState(
@@ -1395,6 +1400,8 @@ def _run_modification_checks_background(
     solver_class,
     probe_constraint_symbols: list[str],
     feasibility_witnessed: bool,
+    *,
+    solver_options: BaseModel | dict[str, Any] | None = None,
 ) -> None:
     """Background: confirm the modified problem is feasible and bounded, and refresh its ideal and nadir.
 
@@ -1454,7 +1461,9 @@ def _run_modification_checks_background(
                 soft = [c for c in problem.constraints or [] if c.symbol in set(probe_constraint_symbols)]
                 hard = [c for c in problem.constraints or [] if c.symbol not in set(probe_constraint_symbols)]
                 base_problem = problem.model_copy(update={"constraints": hard or None})
-                feasible, _, probe_message = _probe_new_problem_feasibility(base_problem, soft, effective_solver)
+                feasible, _, probe_message = _probe_new_problem_feasibility(
+                    base_problem, soft, effective_solver, solver_options
+                )
                 if not feasible:
                     discard(probe_message)
                     return
@@ -1471,7 +1480,7 @@ def _run_modification_checks_background(
 
             try:
                 estimated_ideal, estimated_nadir = payoff_table_method(
-                    problem, solver=effective_solver, require_success=True
+                    problem, solver=effective_solver, require_success=True, solver_options=solver_options
                 )
             except Exception as e:
                 discard(
@@ -1512,6 +1521,8 @@ def modify_problem(
     interactive_session = context.interactive_session
     parent_state = context.parent_state
 
+    solver_class = check_solver(problem_db=problem_db)
+    solver_options = effective_solver_options(problem_db)
     problem = load_problem(problem_db)
     graphical_meta = find_graphical_metadata(problem_db.id, db_session)
     modified_problem = apply_problem_modifications(problem, request.modifications, db_session, graphical_meta)
@@ -1583,8 +1594,6 @@ def modify_problem(
     db_session.commit()
     db_session.refresh(state)
 
-    solver_class = check_solver(problem_db=problem_db)
-
     background_tasks.add_task(
         _run_modification_checks_background,
         new_problem_db.id,
@@ -1592,6 +1601,7 @@ def modify_problem(
         solver_class,
         [c.symbol for c in changed_constraints],
         current_solution_feasible,
+        solver_options=solver_options,
     )
 
     return CumulusModificationResponse(
@@ -1625,6 +1635,8 @@ def create_hypothetical(
     problem_db = context.problem_db
     parent_state = context.parent_state
 
+    solver_class = check_solver(problem_db=problem_db)
+    solver_options = effective_solver_options(problem_db)
     meta = _fetch_graphical_metadata(problem_db.id, db_session)
     network = DiscreteNetwork.model_validate_json(meta.network_json)
     annotation = DecisionAnnotation.model_validate_json(meta.annotation_json)
@@ -1696,9 +1708,10 @@ def create_hypothetical(
         _run_modification_checks_background,
         new_problem_db.id,
         state.base_state.id,
-        check_solver(problem_db=problem_db),
+        solver_class,
         assumed_decision_symbols,
         feasibility_witnessed=False,
+        solver_options=solver_options,
     )
 
     return CumulusModificationResponse(

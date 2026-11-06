@@ -36,7 +36,7 @@ from desdeo.api.models import (
     VotingPreference,
 )
 from desdeo.api.routers.gdm.gdm_aggregate import manager
-from desdeo.api.routers.problem import check_solver
+from desdeo.api.routers.problem import check_solver, effective_solver_options
 from desdeo.api.routers.user_authentication import get_current_user
 from desdeo.mcdm.nimbus import generate_starting_point
 from desdeo.problem import Problem
@@ -57,15 +57,14 @@ def gnimbus_initialize(
     session: Annotated[Session, Depends(get_session)],
 ):
     """Initialize the problem for GNIMBUS."""
-    #Check that all pre-conditions are all right
+    # Check that all pre-conditions are all right
     group = session.exec(select(Group).where(Group.id == request.group_id)).first()
     if group is None:
         raise HTTPException(detail=f"No group with ID {request.group_id} found!", status_code=status.HTTP_404_NOT_FOUND)
     if not (user.id in group.user_ids or user.id is group.owner_id):
         raise HTTPException(detail="Unauthorized user", status_code=status.HTTP_401_UNAUTHORIZED)
 
-    head_iteration = session.exec(select(GroupIteration)
-                                  .where(GroupIteration.id == group.head_iteration_id)).first()
+    head_iteration = session.exec(select(GroupIteration).where(GroupIteration.id == group.head_iteration_id)).first()
     if head_iteration is not None:
         raise HTTPException(detail="Group problem already initialized!", status_code=status.HTTP_400_BAD_REQUEST)
 
@@ -81,7 +80,9 @@ def gnimbus_initialize(
 
     # Create the first iteration for the group
     # As if we just voted for a result, but really is just the starting point.
-    starting_point = generate_starting_point(problem=problem, solver=solver)
+    starting_point = generate_starting_point(
+        problem=problem, solver=solver, solver_options=effective_solver_options(problem_db)
+    )
 
     gnimbus_state = GNIMBUSVotingState(votes={}, solver_results=[starting_point])
 
@@ -168,8 +169,7 @@ def get_latest_results(
 
     nores_exp = HTTPException(detail="No results found!", status_code=status.HTTP_404_NOT_FOUND)
 
-    head_iteration = session.exec(select(GroupIteration)
-                                  .where(GroupIteration.id == group.head_iteration_id)).first()
+    head_iteration = session.exec(select(GroupIteration).where(GroupIteration.id == group.head_iteration_id)).first()
 
     try:
         iteration = head_iteration.parent
@@ -220,7 +220,7 @@ def get_latest_results(
 
 
 @router.post("/all_iterations")
-def full_iteration(  # noqa: C901, PLR0912
+def full_iteration(  # noqa: C901
     request: GroupInfoRequest,
     user: Annotated[User, Depends(get_current_user)],
     session: Annotated[Session, Depends(get_session)],
@@ -247,8 +247,7 @@ def full_iteration(  # noqa: C901, PLR0912
     if user.id not in group.user_ids and user.id is not group.owner_id:
         raise HTTPException(detail="Unauthorized user", status_code=status.HTTP_401_UNAUTHORIZED)
 
-    head_iteration = session.exec(select(GroupIteration)
-                                  .where(GroupIteration.id == group.head_iteration_id)).first()
+    head_iteration = session.exec(select(GroupIteration).where(GroupIteration.id == group.head_iteration_id)).first()
 
     try:
         groupiter = head_iteration.parent
@@ -367,7 +366,7 @@ async def switch_phase(
     session: Annotated[Session, Depends(get_session)],
 ) -> GNIMBUSSwitchPhaseResponse:
     """Switch the phase from one to another. "learning", "crp", "decision" and "compromise" phases are allowed."""
-    #Preliminary checks etc.
+    # Preliminary checks etc.
     if request.new_phase not in ["learning", "crp", "decision", "compromise"]:
         raise HTTPException(
             detail=f"Undefined phase: {request.new_phase}! Can only be {['learning', 'crp', 'decision', 'compromise']}",
@@ -378,8 +377,7 @@ async def switch_phase(
         raise HTTPException(detail=f"No group with ID {request.group_id} found", status_code=status.HTTP_404_NOT_FOUND)
     if user.id is not group.owner_id:
         raise HTTPException(detail="Unauthorized user.", status_code=status.HTTP_401_UNAUTHORIZED)
-    iteration = session.exec(select(GroupIteration)
-                             .where(GroupIteration.id == group.head_iteration_id)).first()
+    iteration = session.exec(select(GroupIteration).where(GroupIteration.id == group.head_iteration_id)).first()
     if iteration is None:
         raise HTTPException(
             detail="There's no iterations! Did you forget to initialize the problem?",
@@ -430,8 +428,7 @@ def get_phase(
     if user.id not in g:
         raise HTTPException(detail="Unauthorized user.", status_code=status.HTTP_401_UNAUTHORIZED)
 
-    current_iteration= session.exec(select(GroupIteration)
-                                    .where(GroupIteration.id == group.head_iteration_id)).first()
+    current_iteration = session.exec(select(GroupIteration).where(GroupIteration.id == group.head_iteration_id)).first()
     if current_iteration is None:
         raise not_init_error
 
@@ -439,6 +436,7 @@ def get_phase(
         current_iteration = current_iteration.parent
 
     return JSONResponse(content={"phase": current_iteration.info_container.phase}, status_code=status.HTTP_200_OK)
+
 
 def get_preference_item(iteration):
     """Returns an empty preference item for adding preferences; The preferences are the next preferences.
@@ -452,13 +450,8 @@ def get_preference_item(iteration):
     item = iteration.preferences
     if type(item) is OptimizationPreference:
         if item.phase in ["decision", "compromise"]:
-            return EndProcessPreference(
-                success=None,
-                set_preferences={}
-            )
-        return VotingPreference(
-            set_preferences={}
-        )
+            return EndProcessPreference(success=None, set_preferences={})
+        return VotingPreference(set_preferences={})
     return OptimizationPreference(
         phase=iteration.parent.preferences.phase if iteration.parent.preferences.phase is not None else "learning",
         set_preferences={},
@@ -486,43 +479,32 @@ async def revert_iteration(
     """
     group: Group = session.exec(select(Group).where(Group.id == request.group_id)).first()
     if not group:
-        raise HTTPException(
-            detail=f"No group with ID {request.group_id}!",
-            status_code=status.HTTP_404_NOT_FOUND
-        )
+        raise HTTPException(detail=f"No group with ID {request.group_id}!", status_code=status.HTTP_404_NOT_FOUND)
     if group.owner_id is not user.id:
-        raise HTTPException(
-            detail="Unauthorized user!",
-            status_code=status.HTTP_401_UNAUTHORIZED
-        )
+        raise HTTPException(detail="Unauthorized user!", status_code=status.HTTP_401_UNAUTHORIZED)
 
-    current_iteration = session.exec(select(GroupIteration)
-                                     .where(GroupIteration.id == group.head_iteration_id)).first()
+    current_iteration = session.exec(select(GroupIteration).where(GroupIteration.id == group.head_iteration_id)).first()
 
     if not current_iteration:
-        raise HTTPException(
-            detail="There's no head iteration",
-            status_code=status.HTTP_404_NOT_FOUND
-        )
+        raise HTTPException(detail="There's no head iteration", status_code=status.HTTP_404_NOT_FOUND)
     head_iteration_type = type(current_iteration.info_container)
     if head_iteration_type in [VotingPreference, EndProcessPreference]:
         raise HTTPException(
             detail="Complete the iteration before reverting. Sorry for the inconvenience.",
-            status_code=status.HTTP_400_BAD_REQUEST
+            status_code=status.HTTP_400_BAD_REQUEST,
         )
 
     # Get the GroupIteration corresponding to the requests state id
     target_iteration = session.exec(select(GroupIteration).where(GroupIteration.state_id == request.state_id)).first()
     if not target_iteration:
         raise HTTPException(
-            detail=f"There's no iteration with state ID {request.state_id}!",
-            status_code=status.HTTP_404_NOT_FOUND
+            detail=f"There's no iteration with state ID {request.state_id}!", status_code=status.HTTP_404_NOT_FOUND
         )
     target_iteration_type = type(target_iteration.info_container)
     if target_iteration_type == OptimizationPreference:
         raise HTTPException(
             detail="You can only revert to a result of a complete iteration. Sorry for the inconvenience.",
-            status_code=status.HTTP_400_BAD_REQUEST
+            status_code=status.HTTP_400_BAD_REQUEST,
         )
 
     # We must "artificially" create some history, so that we can later on fetch stuff seamlessly,
@@ -535,7 +517,7 @@ async def revert_iteration(
         notified=target_iteration.parent.notified.copy(),
         state_id=target_iteration.parent.state_id,
         parent_id=current_iteration.parent.id,
-        parent=current_iteration.parent
+        parent=current_iteration.parent,
     )
 
     session.add(new_parent_1)
@@ -549,7 +531,7 @@ async def revert_iteration(
         notified=target_iteration.notified.copy(),
         state_id=target_iteration.state_id,
         parent_id=new_parent_1.id,
-        parent=new_parent_1
+        parent=new_parent_1,
     )
 
     session.add(new_parent_2)
@@ -561,9 +543,10 @@ async def revert_iteration(
         problem_id=group.problem_id,
         group_id=group.id,
         info_container=OptimizationPreference(
-            phase=target_iteration.parent.info_container.phase \
-                if target_iteration.parent.info_container.phase is not None else "learning",
-            set_preferences={}
+            phase=target_iteration.parent.info_container.phase
+            if target_iteration.parent.info_container.phase is not None
+            else "learning",
+            set_preferences={},
         ),
         notified={},
         parent_id=new_parent_2.id,
@@ -587,5 +570,5 @@ async def revert_iteration(
         content={
             "message": "Iteration reversed!",
         },
-        status_code=status.HTTP_200_OK
+        status_code=status.HTTP_200_OK,
     )

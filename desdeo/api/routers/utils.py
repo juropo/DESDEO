@@ -216,6 +216,7 @@ def copy_problem_metadata(source_problem_db: ProblemDB, target_problem_db: Probl
             SolverSelectionMetadata(
                 metadata_id=new_meta.id,
                 solver_string_representation=item.solver_string_representation,
+                solver_options=item.solver_options,
             )
         )
     for item in source_meta.site_selection_metadata or []:

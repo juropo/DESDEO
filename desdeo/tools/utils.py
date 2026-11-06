@@ -1,10 +1,13 @@
 """General utilities related to solvers."""
 
+import logging
 import shutil
 from collections.abc import Callable
+from typing import Any
 
 import numpy as np
 import polars as pl
+from pydantic import BaseModel, ValidationError
 
 from desdeo.problem import (
     ObjectiveTypeEnum,
@@ -35,6 +38,8 @@ from desdeo.tools.scipy_solver_interfaces import (
     ScipyMinimizeOptions,
     ScipyMinimizeSolver,
 )
+
+logger = logging.getLogger(__name__)
 
 available_solvers = {
     "scipy_minimize": {
@@ -89,7 +94,60 @@ available_solvers = {
         "heuristic": False,
     },
 }
-"""Solvers by name. `heuristic` marks stochastic ones, whose results are not guaranteed optimal."""
+"""Solvers by name. `heuristic` marks stochastic ones, whose results are not guaranteed optimal.
+
+Stored option keys an `options` model doesn't declare don't reach the solver (see `normalize_solver_options`);
+solvers with `options: None` get their dict as is.
+"""
+
+
+def normalize_solver_options(solver_string_representation: str, options: dict[str, Any]) -> dict[str, Any]:
+    """Validate `options` against the solver's options model and return the set ones by field name.
+
+    Keys may be field names or aliases. Keys the model doesn't declare are kept as they are, with a
+    warning unless the model allows extras. Options of solvers without an options model are returned as is.
+
+    Args:
+        solver_string_representation (str): a key of `available_solvers`.
+        options (dict[str, Any]): the options to validate.
+
+    Raises:
+        ValueError: `options` don't validate against the model.
+
+    Returns:
+        dict[str, Any]: the options that were set, keyed by field name, followed by the undeclared ones.
+    """
+    options_model = available_solvers[solver_string_representation]["options"]
+    if options_model is None:
+        return options
+    unknown = {}
+    if options_model.model_config.get("extra") != "allow":
+        fields = options_model.model_fields
+        known = set(fields) | {field.alias for field in fields.values() if field.alias is not None}
+        unknown = {key: value for key, value in options.items() if key not in known}
+        doubled = sorted(name for name, field in fields.items() if name in options and field.alias in options)
+        if doubled:
+            logger.warning(
+                "Options %s of solver %r are given by both name and alias; the alias wins.",
+                doubled,
+                solver_string_representation,
+            )
+        # Undeclared keys are kept but dropped by `model_validate` at solve time (the options models don't
+        # allow extras), so they don't reach model-based solvers.
+        if unknown:
+            logger.warning(
+                "Options %s are not declared by the options model of solver %r; they are kept as given.",
+                sorted(unknown),
+                solver_string_representation,
+            )
+    try:
+        validated = options_model.model_validate(
+            {key: value for key, value in options.items() if key not in unknown}, by_name=True
+        )
+    except ValidationError as e:
+        msg = f"Invalid options for solver {solver_string_representation!r}: {e}"
+        raise ValueError(msg) from e
+    return validated.model_dump(exclude_unset=True) | unknown
 
 
 def is_heuristic_solver(solver) -> bool:
@@ -382,7 +440,11 @@ def flip_maximized_objective_values(problem: Problem, objective_values: dict[str
 
 
 def payoff_table_method(
-    problem: Problem, solver: BaseSolver = None, *, require_success: bool = False
+    problem: Problem,
+    solver: BaseSolver = None,
+    *,
+    require_success: bool = False,
+    solver_options: BaseModel | dict[str, Any] | None = None,
 ) -> tuple[dict[str, float], dict[str, float]]:
     """Solves a representation for the ideal and nadir points for a multiobjective optimization problem.
 
@@ -391,6 +453,8 @@ def payoff_table_method(
         solver (BaseSolver): The solver to be used in solving the points. Defaults to None.
         require_success (bool): raise instead of using the result when a solve is unsuccessful or
             yields non-finite objective values, e.g. because an objective is unbounded. Defaults to False.
+        solver_options (BaseModel | dict[str, Any] | None): options passed to the solver's constructor, if given.
+            Defaults to None.
 
     Raises:
         ValueError: `require_success` is set and a solve failed.
@@ -399,7 +463,7 @@ def payoff_table_method(
         tuple[dict[str, float], dict[str, float]]: The estimated ideal and nadir points.
     """
     solver = solver if solver is not None else guess_best_solver(problem)
-    solver = solver(problem)
+    solver = solver(problem, solver_options) if solver_options else solver(problem)
 
     k = len(problem.objectives)
     po_table = np.zeros((k, k))
