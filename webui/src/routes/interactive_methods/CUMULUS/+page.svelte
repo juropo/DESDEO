@@ -2147,9 +2147,9 @@
 						<p class="text-muted-foreground text-xs">{network_stationary_policy_label}</p>
 						<div class="space-y-1">
 							<p class="text-muted-foreground text-xs font-medium">
-								{network_stationary_has_solution ? "Solution's" : "Status quo's"} per-step values{stationary
-									? ` (discount ${stationary.discount})`
-									: ''}
+								{network_stationary_has_solution ? "Solution's" : "Status quo's"} per-step values (unconditional{stationary
+									? `, discount ${stationary.discount}`
+									: ''})
 							</p>
 							{#each network_real_objectives as { node, symbol, maximize } (node.id)}
 								{@const value = symbol !== undefined ? stationary?.objectives[symbol] : undefined}

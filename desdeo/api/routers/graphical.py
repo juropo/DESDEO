@@ -171,7 +171,8 @@ class WhatIfResponse(BaseModel):
     """Response for `POST /graphical/whatif`."""
 
     posteriors: dict[str, list[float]]
-    """Chance-node name -> per-state probability, in that node's own `labels` order."""
+    """Chance-node name -> per-state probability, in that node's own `labels` order. For a
+    stationary problem, under the evidence-conditioned occupation of steps."""
     policy: dict[str, str] | None = None
     """Decision symbol -> chosen state label, only for decisions whose information set is fully
     pinned by the evidence (see `_read_policy`; with `solution`, `_decode_solved_policy`). `None`
@@ -187,7 +188,8 @@ class WhatIfResponse(BaseModel):
     decision_posteriors: dict[str, list[float]] = {}
     """With `solution`: followed decision symbol -> per-state probability under the solution's policy,
     in the decision's `states` order. Omits decisions pinned by the request and off-policy ones. Also
-    holds, one-hot, the decisions a hypothetical problem assumes."""
+    holds, one-hot, the decisions a hypothetical problem assumes. For a stationary problem, present
+    with or without `solution` and includes pinned decisions, one-hot."""
     stationary: StationaryWhatIfInfo | None = None
     """For a stationary problem only (see `_stationary_whatif`)."""
 
@@ -952,6 +954,10 @@ def whatif(
     decisions a hypothetical problem assumes are always pinned. A stationary problem is handled by
     `_stationary_whatif`.
 
+    For a stationary problem, `evidence` and `decision_evidence` condition on the patient-steps
+    where they hold and don't change the policy, which is `solution`'s or, without it, the status
+    quo. `utilities` are conditional on the evidence; `stationary.objectives` are unconditional.
+
     Raises:
         HTTPException: 404 if the problem or session isn't found or visible, or the problem has
             neither kind of graphical metadata, or for an unusable `solution` (see
@@ -1084,16 +1090,26 @@ def _stationary_structure(diagram: StationaryDiagram) -> StructureResponse:
 class _StationaryPolicy:
     """A stationary problem's policies and their unconditional values."""
 
-    policies: dict[str, RandomisedPolicy]
-    """Decision symbol -> its read-back policy; empty for the status quo."""
+    policies: dict[str, tuple[RandomisedPolicy, np.ndarray]]
+    """Decision symbol -> its read-back policy with empty `probabilities`, and those probabilities
+    as an array with a row per information state; empty for the status quo."""
     info: StationaryWhatIfInfo
 
+    def randomised_policies(self) -> dict[str, RandomisedPolicy]:
+        """`policies` with their `probabilities` filled in."""
+        return {
+            symbol: policy.model_copy(update={"probabilities": dict(enumerate(rows.tolist()))})
+            for symbol, (policy, rows) in self.policies.items()
+        }
 
-_STATIONARY_CACHE_SIZE = 16
+
+_STATIONARY_CACHE_SIZE = 4
 """Maximum number of cached `_StationaryPolicy`s; least-recently-used are evicted first."""
 
-_stationary_cache: OrderedDict[tuple[int, int | None, int | None], _StationaryPolicy] = OrderedDict()
-"""(problem id, state id, solution index) -> its `_StationaryPolicy`; `None` ids for the status quo."""
+_stationary_cache: OrderedDict[tuple[int, int | None, int | None, str, str | None], _StationaryPolicy] = OrderedDict()
+"""(problem id, state id, solution index, metadata hash, state creation time) -> its
+`_StationaryPolicy`; `None` ids and time for the status quo. The hash and time tell apart rows
+that reuse the ids of rows deleted outside this process."""
 
 _stationary_cache_lock = threading.Lock()
 
@@ -1121,6 +1137,8 @@ def _status_quo_arrival_shares(diagram: StationaryDiagram) -> dict[str, list[flo
     """Atemporal decision symbol -> its status-quo marginal, contracting the CPTs of its ancestors.
 
     An atemporal node's ancestors are all atemporal, so this is its distribution for an arriving patient.
+    `initial_distribution` doesn't apply: with it set, `evaluate_stationary_policy` rejects the status
+    quo of any atemporal decision that a step or an objective depends on.
     """
     factors = _network_factors(diagram.network)
     parents = {name: axes[1:] for name, (axes, _) in factors.items()}
@@ -1146,12 +1164,14 @@ def _stationary_policy(
             `ValueError` or a `NotImplementedError`.
     """
     solution = request.solution
+    content = _content_hash(meta.diagram_json, meta.index_map_json)
     if solution is None:
-        key = (request.problem_id, None, None)
+        key = (request.problem_id, None, None, content, None)
     else:
         # Checked on every request, since a cached entry may have been filled for another user.
-        _fetch_solution_state(solution, request.problem_id, user, db_session)
-        key = (request.problem_id, solution.state_id, solution.solution_index)
+        state = _fetch_solution_state(solution, request.problem_id, user, db_session)
+        created = state.base_state.date_time if state.base_state is not None else None
+        key = (request.problem_id, solution.state_id, solution.solution_index, content, created)
     with _stationary_cache_lock:
         if key in _stationary_cache:
             _stationary_cache.move_to_end(key)
@@ -1179,7 +1199,13 @@ def _stationary_policy(
         raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail=str(e)) from e
 
     entry = _StationaryPolicy(
-        policies=policies,
+        policies={
+            symbol: (
+                policy.model_copy(update={"probabilities": {}}),
+                np.array([policy.probabilities[index] for index in range(len(policy.probabilities))]),
+            )
+            for symbol, policy in policies.items()
+        },
         info=StationaryWhatIfInfo(objectives=objectives, arrival_shares=arrival_shares, discount=diagram.discount),
     )
     with _stationary_cache_lock:
@@ -1250,7 +1276,7 @@ def _stationary_whatif(
     evidence = _stationary_evidence(diagram, request)
     policy = _stationary_policy(request, meta, diagram, user, db_session)
     try:
-        result = stationary_step_posteriors(diagram, policy.policies, evidence)
+        result = stationary_step_posteriors(diagram, policy.randomised_policies(), evidence)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
     except NotImplementedError as e:

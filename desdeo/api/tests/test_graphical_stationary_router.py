@@ -7,7 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlmodel import Session, select
 
-from desdeo.api.models import CumulusClassificationState, ProblemDB, ReferencePoint, StateDB
+from desdeo.api.models import CumulusClassificationState, ProblemDB, ReferencePoint, StateDB, StationaryModelMetaData
 from desdeo.api.routers import graphical as graphical_router
 from desdeo.api.routers.utils import load_problem
 from desdeo.api.utils.stationary import add_stationary_lp_problem
@@ -403,3 +403,42 @@ def test_cache_evicts_deleted_state(client: TestClient, session_and_user: dict):
     resp = post_json(client, "/graphical/whatif", ref, token)
     assert resp.status_code == 200
     assert resp.json()["stationary"]["objectives"] == pytest.approx(result_x.optimal_objectives, abs=1e-6)
+
+
+@pytest.mark.cvxpy
+def test_cache_misses_replaced_state(client: TestClient, session_and_user: dict):
+    """A state replaced in place under the same ids, as by a reseed, misses the cache."""
+    token = login(client)
+    session: Session = session_and_user["session"]
+    problem_db, _, state = _solved(session_and_user)
+    ref = {"problem_id": problem_db.id, "solution": {"state_id": state.id, "solution_index": 0}}
+    resp1 = post_json(client, "/graphical/whatif", ref, token)
+    assert resp1.status_code == 200
+    result_x = CVXPYSolver(load_problem(problem_db), CVXPYSolverOptions(solver="HIGHS")).solve("x")
+    state.state.solver_results = [result_x]
+    state.base_state.date_time = "2000-01-01T00:00:00"
+    session.add(state)
+    session.commit()
+    resp2 = post_json(client, "/graphical/whatif", ref, token)
+    assert resp2.status_code == 200
+    assert resp2.json()["stationary"]["objectives"] == pytest.approx(result_x.optimal_objectives, abs=1e-6)
+    assert resp2.json()["stationary"]["objectives"] != resp1.json()["stationary"]["objectives"]
+
+
+def test_cache_misses_replaced_metadata(client: TestClient, session_and_user: dict):
+    """Metadata replaced in place under the same ids, as by a reseed, misses the cache."""
+    token = login(client)
+    session: Session = session_and_user["session"]
+    user = session_and_user["user"]
+    problem_db = add_stationary_lp_problem(session, user, _diagram(), name="Stationary chain")
+    resp1 = post_json(client, "/graphical/whatif", {"problem_id": problem_db.id}, token)
+    assert resp1.status_code == 200
+    assert resp1.json()["stationary"]["discount"] == 0.9
+    metas = session.exec(select(StationaryModelMetaData)).all()
+    meta = next(m for m in metas if m.metadata_instance.problem_id == problem_db.id)
+    meta.diagram_json = _diagram().model_copy(update={"discount": 0.8}).model_dump_json()
+    session.add(meta)
+    session.commit()
+    resp2 = post_json(client, "/graphical/whatif", {"problem_id": problem_db.id}, token)
+    assert resp2.status_code == 200
+    assert resp2.json()["stationary"]["discount"] == pytest.approx(0.8)

@@ -823,6 +823,9 @@ def stationary_step_posteriors(
     status-quo decisions the policies need) and the step nodes: slice t, renewal nodes included,
     and the decided atemporal nodes.
 
+    Evidence with probability just above `_ZERO_EVIDENCE` can be dominated by solver noise when
+    the policies come from an LP solved to a feasibility tolerance of about 1e-9.
+
     Args:
         diagram: the stationary diagram.
         policies: as in `evaluate_stationary_policy`.
