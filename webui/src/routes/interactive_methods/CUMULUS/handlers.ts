@@ -14,7 +14,9 @@ import {
 	getObjectiveConstraintsMethodCumulusObjectiveConstraintGet,
 	getSolutionDescriptionSolutionDescriptionGetPost,
 	getScenarioAvailabilityMethodCumulusScenarioAvailabilityGet,
-	applyScenarioMeasuresMethodCumulusApplyScenarioMeasuresPost
+	applyScenarioMeasuresMethodCumulusApplyScenarioMeasuresPost,
+	createHypotheticalMethodCumulusHypotheticalPost,
+	modifyProblemStatusMethodCumulusModifyProblemStatusStateIdGet
 } from '$lib/gen/endpoints/DESDEOFastAPI';
 import type {
 	CumulusClassificationRequest,
@@ -26,6 +28,8 @@ import type {
 	SolutionInfo,
 	CumulusObjectiveConstraintRequest,
 	CumulusScenarioAvailabilityResponse,
+	CumulusModificationResponse,
+	DiagramAssumptions,
 	SolutionDescriptionRequest,
 	ConstraintTypeEnum,
 	ProblemInfo,
@@ -34,6 +38,13 @@ import type {
 } from '$lib/gen/endpoints/DESDEOFastAPI';
 import type { MapOptions, Response } from './types';
 import { errorMessage, isLoading } from '../../../stores/uiState';
+
+/** Name of an unnamed solution: the id of the state that produced it, and its index there. */
+export function default_solution_name(
+	solution: Pick<Solution, 'state_id' | 'solution_index'>
+): string {
+	return `Solution ${solution.state_id}.${(solution.solution_index ?? 0) + 1}`;
+}
 
 /** `value`, or null when it is missing or empty. */
 export function blankToNull(value: string | null | undefined): string | null {
@@ -381,9 +392,29 @@ export interface MeasureOptions {
 	cvar_alpha?: number;
 }
 
+/** Keeps only the measures the uncertainty source offers. */
+export function only_available_measures(
+	measures: MeasureType[],
+	measure_types: MeasureType[]
+): MeasureType[] {
+	return measures.filter((m) => measure_types.includes(m));
+}
+
+/** The measures to preselect: the already-applied ones the source offers, else E and robust. */
+export function preselected_measures(
+	applied: string[],
+	measure_types: MeasureType[]
+): MeasureType[] {
+	const kept = only_available_measures(applied as MeasureType[], measure_types);
+	return kept.length > 0
+		? kept
+		: only_available_measures(['expected_value', 'worst_case_robust'], measure_types);
+}
+
+/** A null `scenario_model_id` aggregates over the problem's graphical model. */
 function build_uncertainty_measures_request(
 	problem_id: number,
-	scenario_model_id: number,
+	scenario_model_id: number | null,
 	objective_symbols: string[],
 	selected_measures: MeasureType[],
 	measure_options: MeasureOptions,
@@ -394,10 +425,10 @@ function build_uncertainty_measures_request(
 		name: blankToNull(name),
 		uncertainty_measures: selected_measures.map((measure_type) => ({
 			measure_type,
-			scenario_model_id,
+			...(scenario_model_id !== null && { scenario_model_id }),
 			symbols: objective_symbols,
 			...(measure_type === 'conditional_value_at_risk' && {
-				alpha: measure_options.cvar_alpha ?? 0.95
+				alpha: measure_options.cvar_alpha ?? 0.05
 			})
 		}))
 	};
@@ -405,11 +436,11 @@ function build_uncertainty_measures_request(
 
 /**
  * Re-calls get-or-initialize with the DM-chosen uncertainty measures applied,
- * building a combined multi-scenario problem before starting the method.
+ * building a combined problem before starting the method.
  */
 export async function initialize_cumulus_state_with_scenarios(
 	problem_id: number,
-	scenario_model_id: number,
+	scenario_model_id: number | null,
 	objective_symbols: string[],
 	selected_measures: MeasureType[],
 	measure_options: MeasureOptions = {},
@@ -448,7 +479,8 @@ export async function initialize_cumulus_state_with_scenarios(
 
 /**
  * Checks whether a problem (or the base problem it was combined from) has an associated
- * scenario model, so the "Add uncertainty measures" action can be shown or hidden accordingly.
+ * scenario model or graphical model, so the "Add uncertainty measures" action can be shown or
+ * hidden accordingly.
  */
 export async function check_scenario_availability(
 	problem_id: number
@@ -473,14 +505,14 @@ export async function check_scenario_availability(
 }
 
 /**
- * Builds (or rebuilds) a combined scenario problem with the given uncertainty measures,
+ * Builds (or rebuilds) a combined problem with the given uncertainty measures,
  * regardless of whether CUMULUS has already been initialized for the current problem.
  * Used by the "Add uncertainty measures" menu action, which can be used both before the
  * method has started and later, to change which measures are included.
  */
 export async function apply_scenario_measures(
 	problem_id: number,
-	scenario_model_id: number,
+	scenario_model_id: number | null,
 	objective_symbols: string[],
 	selected_measures: MeasureType[],
 	measure_options: MeasureOptions = {},
@@ -515,6 +547,102 @@ export async function apply_scenario_measures(
 	} finally {
 		isLoading.set(false);
 	}
+}
+
+/** Poll cadence and give-up point for the background checks of a new problem. */
+const MODIFICATION_POLL_INTERVAL_MS = 1000;
+const MODIFICATION_POLL_TIMEOUT_MS = 10 * 60 * 1000;
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const DISCARDED_MESSAGE = 'The new problem could not be used and was discarded.';
+
+export type ModificationOutcome =
+	/** The background checks passed and the new problem is ready to be used. */
+	| { kind: 'accepted'; response: CumulusModificationResponse }
+	/** The checks failed and the new problem was discarded. */
+	| { kind: 'rejected'; reason: string }
+	/** Neither could be established: polling itself failed or ran out of time. */
+	| { kind: 'failed' };
+
+/**
+ * Polls /modify-problem/status until the background checks settle.
+ *
+ * `is_ready` only means the checks have finished, so a ready response still has to be read for
+ * the verdict.
+ */
+export async function poll_modification_status(
+	state_id: number,
+	{
+		interval_ms = MODIFICATION_POLL_INTERVAL_MS,
+		timeout_ms = MODIFICATION_POLL_TIMEOUT_MS
+	}: { interval_ms?: number; timeout_ms?: number } = {}
+): Promise<ModificationOutcome> {
+	const deadline = Date.now() + timeout_ms;
+
+	for (;;) {
+		const response = await modifyProblemStatusMethodCumulusModifyProblemStatusStateIdGet(state_id);
+
+		// A discarded problem can take its state with it, so a missing state means rejection.
+		if ((response.status as number) === 404) {
+			return { kind: 'rejected', reason: DISCARDED_MESSAGE };
+		}
+
+		if (response.status !== 200) {
+			errorMessage.set(
+				errorDetail(response.data) ??
+					`Checking the new problem failed with status ${response.status}`
+			);
+			return { kind: 'failed' };
+		}
+
+		if (response.data.is_ready) {
+			if (response.data.problem_deleted || response.data.error) {
+				return { kind: 'rejected', reason: response.data.error ?? DISCARDED_MESSAGE };
+			}
+			return { kind: 'accepted', response: response.data };
+		}
+
+		if (Date.now() >= deadline) {
+			errorMessage.set(
+				'Checking the new problem is taking longer than expected; try again in a moment.'
+			);
+			return { kind: 'failed' };
+		}
+
+		await sleep(interval_ms);
+	}
+}
+
+/**
+ * Creates a hypothetical problem from a graphical-model problem under `assumptions` and waits
+ * for its background checks. Returns the new problem's id, or null after reporting an error.
+ */
+export async function create_hypothetical(
+	problem_id: number,
+	parent_state_id: number | null,
+	assumptions: DiagramAssumptions,
+	{ poll_interval_ms }: { poll_interval_ms?: number } = {}
+): Promise<number | null> {
+	errorMessage.set(null);
+	const response = await createHypotheticalMethodCumulusHypotheticalPost({
+		problem_id,
+		parent_state_id,
+		assumptions
+	});
+	if (response.status !== 200) {
+		errorMessage.set(
+			errorDetail(response.data) ??
+				`Creating the hypothetical problem failed with status ${response.status}`
+		);
+		return null;
+	}
+
+	const outcome = await poll_modification_status(response.data.state_id, {
+		interval_ms: poll_interval_ms
+	});
+	if (outcome.kind === 'rejected') errorMessage.set(outcome.reason);
+	return outcome.kind === 'accepted' ? response.data.problem_id : null;
 }
 
 type UIConstraintType = '<=0' | '=0';

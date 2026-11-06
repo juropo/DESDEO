@@ -1,8 +1,11 @@
 """Tests for the gurobipy solver."""
 
+import logging
+
 import gurobipy as gp
 import numpy as np
 import pytest
+from pydantic import ValidationError
 
 from desdeo.problem import (
     Constraint,
@@ -21,7 +24,7 @@ from desdeo.problem.testproblems import (
     simple_knapsack_vectors,
     simple_linear_test_problem,
 )
-from desdeo.tools import GurobipySolver, PersistentGurobipySolver
+from desdeo.tools import GurobipyOptions, GurobipySolver, PersistentGurobipySolver
 
 
 @pytest.mark.slow
@@ -232,3 +235,199 @@ def test_objective_referencing_unknown_symbol_still_raises():
 
     with pytest.raises(GurobipyEvaluatorError, match="f_nonexistent"):
         GurobipyEvaluator(broken)
+
+
+@pytest.mark.gurobipy
+@pytest.mark.parametrize("solver_class", [GurobipySolver, PersistentGurobipySolver])
+def test_custom_options_keep_defaults(solver_class):
+    """Custom options are set alongside the defaults, and override them where they overlap."""
+    solver = solver_class(simple_linear_test_problem(), options=GurobipyOptions(TimeLimit=30, OutputFlag=1))
+    params = solver.evaluator.model.Params
+
+    assert params.IntegralityFocus == 1
+    assert params.LogToConsole == 0
+    assert params.TimeLimit == 30
+    assert params.OutputFlag == 1
+
+
+def _knapsack_problem() -> tuple[Problem, list[int], int]:
+    """A small binary knapsack, returned with its item weights and capacity."""
+    values = [10, 13, 7, 8, 9, 12, 6, 11]
+    weights = [5, 7, 4, 5, 6, 8, 3, 6]
+    capacity = 20
+    symbols = [f"x_{i + 1}" for i in range(len(values))]
+
+    return (
+        Problem(
+            name="Knapsack",
+            description="Binary knapsack.",
+            variables=[
+                Variable(name=s, symbol=s, variable_type=VariableTypeEnum.binary, lowerbound=0, upperbound=1)
+                for s in symbols
+            ],
+            objectives=[
+                Objective(
+                    name="f",
+                    symbol="f",
+                    func=["Add", *[["Multiply", v, s] for v, s in zip(values, symbols, strict=True)]],
+                    maximize=True,
+                    objective_type=ObjectiveTypeEnum.analytical,
+                    is_linear=True,
+                    is_convex=True,
+                    is_twice_differentiable=True,
+                )
+            ],
+            constraints=[
+                Constraint(
+                    name="capacity",
+                    symbol="g",
+                    func=["Add", *[["Multiply", w, s] for w, s in zip(weights, symbols, strict=True)], -capacity],
+                    cons_type=ConstraintTypeEnum.LTE,
+                    is_linear=True,
+                    is_convex=True,
+                    is_twice_differentiable=True,
+                )
+            ],
+        ),
+        weights,
+        capacity,
+    )
+
+
+@pytest.mark.gurobipy
+@pytest.mark.parametrize("solver_class", [GurobipySolver, PersistentGurobipySolver])
+def test_incumbent_returned_when_not_optimal(solver_class):
+    """When the solve stops with a feasible incumbent, its values are returned with success=False."""
+    problem, weights, capacity = _knapsack_problem()
+    solver = solver_class(problem, options={"SolutionLimit": 1})
+    results = solver.solve("f")
+
+    assert solver.evaluator.model.status == gp.GRB.SOLUTION_LIMIT
+    assert results.success is False
+    assert "not proven optimal" in results.message
+
+    xs = [results.optimal_variables[f"x_{i + 1}"] for i in range(len(weights))]
+    assert all(np.isfinite(x) for x in xs)
+    assert all(np.isclose(x, 0) or np.isclose(x, 1) for x in xs)
+    assert sum(w * x for w, x in zip(weights, xs, strict=True)) <= capacity + 1e-6
+    assert np.isfinite(results.optimal_objectives["f"])
+
+
+@pytest.mark.gurobipy
+@pytest.mark.parametrize("solver_class", [GurobipySolver, PersistentGurobipySolver])
+def test_infeasible_returns_nan(solver_class):
+    """An infeasible model has no incumbent, so NaN values are returned with success=False."""
+    problem, _, _ = _knapsack_problem()
+    infeasible = problem.model_copy(
+        update={
+            "constraints": [
+                *problem.constraints,
+                Constraint(
+                    name="impossible",
+                    symbol="h",
+                    func=["Add", "x_1", 1],
+                    cons_type=ConstraintTypeEnum.LTE,
+                    is_linear=True,
+                    is_convex=True,
+                    is_twice_differentiable=True,
+                ),
+            ]
+        }
+    )
+    results = solver_class(infeasible).solve("f")
+
+    assert results.success is False
+    assert all(np.isnan(x) for x in results.optimal_variables.values())
+    assert all(np.isnan(f) for f in results.optimal_objectives.values())
+
+
+@pytest.mark.gurobipy
+def test_gurobipy_options_defaults():
+    """The defaults of `GurobipyOptions` suppress output and set IntegralityFocus, and nothing else."""
+    assert GurobipyOptions().model_dump(exclude_none=True) == {
+        "OutputFlag": 0,
+        "LogToConsole": 0,
+        "IntegralityFocus": 1,
+    }
+
+
+@pytest.mark.gurobipy
+@pytest.mark.parametrize("solver_class", [GurobipySolver, PersistentGurobipySolver])
+def test_gurobipy_options_set_on_model(solver_class):
+    """A declared parameter is set on the Gurobi model along with the defaults."""
+    solver = solver_class(simple_linear_test_problem(), GurobipyOptions(FeasibilityTol=1e-9))
+    params = solver.evaluator.model.Params
+
+    assert params.FeasibilityTol == 1e-9
+    assert params.OutputFlag == 0
+    assert params.LogToConsole == 0
+    assert params.IntegralityFocus == 1
+    assert solver.solve("f_1").success
+
+
+@pytest.mark.gurobipy
+@pytest.mark.parametrize("solver_class", [GurobipySolver, PersistentGurobipySolver])
+def test_gurobipy_options_extra_parameter_passes_through(solver_class):
+    """An undeclared Gurobi parameter is passed on to the Gurobi model."""
+    solver = solver_class(simple_linear_test_problem(), GurobipyOptions(MIPFocus=1))
+
+    assert solver.evaluator.model.Params.MIPFocus == 1
+
+
+@pytest.mark.gurobipy
+@pytest.mark.parametrize("solver_class", [GurobipySolver, PersistentGurobipySolver])
+def test_gurobipy_options_dict_matches_model(solver_class):
+    """A dict of parameters sets the same values as the equivalent `GurobipyOptions`."""
+    options = {"FeasibilityTol": 1e-8, "MIPFocus": 2}
+    from_dict = solver_class(simple_linear_test_problem(), options)
+    from_model = solver_class(simple_linear_test_problem(), GurobipyOptions(**options))
+
+    for name, value in {"FeasibilityTol": 1e-8, "MIPFocus": 2, "OutputFlag": 0, "IntegralityFocus": 1}.items():
+        assert getattr(from_dict.evaluator.model.Params, name) == value
+        assert getattr(from_model.evaluator.model.Params, name) == value
+
+
+@pytest.mark.gurobipy
+def test_gurobipy_options_invalid_value():
+    """A value of the wrong type fails validation, also when given in a dict."""
+    with pytest.raises(ValidationError, match="FeasibilityTol"):
+        GurobipyOptions(FeasibilityTol="abc")
+    with pytest.raises(ValidationError, match="FeasibilityTol"):
+        GurobipySolver(simple_linear_test_problem(), {"FeasibilityTol": "abc"})
+
+
+@pytest.mark.gurobipy
+def test_gurobipy_options_unknown_name_kept_and_warned(caplog):
+    """A name Gurobi doesn't know is kept with a warning; known undeclared names aren't warned about."""
+    with caplog.at_level(logging.WARNING):
+        options = GurobipyOptions(NotAGurobiParam=1, MIPFocus=1)
+
+    assert options.model_extra == {"NotAGurobiParam": 1, "MIPFocus": 1}
+    assert "NotAGurobiParam" in caplog.text
+    assert "MIPFocus" not in caplog.text
+
+
+@pytest.mark.gurobipy
+def test_gurobipy_options_both_spellings_keep_declared(caplog):
+    """Declared spelling wins over lowercase when both are given."""
+    with caplog.at_level(logging.WARNING):
+        opts1 = GurobipyOptions.model_validate({"feasibilitytol": 1e-6, "FeasibilityTol": 1e-9})
+        opts2 = GurobipyOptions.model_validate({"FeasibilityTol": 1e-9, "feasibilitytol": 1e-6})
+    assert opts1.FeasibilityTol == 1e-9
+    assert opts1.model_extra == {}
+    assert opts2.FeasibilityTol == 1e-9
+    assert opts2.model_extra == {}
+    assert "FeasibilityTol" in caplog.text
+
+
+@pytest.mark.gurobipy
+def test_gurobipy_options_lowercase_declared_name_is_type_checked():
+    """Lowercase declared name is normalized and type-checked."""
+    with pytest.raises(ValidationError, match="FeasibilityTol"):
+        GurobipyOptions.model_validate({"feasibilitytol": "abc"})
+
+
+@pytest.mark.gurobipy
+def test_gurobipy_options_extra_name_uses_gurobi_spelling():
+    """Extra Gurobi parameters are normalized to Gurobi's spelling."""
+    assert GurobipyOptions.model_validate({"mipfocus": 1}).model_dump(exclude_unset=True) == {"MIPFocus": 1}

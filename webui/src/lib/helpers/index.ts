@@ -58,6 +58,16 @@ export function clampValue(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
 }
 
+/** Toggles `value`'s membership in `set`, returning a new `Set` -- never mutates `set`. Shared so
+ *  the "toggle membership, return a new Set" pattern (expandable table rows, flagged/pinned node
+ *  ids, etc.) has one implementation instead of each caller inlining its own copy. */
+export function toggleSet<T>(set: Set<T>, value: T): Set<T> {
+  const next = new Set(set);
+  if (next.has(value)) next.delete(value);
+  else next.add(value);
+  return next;
+}
+
 export type PreferenceType = keyof typeof PREFERENCE_TYPES;
 export type PreferenceValue = typeof PREFERENCE_TYPES[PreferenceType];
 

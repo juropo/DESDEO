@@ -5,6 +5,8 @@ const setObjectiveConstraints = vi.fn<(...args: unknown[]) => unknown>();
 const getObjectiveConstraints = vi.fn<(...args: unknown[]) => unknown>();
 const getScenarioAvailability = vi.fn<(...args: unknown[]) => unknown>();
 const applyScenarioMeasures = vi.fn<(...args: unknown[]) => unknown>();
+const createHypothetical = vi.fn<(...args: unknown[]) => unknown>();
+const modifyProblemStatus = vi.fn<(...args: unknown[]) => unknown>();
 
 vi.mock('$lib/gen/endpoints/DESDEOFastAPI', () => ({
 	setObjectiveConstraintsMethodCumulusObjectiveConstraintPost: (...args: unknown[]) =>
@@ -15,6 +17,10 @@ vi.mock('$lib/gen/endpoints/DESDEOFastAPI', () => ({
 		getScenarioAvailability(...args),
 	applyScenarioMeasuresMethodCumulusApplyScenarioMeasuresPost: (...args: unknown[]) =>
 		applyScenarioMeasures(...args),
+	createHypotheticalMethodCumulusHypotheticalPost: (...args: unknown[]) =>
+		createHypothetical(...args),
+	modifyProblemStatusMethodCumulusModifyProblemStatusStateIdGet: (...args: unknown[]) =>
+		modifyProblemStatus(...args),
 	// The module is imported wholesale, so every other endpoint the handlers pull in has to exist.
 	solveSolutionsMethodCumulusSolvePost: vi.fn(),
 	getOrInitializeMethodCumulusGetOrInitializePost: vi.fn(),
@@ -30,11 +36,16 @@ const {
 	set_objective_constraints,
 	get_objective_constraints,
 	check_scenario_availability,
-	apply_scenario_measures
+	apply_scenario_measures,
+	create_hypothetical,
+	default_solution_name,
+	only_available_measures,
+	preselected_measures
 } = await import('./handlers');
 const { errorMessage } = await import('../../../stores/uiState');
 
 import type { ProblemInfo } from '$lib/gen/endpoints/DESDEOFastAPI';
+import type { MeasureType } from './handlers';
 
 /** A problem stub carrying only what the constraint handlers actually read. */
 function make_problem(): ProblemInfo {
@@ -169,6 +180,50 @@ describe('apply_scenario_measures', () => {
 		expect(result).toEqual({ problem_id: 9 });
 	});
 
+	it('sends CVaR with the worst 5 % as the default tail probability', async () => {
+		applyScenarioMeasures.mockResolvedValue({ status: 200, data: { problem_id: 9 } });
+
+		await apply_scenario_measures(7, 3, ['f_1'], ['conditional_value_at_risk']);
+
+		expect(applyScenarioMeasures).toHaveBeenCalledWith({
+			problem_id: 7,
+			name: null,
+			uncertainty_measures: [
+				{
+					measure_type: 'conditional_value_at_risk',
+					scenario_model_id: 3,
+					symbols: ['f_1'],
+					alpha: 0.05
+				}
+			]
+		});
+	});
+
+	it('omits scenario_model_id for the graphical source', async () => {
+		applyScenarioMeasures.mockResolvedValue({ status: 200, data: { problem_id: 9 } });
+
+		await apply_scenario_measures(
+			7,
+			null,
+			['f_1'],
+			['expected_value', 'conditional_value_at_risk'],
+			{ cvar_alpha: 0.1 }
+		);
+
+		expect(applyScenarioMeasures).toHaveBeenCalledWith({
+			problem_id: 7,
+			name: null,
+			uncertainty_measures: [
+				{ measure_type: 'expected_value', symbols: ['f_1'] },
+				{ measure_type: 'conditional_value_at_risk', symbols: ['f_1'], alpha: 0.1 }
+			]
+		});
+		const [request] = applyScenarioMeasures.mock.calls[0] as [{ uncertainty_measures: object[] }];
+		for (const measure of request.uncertainty_measures) {
+			expect(measure).not.toHaveProperty('scenario_model_id');
+		}
+	});
+
 	it('reports an error and returns null when the endpoint rejects the measures', async () => {
 		applyScenarioMeasures.mockResolvedValue({ status: 422, data: { detail: 'no scenario model' } });
 
@@ -176,5 +231,112 @@ describe('apply_scenario_measures', () => {
 
 		expect(result).toBeNull();
 		expect(get(errorMessage)).toContain('422');
+	});
+});
+
+describe('only_available_measures', () => {
+	it('drops measures the source does not offer, keeping the given order', () => {
+		expect(
+			only_available_measures(
+				['weighted_scenarios', 'expected_value', 'worst_case_robust'],
+				['expected_value', 'worst_case_robust', 'conditional_value_at_risk']
+			)
+		).toEqual(['expected_value', 'worst_case_robust']);
+	});
+
+	it('returns nothing when the source offers no measures', () => {
+		expect(only_available_measures(['expected_value'], [])).toEqual([]);
+	});
+});
+
+describe('preselected_measures', () => {
+	const offered: MeasureType[] = [
+		'expected_value',
+		'worst_case_robust',
+		'conditional_value_at_risk'
+	];
+
+	it('keeps the applied measures the source offers', () => {
+		expect(preselected_measures(['expected_value', 'conditional_value_at_risk'], offered)).toEqual([
+			'expected_value',
+			'conditional_value_at_risk'
+		]);
+	});
+
+	it('falls back to E and robust when nothing is applied', () => {
+		expect(preselected_measures([], offered)).toEqual(['expected_value', 'worst_case_robust']);
+	});
+
+	it('falls back when no applied measure is offered', () => {
+		expect(preselected_measures(['weighted_scenarios'], offered)).toEqual([
+			'expected_value',
+			'worst_case_robust'
+		]);
+	});
+
+	it('limits the fallback to the offered measures', () => {
+		expect(preselected_measures([], ['expected_value'])).toEqual(['expected_value']);
+	});
+});
+
+describe('create_hypothetical', () => {
+	const assumptions = { chance: { structure: 'soaking' }, decisions: {} };
+
+	beforeEach(() => {
+		createHypothetical.mockReset();
+		modifyProblemStatus.mockReset();
+	});
+
+	it('creates the problem, polls until ready, and returns its id', async () => {
+		createHypothetical.mockResolvedValue({ status: 200, data: { state_id: 3, problem_id: 12 } });
+		modifyProblemStatus
+			.mockResolvedValueOnce({ status: 200, data: { is_ready: false } })
+			.mockResolvedValueOnce({ status: 200, data: { is_ready: true, problem_id: 12 } });
+
+		const result = await create_hypothetical(7, 2, assumptions, { poll_interval_ms: 0 });
+
+		expect(createHypothetical).toHaveBeenCalledWith({
+			problem_id: 7,
+			parent_state_id: 2,
+			assumptions
+		});
+		expect(modifyProblemStatus).toHaveBeenCalledWith(3);
+		expect(result).toBe(12);
+	});
+
+	it('reports the reason and returns null when the new problem is discarded', async () => {
+		createHypothetical.mockResolvedValue({ status: 200, data: { state_id: 3, problem_id: 12 } });
+		modifyProblemStatus.mockResolvedValue({
+			status: 200,
+			data: { is_ready: true, problem_deleted: true, error: 'infeasible' }
+		});
+
+		const result = await create_hypothetical(7, null, assumptions, { poll_interval_ms: 0 });
+
+		expect(result).toBeNull();
+		expect(get(errorMessage)).toBe('infeasible');
+	});
+
+	it('reports the backend detail and does not poll when creation is refused', async () => {
+		createHypothetical.mockResolvedValue({
+			status: 400,
+			data: { detail: 'Already assumed differently: structure = dry.' }
+		});
+
+		const result = await create_hypothetical(7, null, assumptions);
+
+		expect(result).toBeNull();
+		expect(modifyProblemStatus).not.toHaveBeenCalled();
+		expect(get(errorMessage)).toContain('structure = dry');
+	});
+});
+
+describe('default_solution_name', () => {
+	it('names a solution by its state id and 1-based index', () => {
+		expect(default_solution_name({ state_id: 57, solution_index: 1 })).toBe('Solution 57.2');
+	});
+
+	it('treats a missing index as the first solution', () => {
+		expect(default_solution_name({ state_id: 3, solution_index: null })).toBe('Solution 3.1');
 	});
 });

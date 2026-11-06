@@ -3,7 +3,7 @@
 import json
 from pathlib import Path
 from types import UnionType
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from fastapi import UploadFile
 from pydantic import BaseModel, ConfigDict, create_model, field_validator
@@ -20,6 +20,7 @@ from desdeo.problem.schema import (
     Problem,
     ScalarizationFunction,
     Simulator,
+    SparseTensorConstant,
     Tensor,
     TensorConstant,
     TensorVariable,
@@ -59,6 +60,9 @@ class ProblemSelectSolverRequest(SQLModel):
     problem_id: int = Field(description="ID of the problem that the solver is assigned to.")
     solver_string_representation: str = Field(
         description=f"One of the following: {[x for x, _ in available_solvers.items()]}"
+    )
+    solver_options: dict[str, Any] | None = Field(
+        default=None, description="Options stored with the solver and passed to it when solving."
     )
 
 
@@ -109,6 +113,7 @@ class ProblemInfo(ProblemBase):
 
     constants: list["ConstantDB"] | None
     tensor_constants: list["TensorConstantDB"] | None
+    # sparse tensor constants can be very large, so they are not sent with every problem fetch
     variables: list["VariableDB"] | None
     tensor_variables: list["TensorVariableDB"] | None
     objectives: list["ObjectiveDB"]
@@ -167,6 +172,9 @@ class ProblemDB(ProblemBase, table=True):
     # Populated by other models
     constants: list["ConstantDB"] = Relationship(back_populates="problem", cascade_delete=True)
     tensor_constants: list["TensorConstantDB"] = Relationship(back_populates="problem", cascade_delete=True)
+    sparse_tensor_constants: list["SparseTensorConstantDB"] = Relationship(
+        back_populates="problem", cascade_delete=True
+    )
     variables: list["VariableDB"] = Relationship(back_populates="problem", cascade_delete=True)
     tensor_variables: list["TensorVariableDB"] = Relationship(back_populates="problem", cascade_delete=True)
     objectives: list["ObjectiveDB"] = Relationship(back_populates="problem", cascade_delete=True)
@@ -200,6 +208,11 @@ class ProblemDB(ProblemBase, table=True):
             if problem_instance.constants is not None
             else []
         )
+        sparse_tensor_constants = (
+            [const for const in problem_instance.constants if isinstance(const, SparseTensorConstant)]
+            if problem_instance.constants is not None
+            else []
+        )
         scalar_variables = [var for var in problem_instance.variables if isinstance(var, Variable)]
         tensor_variables = [var for var in problem_instance.variables if isinstance(var, TensorVariable)]
         return cls(
@@ -212,6 +225,7 @@ class ProblemDB(ProblemBase, table=True):
             variable_domain=problem_instance.variable_domain,
             constants=[ConstantDB.model_validate(const) for const in scalar_constants],
             tensor_constants=[TensorConstantDB.model_validate(const) for const in tensor_constants],
+            sparse_tensor_constants=[SparseTensorConstantDB.model_validate(const) for const in sparse_tensor_constants],
             variables=[VariableDB.model_validate(var) for var in scalar_variables],
             tensor_variables=[TensorVariableDB.model_validate(var) for var in tensor_variables],
             objectives=[ObjectiveDB.model_validate(obj) for obj in problem_instance.objectives],
@@ -307,6 +321,11 @@ class SolverSelectionMetadata(SQLModel, table=True):
 
     # The solver's string representation is used in endpoints to fetch the proper solver from available solvers.
     solver_string_representation: str = Field(description="The string representation of the selected solver.")
+    solver_options: dict[str, Any] | None = Field(
+        sa_column=Column(JSON),
+        default=None,
+        description="Options passed to the solver; requests' solver options override them per key.",
+    )
 
     metadata_instance: "ProblemMetaDataDB" = Relationship(back_populates="solver_selection_metadata")
 
@@ -342,6 +361,71 @@ class SiteSelectionMetaData(SQLModel, table=True):
     coverage_threshold: float = Field(default=15.0, description="Threshold for coverage edges (e.g., minutes, km)")
 
     metadata_instance: "ProblemMetaDataDB" = Relationship(back_populates="site_selection_metadata")
+
+
+class GraphicalModelMetaData(SQLModel, table=True):
+    """Metadata for a graphical model (Bayesian network / influence diagram) compiled `Problem`.
+
+    Mirrors `SiteSelectionMetaData`'s JSON-blob-column pattern rather than `ScenarioModelDB`'s
+    relational one: see `.claude/desdeo-graphical-models-plan.md`'s Phase 3 checklist item and
+    design decisions table ("Compiled-model metadata ... persists via the API's
+    `ProblemMetaDataDB` side-table pattern, not a field on core `Problem`"). Nothing in the
+    current API queries *into* a stored problem's substructure at the SQL level (unlike
+    `ScenarioModelDB`, whose relational mapping exists specifically for its polymorphic pools
+    and per-leaf scenario dispatch) -- a JSON blob per document is sufficient here, same as
+    `SiteSelectionMetaData`'s `sites_json`/`nodes_json`/`travel_time_matrix_json`.
+
+    Each JSON column round-trips one `problem/graphical` pydantic model via `.model_dump_json()`/
+    `.model_validate_json()`: `network_json` <-> `DiscreteNetwork`, `annotation_json` <->
+    `DecisionAnnotation`, `rjt_json` <-> `RootedJunctionTree` (Phase 3). `index_map_json` is
+    Phase 4's `IndexMap`, returned alongside the compiled `Problem` by `compile_diagram` -- it
+    stays `None` until a Phase 4/7 compile step populates it, since nothing before that point has
+    an `IndexMap` to store.
+    """
+
+    id: int | None = Field(primary_key=True, default=None)
+    metadata_id: int | None = Field(foreign_key="problemmetadatadb.id", default=None)
+
+    metadata_type: str = "graphical_model_metadata"
+
+    network_json: str = Field(description="JSON-serialised `desdeo.problem.graphical.DiscreteNetwork`")
+    annotation_json: str = Field(description="JSON-serialised `desdeo.problem.graphical.DecisionAnnotation`")
+    rjt_json: str | None = Field(
+        default=None, description="JSON-serialised `desdeo.problem.graphical.RootedJunctionTree`, once built"
+    )
+    index_map_json: str | None = Field(
+        default=None, description="JSON-serialised `IndexMap` (Phase 4), once the diagram has been compiled"
+    )
+    assumptions_json: str | None = Field(
+        default=None,
+        description=(
+            "JSON-serialised `desdeo.problem.graphical.DiagramAssumptions` of a hypothetical problem; "
+            "`network_json` is then already conditioned on them"
+        ),
+    )
+
+    metadata_instance: "ProblemMetaDataDB" = Relationship(back_populates="graphical_model_metadata")
+
+
+class StationaryModelMetaData(SQLModel, table=True):
+    """Metadata for a `Problem` compiled from a stationary 2TBN diagram with `compile_stationary_lp`."""
+
+    id: int | None = Field(primary_key=True, default=None)
+    metadata_id: int | None = Field(foreign_key="problemmetadatadb.id", default=None)
+
+    metadata_type: str = "stationary_model_metadata"
+
+    diagram_json: str = Field(description="JSON-serialised `desdeo.problem.graphical.StationaryDiagram`")
+    index_map_json: str = Field(description="JSON-serialised `desdeo.problem.graphical.StationaryLPIndexMap`")
+
+    metadata_instance: "ProblemMetaDataDB" = Relationship(back_populates="stationary_model_metadata")
+
+
+class StationaryModelMetaDataPublic(SQLModel):
+    """Response model for `StationaryModelMetaData`, without the diagram and index map."""
+
+    id: int | None
+    metadata_type: str
 
 
 class DescriptionPart(BaseModel):
@@ -399,6 +483,12 @@ class ProblemMetaDataDB(SQLModel, table=True):
     solution_description_metadata: list[SolutionDescriptionMetaData] = Relationship(
         back_populates="metadata_instance", cascade_delete=True
     )
+    graphical_model_metadata: list[GraphicalModelMetaData] = Relationship(
+        back_populates="metadata_instance", cascade_delete=True
+    )
+    stationary_model_metadata: list[StationaryModelMetaData] = Relationship(
+        back_populates="metadata_instance", cascade_delete=True
+    )
     problem: ProblemDB = Relationship(back_populates="problem_metadata")
 
     @property
@@ -410,6 +500,8 @@ class ProblemMetaDataDB(SQLModel, table=True):
         | SolverSelectionMetadata
         | SiteSelectionMetaData
         | SolutionDescriptionMetaData
+        | GraphicalModelMetaData
+        | StationaryModelMetaData
     ]:
         """Return all metadata in one list."""
         return (
@@ -418,6 +510,8 @@ class ProblemMetaDataDB(SQLModel, table=True):
             + (self.solver_selection_metadata or [])
             + (self.site_selection_metadata or [])
             + (self.solution_description_metadata or [])
+            + (self.graphical_model_metadata or [])
+            + (self.stationary_model_metadata or [])
         )
 
 
@@ -430,6 +524,8 @@ class ProblemMetaDataPublic(SQLModel):
     representative_nd_metadata: list[RepresentativeNonDominatedSolutions] | None
     site_selection_metadata: list[SiteSelectionMetaData] | None
     solution_description_metadata: list[SolutionDescriptionMetaData] | None
+    graphical_model_metadata: list[GraphicalModelMetaData] | None
+    stationary_model_metadata: list[StationaryModelMetaDataPublic] | None
 
 
 class ProblemMetaDataGetRequest(SQLModel):
@@ -592,6 +688,31 @@ class TensorConstantDB(_BaseTensorConstantDB, table=True):
     # Back populates
     problem: ProblemDB | None = Relationship(back_populates="tensor_constants")
     scenario_model: "ScenarioModelDB" = Relationship(back_populates="tensor_constants")
+
+
+class _SparseTensorConstant(SQLModel):
+    """Helper class to override the field types of list types."""
+
+    shape: list[int] = Field(sa_column=Column(JSON))
+    indices: list[list[int]] = Field(sa_column=Column(JSON))
+    values: list[float] = Field(sa_column=Column(JSON))
+
+
+_BaseSparseTensorConstantDB = from_pydantic(
+    SparseTensorConstant,
+    "_BaseSparseTensorConstantDB",
+    base_model=_SparseTensorConstant,
+)
+
+
+class SparseTensorConstantDB(_BaseSparseTensorConstantDB, table=True):
+    """The SQLModel equivalent to `SparseTensorConstant`."""
+
+    id: int | None = Field(primary_key=True, default=None)
+    problem_id: int | None = Field(default=None, foreign_key="problemdb.id")
+
+    # Back populates
+    problem: ProblemDB | None = Relationship(back_populates="sparse_tensor_constants")
 
 
 _ConstantDB = from_pydantic(Constant, "_ConstantDB", union_type_conversions={VariableType: float})

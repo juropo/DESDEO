@@ -1,14 +1,18 @@
 """General utilities related to solvers."""
 
+import logging
 import shutil
 from collections.abc import Callable
+from typing import Any
 
 import numpy as np
 import polars as pl
+from pydantic import BaseModel, ValidationError
 
 from desdeo.problem import (
     ObjectiveTypeEnum,
     Problem,
+    SparseTensorConstant,
     VariableDimensionEnum,
     VariableDomainTypeEnum,
     numpy_array_to_objective_dict,
@@ -16,7 +20,12 @@ from desdeo.problem import (
 )
 from desdeo.tools.cvxpy_solver_interfaces import CVXPYSolver, CVXPYSolverOptions, check_cvxpy_suitability
 from desdeo.tools.generics import BaseSolver
-from desdeo.tools.gurobipy_solver_interfaces import GurobipySolver, PersistentGurobipySolver, check_gurobi_license
+from desdeo.tools.gurobipy_solver_interfaces import (
+    GurobipyOptions,
+    GurobipySolver,
+    PersistentGurobipySolver,
+    check_gurobi_license,
+)
 from desdeo.tools.ng_solver_interfaces import NevergradGenericOptions, NevergradGenericSolver
 from desdeo.tools.proximal_solver import ProximalSolver
 from desdeo.tools.pyomo_solver_interfaces import (
@@ -34,6 +43,8 @@ from desdeo.tools.scipy_solver_interfaces import (
     ScipyMinimizeOptions,
     ScipyMinimizeSolver,
 )
+
+logger = logging.getLogger(__name__)
 
 available_solvers = {
     "scipy_minimize": {
@@ -74,12 +85,12 @@ available_solvers = {
     "pyomo_gurobi": {"constructor": PyomoGurobiSolver, "options": None, "heuristic": False},
     "gurobipy": {
         "constructor": GurobipySolver,
-        "options": None,
+        "options": GurobipyOptions,
         "heuristic": False,
     },
     "gurobipy_persistent": {
         "constructor": PersistentGurobipySolver,
-        "options": None,
+        "options": GurobipyOptions,
         "heuristic": False,
     },
     "cvxpy": {
@@ -88,7 +99,60 @@ available_solvers = {
         "heuristic": False,
     },
 }
-"""Solvers by name. `heuristic` marks stochastic ones, whose results are not guaranteed optimal."""
+"""Solvers by name. `heuristic` marks stochastic ones, whose results are not guaranteed optimal.
+
+Stored option keys an `options` model doesn't declare don't reach the solver (see `normalize_solver_options`),
+unless the model allows extras, as `GurobipyOptions` does; solvers with `options: None` get their dict as is.
+"""
+
+
+def normalize_solver_options(solver_string_representation: str, options: dict[str, Any]) -> dict[str, Any]:
+    """Validate `options` against the solver's options model and return the set ones by field name.
+
+    Keys may be field names or aliases. Keys the model doesn't declare are kept as they are, with a
+    warning unless the model allows extras. Options of solvers without an options model are returned as is.
+
+    Args:
+        solver_string_representation (str): a key of `available_solvers`.
+        options (dict[str, Any]): the options to validate.
+
+    Raises:
+        ValueError: `options` don't validate against the model.
+
+    Returns:
+        dict[str, Any]: the options that were set, keyed by field name, followed by the undeclared ones.
+    """
+    options_model = available_solvers[solver_string_representation]["options"]
+    if options_model is None:
+        return options
+    unknown = {}
+    if options_model.model_config.get("extra") != "allow":
+        fields = options_model.model_fields
+        known = set(fields) | {field.alias for field in fields.values() if field.alias is not None}
+        unknown = {key: value for key, value in options.items() if key not in known}
+        doubled = sorted(name for name, field in fields.items() if name in options and field.alias in options)
+        if doubled:
+            logger.warning(
+                "Options %s of solver %r are given by both name and alias; the alias wins.",
+                doubled,
+                solver_string_representation,
+            )
+        # Undeclared keys are kept but dropped by `model_validate` at solve time (this model doesn't allow
+        # extras), so they don't reach the solver.
+        if unknown:
+            logger.warning(
+                "Options %s are not declared by the options model of solver %r; they are kept as given.",
+                sorted(unknown),
+                solver_string_representation,
+            )
+    try:
+        validated = options_model.model_validate(
+            {key: value for key, value in options.items() if key not in unknown}, by_name=True
+        )
+    except ValidationError as e:
+        msg = f"Invalid options for solver {solver_string_representation!r}: {e}"
+        raise ValueError(msg) from e
+    return validated.model_dump(exclude_unset=True) | unknown
 
 
 def is_heuristic_solver(solver) -> bool:
@@ -122,6 +186,9 @@ def find_compatible_solvers(problem: Problem) -> list[BaseSolver]:
     # check if problem has a discrete definition
     has_discrete = problem.discrete_representation is not None
 
+    # sparse constants are not supported by the Pyomo and Sympy evaluators
+    has_sparse = any(isinstance(const, SparseTensorConstant) for const in problem.constants or [])
+
     # check if problem is data-based
     if all_data_based and has_discrete and var_dim == VariableDimensionEnum.scalar:
         # problem has only data-based objectives and a discrete definition is available
@@ -130,7 +197,8 @@ def find_compatible_solvers(problem: Problem) -> list[BaseSolver]:
 
     # check if the problem is differentiable and if it is mixed integer
     if (
-        problem.is_twice_differentiable
+        not has_sparse
+        and problem.is_twice_differentiable
         and shutil.which("bonmin")
         and problem.variable_domain
         in [
@@ -142,7 +210,8 @@ def find_compatible_solvers(problem: Problem) -> list[BaseSolver]:
 
     # check if the problem is differentiable and continuous
     if (
-        problem.is_twice_differentiable
+        not has_sparse
+        and problem.is_twice_differentiable
         and shutil.which("ipopt")
         and problem.variable_domain == VariableDomainTypeEnum.continuous
     ):
@@ -155,15 +224,16 @@ def find_compatible_solvers(problem: Problem) -> list[BaseSolver]:
     # check if the problem is linear
     if problem.is_linear and check_gurobi_license():
         solvers.append(available_solvers["gurobipy"]["constructor"])
-    if problem.is_linear and shutil.which("gurobi"):
+    if not has_sparse and problem.is_linear and shutil.which("gurobi"):
         solvers.append(available_solvers["pyomo_gurobi"]["constructor"])  # gurobi has to be installed
-    if problem.is_linear and shutil.which("cbc"):
+    if not has_sparse and problem.is_linear and shutil.which("cbc"):
         solvers.append(available_solvers["pyomo_cbc"]["constructor"])
 
     # check if problem's variables are all scalars
     if var_dim == VariableDimensionEnum.scalar:
         # nevergrad and scipy solvers work with all(?) problems with only scalar valued variables
-        solvers.append(available_solvers["nevergrad"]["constructor"])
+        if not has_sparse:
+            solvers.append(available_solvers["nevergrad"]["constructor"])
         solvers.append(available_solvers["scipy_minimize"]["constructor"])
         solvers.append(available_solvers["scipy_de"]["constructor"])
     return solvers
@@ -188,6 +258,9 @@ def guess_best_solver(problem: Problem) -> BaseSolver:
 
     # check if problem has a discrete definition
     has_discrete = problem.discrete_representation is not None
+
+    # sparse constants are not supported by the Pyomo and Sympy evaluators
+    has_sparse = any(isinstance(const, SparseTensorConstant) for const in problem.constants or [])
 
     # TODO: when figured out what solver is best for problems with tensor variables: it seems that e.g. the
     # forest problems don't work with pyomo_cbc. So VERY MUCH a quick fix to get something working, as those types of
@@ -236,7 +309,8 @@ def guess_best_solver(problem: Problem) -> BaseSolver:
 
     # check if the problem is differentiable and if it is mixed integer
     if (
-        problem.is_twice_differentiable
+        not has_sparse
+        and problem.is_twice_differentiable
         and shutil.which("bonmin")
         and problem.variable_domain
         in [
@@ -248,11 +322,16 @@ def guess_best_solver(problem: Problem) -> BaseSolver:
 
     # check if the problem is differentiable and continuous
     if (
-        problem.is_twice_differentiable
+        not has_sparse
+        and problem.is_twice_differentiable
         and shutil.which("ipopt")
         and problem.variable_domain == VariableDomainTypeEnum.continuous
     ):
         return available_solvers["pyomo_ipopt"]["constructor"]
+
+    # nevergrad uses the Sympy evaluator, so fall back to the Polars-based scipy heuristic instead
+    if has_sparse:
+        return available_solvers["scipy_de"]["constructor"]
 
     # else, guess nevergrad heuristics to be the best
     return available_solvers["nevergrad"]["constructor"]
@@ -366,7 +445,11 @@ def flip_maximized_objective_values(problem: Problem, objective_values: dict[str
 
 
 def payoff_table_method(
-    problem: Problem, solver: BaseSolver = None, *, require_success: bool = False
+    problem: Problem,
+    solver: BaseSolver = None,
+    *,
+    require_success: bool = False,
+    solver_options: BaseModel | dict[str, Any] | None = None,
 ) -> tuple[dict[str, float], dict[str, float]]:
     """Solves a representation for the ideal and nadir points for a multiobjective optimization problem.
 
@@ -375,6 +458,8 @@ def payoff_table_method(
         solver (BaseSolver): The solver to be used in solving the points. Defaults to None.
         require_success (bool): raise instead of using the result when a solve is unsuccessful or
             yields non-finite objective values, e.g. because an objective is unbounded. Defaults to False.
+        solver_options (BaseModel | dict[str, Any] | None): options passed to the solver's constructor, if given.
+            Defaults to None.
 
     Raises:
         ValueError: `require_success` is set and a solve failed.
@@ -383,7 +468,7 @@ def payoff_table_method(
         tuple[dict[str, float], dict[str, float]]: The estimated ideal and nadir points.
     """
     solver = solver if solver is not None else guess_best_solver(problem)
-    solver = solver(problem)
+    solver = solver(problem, solver_options) if solver_options else solver(problem)
 
     k = len(problem.objectives)
     po_table = np.zeros((k, k))

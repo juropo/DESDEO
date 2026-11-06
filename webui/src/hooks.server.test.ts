@@ -30,9 +30,14 @@ const callHook = (opts: {
 	request: Request;
 	cookies: ReturnType<typeof createCookieStore>;
 	fetchMock: ReturnType<typeof vi.fn>;
+	/** Pass the same `event` across calls to simulate concurrent fetches within one request --
+	 *  SvelteKit invokes `handleFetch` with the same `event` instance for every fetch a `load`
+	 *  function issues. Defaults to a fresh object per call, matching every other test here where
+	 *  each call is its own independent request. */
+	event?: HookArgs['event'];
 }) =>
 	handleFetch({
-		event: { cookies: opts.cookies } as unknown as HookArgs['event'],
+		event: opts.event ?? ({ cookies: opts.cookies } as unknown as HookArgs['event']),
 		request: opts.request,
 		fetch: opts.fetchMock
 	} as HookArgs);
@@ -336,6 +341,81 @@ describe('handleFetch', () => {
 			await callHook({ request, cookies, fetchMock });
 
 			expect(cookies.set).not.toHaveBeenCalled();
+		});
+	});
+
+	// Concurrent 401s on the same request share one refresh (see `refreshPromises`)
+
+	describe('concurrent 401s within the same request', () => {
+		it('shares one refresh call across concurrent fetches on the same event', async () => {
+			const cookies = createCookieStore({ refresh_token: 'refresh-shared' });
+			// Same `event` for both calls -- this is what actually makes them "concurrent 401s on
+			// one request" rather than two unrelated requests; every other test in this file uses
+			// a fresh `event` per call, which is why this needs its own scenario.
+			const event = { cookies } as unknown as HookArgs['event'];
+
+			const fetchMockA = vi
+				.fn()
+				.mockResolvedValueOnce(unauthorized401())
+				.mockResolvedValueOnce(ok200('{"a":true}'));
+			const fetchMockB = vi
+				.fn()
+				.mockResolvedValueOnce(unauthorized401())
+				.mockResolvedValueOnce(ok200('{"b":true}'));
+
+			mockRefreshSuccess('shared-fresh-token');
+
+			const [responseA, responseB] = await Promise.all([
+				callHook({
+					request: new Request('http://example.test/api/a'),
+					cookies,
+					fetchMock: fetchMockA,
+					event
+				}),
+				callHook({
+					request: new Request('http://example.test/api/b'),
+					cookies,
+					fetchMock: fetchMockB,
+					event
+				})
+			]);
+
+			expect(responseA.status).toBe(200);
+			expect(responseB.status).toBe(200);
+			// The one-refresh guarantee this test exists for: without de-duplication, two
+			// concurrent 401s would each call this independently.
+			expect(refreshAccessTokenRefreshPost).toHaveBeenCalledTimes(1);
+		});
+
+		it('does not share a refresh call across different events (independent requests)', async () => {
+			const cookiesA = createCookieStore({ refresh_token: 'refresh-a' });
+			const cookiesB = createCookieStore({ refresh_token: 'refresh-b' });
+
+			const fetchMockA = vi
+				.fn()
+				.mockResolvedValueOnce(unauthorized401())
+				.mockResolvedValueOnce(ok200());
+			const fetchMockB = vi
+				.fn()
+				.mockResolvedValueOnce(unauthorized401())
+				.mockResolvedValueOnce(ok200());
+
+			mockRefreshSuccess('fresh-token');
+
+			await Promise.all([
+				callHook({
+					request: new Request('http://example.test/api/a'),
+					cookies: cookiesA,
+					fetchMock: fetchMockA
+				}),
+				callHook({
+					request: new Request('http://example.test/api/b'),
+					cookies: cookiesB,
+					fetchMock: fetchMockB
+				})
+			]);
+
+			expect(refreshAccessTokenRefreshPost).toHaveBeenCalledTimes(2);
 		});
 	});
 

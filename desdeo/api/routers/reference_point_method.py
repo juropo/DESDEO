@@ -10,7 +10,7 @@ from desdeo.api.models import (
     RPMState,
     StateDB,
 )
-from desdeo.api.routers.problem import check_solver
+from desdeo.api.routers.problem import check_solver, effective_solver_options
 from desdeo.mcdm import rpm_solve_solutions
 from desdeo.problem import Problem
 from desdeo.tools import SolverResults
@@ -57,7 +57,7 @@ def solve_solutions(
         request.preference.aspiration_levels,
         request.scalarization_options,
         solver,
-        request.solver_options,
+        effective_solver_options(problem_db, request.solver_options),
         include_perturbed=request.include_perturbed,
     )
 

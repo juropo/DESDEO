@@ -10,6 +10,7 @@ from desdeo.problem.schema import (
     Constant,
     ObjectiveTypeEnum,
     Problem,
+    SparseTensorConstant,
     TensorConstant,
     TensorVariable,
     Variable,
@@ -173,7 +174,12 @@ class PolarsEvaluator:
         self.tensor_constants = None
 
         # Note: `self.parser` is assumed to be set before continuing the initialization.
-        self.parser = MathParser()
+        # Sparse constants are captured in the parsed expressions instead of the dataframe
+        self.parser = MathParser(
+            sparse_constants={
+                c.symbol: c.to_scipy_operand() for c in problem.constants or [] if isinstance(c, SparseTensorConstant)
+            }
+        )
         self._polars_init()
 
         # Note, when calling an evaluate method, it is assumed the problem has been fully parsed.

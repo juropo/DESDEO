@@ -1,10 +1,12 @@
 """Defines end-points to access and manage problems."""
 
+import itertools
 import json
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, status
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 from sqlmodel import Session, select
 
 from desdeo.api.db import get_session
@@ -12,10 +14,10 @@ from desdeo.api.models import (
     ConstrainedVariantRequest,
     ConstrainedVariantResponse,
     ForestProblemMetaData,
+    Group,
     ProblemDB,
     ProblemInfo,
     ProblemInfoSmall,
-    Group,
     ProblemMetaDataDB,
     ProblemMetaDataGetRequest,
     ProblemSelectSolverRequest,
@@ -33,11 +35,22 @@ from desdeo.api.models.representative_solution import (
 from desdeo.api.routers.user_authentication import get_current_user
 from desdeo.problem import Problem
 from desdeo.problem.schema import Constraint, ConstraintTypeEnum, TensorVariable
-from desdeo.tools.utils import available_solvers
+from desdeo.tools.utils import available_solvers, normalize_solver_options
 
 from .utils import ContextField, SessionContext, SessionContextGuard
 
 router = APIRouter(prefix="/problem")
+
+
+def _solver_selection(problem_db: ProblemDB) -> SolverSelectionMetadata | None:
+    """The last solver selection metadata row of the problem, or None."""
+    metadata: ProblemMetaDataDB = problem_db.problem_metadata
+    if metadata is None:
+        return None
+    solver_metadata_list = [
+        metadata for metadata in metadata.all_metadata if metadata.metadata_type == "solver_selection_metadata"
+    ]
+    return solver_metadata_list[-1] if solver_metadata_list != [] else None
 
 
 def check_solver(problem_db: ProblemDB):
@@ -46,20 +59,40 @@ def check_solver(problem_db: ProblemDB):
     Check if a preferred solver is set in the metadata.
     If it exist, fetch its constructor and return it. Otherwise return None.
     """
-    metadata: ProblemMetaDataDB = problem_db.problem_metadata
-    solver_metadata = None
-    if metadata is not None:
-        solver_metadata_list = [
-            metadata for metadata in metadata.all_metadata if metadata.metadata_type == "solver_selection_metadata"
-        ]
-        if solver_metadata_list != []:
-            solver_metadata = solver_metadata_list[-1]
-
+    solver_metadata = _solver_selection(problem_db)
     if solver_metadata is not None:
         solver = available_solvers[solver_metadata.solver_string_representation]["constructor"]
     else:
         solver = None
     return solver
+
+
+def effective_solver_options(
+    problem_db: ProblemDB, request_options: dict[str, Any] | None = None
+) -> BaseModel | dict[str, Any] | None:
+    """The stored solver options overridden per key by `request_options`, or None when neither is set.
+
+    With a preferred solver, both sides are normalized by `normalize_solver_options` before merging and the
+    result is the solver's options model, or a dict for solvers without one. Without a preferred solver,
+    `request_options` are returned as is.
+
+    Raises:
+        HTTPException: 422 when the options don't validate against the solver's options model.
+    """
+    solver_metadata = _solver_selection(problem_db)
+    if solver_metadata is None:
+        return request_options
+    if solver_metadata.solver_options is None and request_options is None:
+        return None
+    solver_name = solver_metadata.solver_string_representation
+    options_model = available_solvers[solver_name]["options"]
+    try:
+        options = normalize_solver_options(solver_name, solver_metadata.solver_options or {}) | (
+            normalize_solver_options(solver_name, request_options or {})
+        )
+        return options if options_model is None else options_model.model_validate(options, by_name=True)
+    except ValueError as e:  # pydantic's ValidationError is a ValueError
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
 
 
 # This is needed, because otherwise fields ending in an underscore fail to parse.
@@ -90,9 +123,7 @@ def get_problems(
 
     groups = db_session.exec(select(Group)).all()
     visible_group_problem_ids = {
-        group.problem_id
-        for group in groups
-        if user.id == group.owner_id or user.id in (group.user_ids or [])
+        group.problem_id for group in groups if user.id == group.owner_id or user.id in (group.user_ids or [])
     }
     if visible_group_problem_ids:
         group_problems = db_session.exec(select(ProblemDB).where(ProblemDB.id.in_(visible_group_problem_ids))).all()
@@ -123,9 +154,7 @@ def get_problems_info(
 
     groups = db_session.exec(select(Group)).all()
     visible_group_problem_ids = {
-        group.problem_id
-        for group in groups
-        if user.id == group.owner_id or user.id in (group.user_ids or [])
+        group.problem_id for group in groups if user.id == group.owner_id or user.id in (group.user_ids or [])
     }
     if visible_group_problem_ids:
         group_problems = db_session.exec(select(ProblemDB).where(ProblemDB.id.in_(visible_group_problem_ids))).all()
@@ -353,6 +382,13 @@ def select_solver(
             status_code=status.HTTP_403_FORBIDDEN,
         )
 
+    solver_options = request.solver_options
+    if solver_options is not None:
+        try:
+            solver_options = normalize_solver_options(request.solver_string_representation, solver_options)
+        except ValueError as e:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
+
     # All good, get on with it.
     problem_metadata = problem_db.problem_metadata or ProblemMetaDataDB(problem_id=problem_db.id, problem=problem_db)
     db_session.add(problem_metadata)
@@ -368,6 +404,7 @@ def select_solver(
     solver_selection_metadata = SolverSelectionMetadata(
         metadata_id=problem_metadata.id,
         solver_string_representation=request.solver_string_representation,
+        solver_options=solver_options,
         metadata_instance=problem_metadata,
     )
 
@@ -611,8 +648,6 @@ def create_constrained_variant(
     # Pyomo creates tensor variables with index sets for each dimension of the shape,
     # so shape [60, 1] needs a 2D index (i, 1). Shape [3, 4] would enumerate all 12
     # elements as sv_1..sv_12 in row-major order with 1-based Pyomo indices.
-    import itertools
-
     var_symbol_to_expr: dict[str, str | list] = {}
     for v in problem.variables:
         if isinstance(v, TensorVariable):
@@ -670,6 +705,7 @@ def create_constrained_variant(
             variant_solver = SolverSelectionMetadata(
                 metadata_id=variant_metadata.id,
                 solver_string_representation=parent_solver_meta[-1].solver_string_representation,
+                solver_options=parent_solver_meta[-1].solver_options,
             )
             db_session.add(variant_solver)
             db_session.commit()

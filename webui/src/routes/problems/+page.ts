@@ -1,11 +1,12 @@
 import type { PageLoad } from './$types';
 import { getDmUsersUsersDmsGet, getProblemsInfoProblemAllInfoGet } from '$lib/gen/endpoints/DESDEOFastAPI';
 import type { UserPublic } from '$lib/gen/endpoints/DESDEOFastAPI';
+import { withFetch } from '$lib/api/ssr-fetch';
 
-export const load: PageLoad = async () => {
+export const load: PageLoad = async ({ fetch }) => {
 	const [problemsRes, dmsRes] = await Promise.all([
-		getProblemsInfoProblemAllInfoGet(),
-		getDmUsersUsersDmsGet().catch(() => null)
+		getProblemsInfoProblemAllInfoGet(withFetch(fetch)),
+		getDmUsersUsersDmsGet(withFetch(fetch)).catch(() => null)
 	]);
 
 	if (problemsRes.status !== 200) {

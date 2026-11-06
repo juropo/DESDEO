@@ -96,11 +96,11 @@ def test_expected_asf_optimal_scalarization_is_finite(solve_result):
 
 @pytest.fixture(name="cvar_asf_problem")
 def cvar_asf_problem_fixture(model):
-    """Combined problem with CVaR (alpha=0.95) of the per-leaf ASF scalarizations."""
+    """Combined problem with CVaR (alpha=0.05) of the per-leaf ASF scalarizations."""
     asf_base, scal = add_asf_diff(model.base_problem, "asf", _REF, ideal=_IDEAL, nadir=_NADIR)
     asf_model = model.with_base_problem(problem=asf_base)
     combined, symbol_maps = build_combined_scenario_problem(asf_model)
-    return add_conditional_value_at_risk(asf_model, [scal], alpha=0.95, combined=combined, symbol_maps=symbol_maps)
+    return add_conditional_value_at_risk(asf_model, [scal], alpha=0.05, combined=combined, symbol_maps=symbol_maps)
 
 
 @pytest.fixture(name="cvar_solve_result")
@@ -205,6 +205,73 @@ def test_cvar_objective_value_matches_tail_mean(maximize, expected):
     for leaf in ("s_1", "s_2", "s_3", "s_4"):
         assert result.optimal_variables[f"{leaf}_x"] == pytest.approx(1.0 if maximize else 0.0)
     assert result.optimal_objectives[cvar_sym] == pytest.approx(expected)
+
+
+def _two_outcome_model(maximize: bool = True) -> ScenarioModel:
+    """Objective u = x + c with x fixed to 0, c = 0 (p = 0.1) or 100 (p = 0.9)."""
+    base_problem = Problem(
+        name="CVaR tail mass test problem",
+        description="u = x + c with a per-leaf constant c.",
+        variables=[
+            Variable(name="x", symbol="x", variable_type=VariableTypeEnum.real, lowerbound=0, upperbound=0),
+        ],
+        constants=[Constant(name="c", symbol="c", value=0.0)],
+        objectives=[
+            Objective(
+                name="u",
+                symbol="u",
+                func="x + c",
+                maximize=maximize,
+                is_linear=True,
+                is_convex=True,
+                is_twice_differentiable=True,
+            ),
+        ],
+    )
+    return ScenarioModel(
+        scenario_tree={"ROOT": ["s_1", "s_2"], "s_1": [], "s_2": []},
+        scenario_probabilities={"s_1": 0.1, "s_2": 0.9},
+        base_problem=base_problem,
+        constants=[
+            Constant(name="c (s_1)", symbol="c", value=0.0),
+            Constant(name="c (s_2)", symbol="c", value=100.0),
+        ],
+        scenarios={"s_1": Scenario(constants={"c": 0}), "s_2": Scenario(constants={"c": 1})},
+    )
+
+
+@pytest.mark.scenario
+@pytest.mark.gurobipy
+@pytest.mark.parametrize(
+    ("maximize", "alpha", "expected"),
+    [
+        # Maximising: the worst 5 % lies entirely in the u = 0 outcome.
+        (True, 0.05, 0.0),
+        # Maximising: the worst 95 % is the whole u = 0 outcome plus 0.85 of the u = 100 outcome.
+        (True, 0.95, 85.0 / 0.95),
+        # Minimising: the worst 5 % lies entirely in the u = 100 outcome.
+        (False, 0.05, 100.0),
+        # Minimising: the worst 95 % is the whole u = 100 outcome plus 0.05 of the u = 0 outcome.
+        (False, 0.95, 90.0 / 0.95),
+    ],
+)
+def test_cvar_alpha_is_tail_mass(maximize, alpha, expected):
+    """CVaR averages the worst ``alpha`` probability mass in the objective's direction."""
+    problem, added = add_conditional_value_at_risk(_two_outcome_model(maximize), ["u"], alpha=alpha)
+    cvar_sym = added["u"]
+
+    result = GurobipySolver(problem).solve(cvar_sym)
+
+    assert result.success
+    assert result.optimal_objectives[cvar_sym] == pytest.approx(expected)
+
+
+@pytest.mark.scenario
+@pytest.mark.parametrize("alpha", [0.0, 1.0, -0.1, 1.5])
+def test_cvar_alpha_outside_unit_interval_raises(alpha):
+    """Alpha must lie strictly between 0 and 1."""
+    with pytest.raises(ValueError, match="alpha"):
+        add_conditional_value_at_risk(_two_outcome_model(), ["u"], alpha=alpha)
 
 
 # ---------------------------------------------------------------------------

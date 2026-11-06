@@ -26,6 +26,7 @@ def add_expected_asf(
     scenario_model: "ScenarioModel",
     symbol: str,
     reference_point: dict[str, float],
+    *,
     ideal: dict[str, float] | None = None,
     nadir: dict[str, float] | None = None,
     rho: float = 1e-6,
@@ -158,6 +159,7 @@ def add_conditional_value_at_risk(
     scenario_model: "ScenarioModel",
     symbols: list[str],
     alpha: float,
+    *,
     var_prefix: str = "VAR_",
     cvar_prefix: str = "CVAR_",
     combined: "Problem | None" = None,
@@ -171,10 +173,10 @@ def add_conditional_value_at_risk(
     - ``{leaf}_{var_prefix}{sym}``: per-leaf auxiliary z_s ≥ 0 such that
       z_s >= sym_s - eta.
     - ``{leaf}_{var_prefix}{sym}_con``: per-leaf LTE constraint sym_s - eta - z_s <= 0.
-    - ``{cvar_prefix}{sym}``: CVaR = eta + 1/(1-alpha) * sum_s p_s * z_s.
+    - ``{cvar_prefix}{sym}``: CVaR = eta + 1/alpha * sum_s p_s * z_s.
 
     For maximized objectives the bad tail is the low values, so the constraints are
-    eta - sym_s - z_s <= 0 and CVaR = eta - 1/(1-alpha) * sum_s p_s * z_s, which stays
+    eta - sym_s - z_s <= 0 and CVaR = eta - 1/alpha * sum_s p_s * z_s, which stays
     maximized. Non-objective elements always use the minimization form.
 
     The CVaR element preserves the type of the original element (objective stays
@@ -184,7 +186,8 @@ def add_conditional_value_at_risk(
     Args:
         scenario_model: the ScenarioModel used to build or match ``combined``.
         symbols: original symbols whose CVaR should be added.
-        alpha: confidence level, 0 < alpha < 1 (e.g., 0.95 for 95% CVaR).
+        alpha: probability mass of the averaged tail of worst outcomes in the element's
+            own direction, 0 < alpha < 1, e.g. 0.05 for the worst 5 % (often called CVaR 95 %).
         var_prefix: prefix for the VaR threshold and auxiliary variables.
             Defaults to ``'VAR_'``.
         cvar_prefix: prefix for the resulting CVaR element. Defaults to ``'CVAR_'``.
@@ -197,12 +200,16 @@ def add_conditional_value_at_risk(
             symbol to its CVaR symbol.
 
     Raises:
-        ValueError: if a requested symbol is not found in the combined problem.
+        ValueError: if alpha is not in (0, 1) or a requested symbol is not found in the
+            combined problem.
     """
+    if not 0.0 < alpha < 1.0:
+        msg = f"alpha must be in (0, 1), got {alpha}."
+        raise ValueError(msg)
     if combined is None or symbol_maps is None:
         combined, symbol_maps = build_combined_scenario_problem(scenario_model)
     weights = scenario_model.leaf_scenarios
-    scale = 1.0 / (1.0 - alpha)
+    scale = 1.0 / alpha
 
     new_variables = list(combined.variables)
     new_objectives = list(combined.objectives or [])

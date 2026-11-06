@@ -117,6 +117,18 @@
 		},
 	];
 
+	// Declared before `methods` below (which reads `data.groupId` inside a `$derived` -- `$derived`
+	// evaluates its expression immediately, so `data` must already be initialized by that point;
+	// having this declaration after that `$derived` threw `ReferenceError: Cannot access 'data'
+	// before initialization` on every render).
+	const { data } = $props<{
+			data: {
+				problems: ProblemInfo[],
+				groupId?: string // This exists only in GDM when user comes to this page through group selecting page.
+			}
+		}>();
+	let problemList = $derived(data.problems ?? []);
+
 	// Add group parameter to paths when needed
 	const methods = $derived(
 		baseMethods.map(method => ({
@@ -136,14 +148,6 @@
 	let isCompactView = $state(false);
 	let selectedSessionId: number | null = $state(null);
 	let selectedSessionInfo: string | null = $state(null);
-
-	const { data } = $props<{
-			data: {
-				problems: ProblemInfo[],
-				groupId?: string // This exists only in GDM when user comes to this page through group selecting page.
-			}
-		}>();
-	let problemList = $derived(data.problems ?? []);
 
 	const preferenceTypes = [...new Set(baseMethods.flatMap((m) => m.preferencesType))];
 

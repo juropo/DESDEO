@@ -15,6 +15,7 @@ from desdeo.problem.schema import (
     Objective,
     Problem,
     ScalarizationFunction,
+    SparseTensorConstant,
     TensorConstant,
     TensorVariable,
     Variable,
@@ -199,6 +200,8 @@ class GurobipyEvaluator:
                 constants[con.symbol] = con.value
             elif isinstance(con, TensorConstant):
                 constants[con.symbol] = con.get_values()
+            elif isinstance(con, SparseTensorConstant):
+                constants[con.symbol] = con.to_scipy_operand()
 
         return constants
 

@@ -3,14 +3,19 @@
 NOTE: No routers should be defined in this file!
 """
 
+import hashlib
+import json
+import threading
+from collections import OrderedDict
 from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Annotated, Any
 
+import sqlalchemy
 from fastapi import Depends, HTTPException, status
 from numpy import allclose
-from sqlmodel import Session, select
+from sqlmodel import Session, func, select
 
 from desdeo.api.db import get_session
 from desdeo.api.models import (
@@ -24,38 +29,56 @@ from desdeo.api.models import (
     SavedSolutionReference,
     ScenarioModelDB,
     SolutionReference,
+    SparseTensorConstantDB,
     StateDB,
     User,
     UserRole,
     UserSavedSolutionDB,
 )
-from desdeo.api.models.cumulus import ProblemModification
+from desdeo.api.models.cumulus import ProblemModification, UncertaintyMeasureSpec
 from desdeo.api.models.generic_states import StateKind
 from desdeo.api.models.problem import (
     ForestProblemMetaData,
+    GraphicalModelMetaData,
     ProblemMetaDataDB,
     RepresentativeNonDominatedSolutions,
     SiteSelectionMetaData,
     SolutionDescriptionMetaData,
     SolverSelectionMetadata,
+    StationaryModelMetaData,
 )
 from desdeo.api.models.session import CreateSessionRequest
 from desdeo.api.routers.user_authentication import get_current_user
 from desdeo.problem import Problem
+from desdeo.problem.graphical import (
+    DecisionAnnotation,
+    DiscreteNetwork,
+    IndexMap,
+    RootedJunctionTree,
+    build_outcome_distributions,
+)
 from desdeo.problem.schema import (
     Constant,
     Constraint,
     ExtraFunction,
     Objective,
     ScalarizationFunction,
+    SparseTensorConstant,
     TensorConstant,
     TensorVariable,
     Variable,
 )
 from desdeo.problem.utils import ProblemUtilsError, add_soft_constraint, determine_function_properties
 from desdeo.tools import SolverResults, guess_best_solver
+from desdeo.tools.outcome_distribution import (
+    OutcomeDistribution,
+    add_cvar_dd,
+    add_expected_value_dd,
+    add_worst_case_dd,
+    cvar_dd_constraint_symbols,
+)
 from desdeo.tools.robust import add_weighted_scenarios, add_worst_case_robust
-from desdeo.tools.scenarios import build_combined_scenario_problem
+from desdeo.tools.scenarios import build_combined_scenario_problem, symbols_in
 from desdeo.tools.stochastic import add_conditional_value_at_risk, add_expected_value
 from desdeo.tools.utils import payoff_table_method
 
@@ -77,6 +100,78 @@ def get_solver_results_at(actual_state, index: int) -> SolverResults:
         )
     results = actual_state.solver_results
     return results[index] if isinstance(results, list) else results
+
+
+_PROBLEM_CACHE_SIZE = 3
+# Digest -> (problem id, loaded problem).
+_problem_cache: OrderedDict[str, tuple[int, Problem]] = OrderedDict()
+_problem_cache_lock = threading.Lock()
+
+
+@sqlalchemy.event.listens_for(ProblemDB, "after_delete")
+def _evict_deleted_problem(mapper, connection, target: ProblemDB) -> None:
+    """Drop a deleted problem's cache entries, since SQLite may reuse its ids for a different problem."""
+    with _problem_cache_lock:
+        for key in [key for key, (problem_id, _) in _problem_cache.items() if problem_id == target.id]:
+            del _problem_cache[key]
+
+
+def _problem_cache_key(problem_db: ProblemDB, sparse_constants: list) -> str:
+    """A digest of the columns of `problem_db`'s rows, with only the ids, symbols and shapes of its sparse constants.
+
+    Objective ideals and nadirs are updated in place, so the key covers the row contents rather than just the id.
+    """
+    rows = [
+        problem_db,
+        *problem_db.constants,
+        *problem_db.tensor_constants,
+        *problem_db.variables,
+        *problem_db.tensor_variables,
+        *problem_db.objectives,
+        *problem_db.constraints,
+        *problem_db.scalarization_funcs,
+        *problem_db.extra_funcs,
+        *problem_db.simulators,
+        *([problem_db.discrete_representation] if problem_db.discrete_representation is not None else []),
+    ]
+    digest = hashlib.sha256()
+    for row in rows:
+        # `getattr` loads expired attributes.
+        columns = {attr.key: getattr(row, attr.key) for attr in sqlalchemy.inspect(row).mapper.column_attrs}
+        digest.update(json.dumps(columns, sort_keys=True, default=str).encode())
+    digest.update(json.dumps(sparse_constants).encode())
+    return digest.hexdigest()
+
+
+def load_problem(problem_db: ProblemDB) -> Problem:
+    """`Problem.from_problemdb`, cached in-process for problems with sparse tensor constants.
+
+    Those problems can take seconds to load, so the last `_PROBLEM_CACHE_SIZE` of them are kept.
+    """
+    session = Session.object_session(problem_db)
+    sparse_constants = (
+        session.exec(
+            select(SparseTensorConstantDB.id, SparseTensorConstantDB.symbol, SparseTensorConstantDB.shape)
+            .where(SparseTensorConstantDB.problem_id == problem_db.id)
+            .order_by(SparseTensorConstantDB.id)
+        ).all()
+        if session is not None
+        else []
+    )
+    if not sparse_constants:
+        return Problem.from_problemdb(problem_db)
+
+    key = _problem_cache_key(problem_db, [list(row) for row in sparse_constants])
+    with _problem_cache_lock:
+        if key in _problem_cache:
+            _problem_cache.move_to_end(key)
+            return _problem_cache[key][1]
+    problem = Problem.from_problemdb(problem_db)
+    with _problem_cache_lock:
+        _problem_cache[key] = (problem_db.id, problem)
+        while len(_problem_cache) > _PROBLEM_CACHE_SIZE:
+            _problem_cache.popitem(last=False)
+    return problem
 
 
 def copy_problem_metadata(source_problem_db: ProblemDB, target_problem_db: ProblemDB, db_session: Session) -> None:
@@ -121,6 +216,7 @@ def copy_problem_metadata(source_problem_db: ProblemDB, target_problem_db: Probl
             SolverSelectionMetadata(
                 metadata_id=new_meta.id,
                 solver_string_representation=item.solver_string_representation,
+                solver_options=item.solver_options,
             )
         )
     for item in source_meta.site_selection_metadata or []:
@@ -144,6 +240,92 @@ def copy_problem_metadata(source_problem_db: ProblemDB, target_problem_db: Probl
                 separator=item.separator,
             )
         )
+    for item in source_meta.graphical_model_metadata or []:
+        # Missing until a Phase 7 review pass caught it: without this loop, any flow going through
+        # `copy_problem_metadata` (e.g. Cumulus's problem-modification path) silently dropped a
+        # compiled diagram's `GraphicalModelMetaData` row on the copy, leaving
+        # `/graphical/{id}/structure`/`/whatif` both 404ing on the copy forever with no way to
+        # notice why.
+        db_session.add(
+            GraphicalModelMetaData(
+                metadata_id=new_meta.id,
+                network_json=item.network_json,
+                annotation_json=item.annotation_json,
+                rjt_json=item.rjt_json,
+                index_map_json=item.index_map_json,
+                assumptions_json=item.assumptions_json,
+            )
+        )
+    for item in source_meta.stationary_model_metadata or []:
+        db_session.add(
+            StationaryModelMetaData(
+                metadata_id=new_meta.id,
+                diagram_json=item.diagram_json,
+                index_map_json=item.index_map_json,
+            )
+        )
+
+
+def find_graphical_metadata(problem_id: int, db_session: Session) -> GraphicalModelMetaData | None:
+    """The most recently added `GraphicalModelMetaData` row for `problem_id`, if any.
+
+    Queried directly with an explicit order, since `ProblemMetaDataDB.all_metadata` is unordered.
+    """
+    return db_session.exec(
+        select(GraphicalModelMetaData)
+        .join(ProblemMetaDataDB, GraphicalModelMetaData.metadata_id == ProblemMetaDataDB.id)
+        .where(ProblemMetaDataDB.problem_id == problem_id)
+        .order_by(GraphicalModelMetaData.id.desc())
+    ).first()
+
+
+def find_stationary_metadata(problem_id: int, db_session: Session) -> StationaryModelMetaData | None:
+    """The most recently added `StationaryModelMetaData` row for `problem_id`, if any."""
+    return db_session.exec(
+        select(StationaryModelMetaData)
+        .join(ProblemMetaDataDB, StationaryModelMetaData.metadata_id == ProblemMetaDataDB.id)
+        .where(ProblemMetaDataDB.problem_id == problem_id)
+        .order_by(StationaryModelMetaData.id.desc())
+    ).first()
+
+
+def graphical_outcome_distributions(
+    problem: Problem, meta: GraphicalModelMetaData
+) -> tuple[Problem, dict[str, OutcomeDistribution]]:
+    """`meta`'s outcome distributions, and `problem` with the `pu_*` extra functions they reference.
+
+    A problem compiled before `IndexMap.outcome_distributions` existed has neither, so both are
+    rebuilt from the stored network, annotation, RJT and cluster index maps. A problem that was
+    never compiled (no stored index map) has no distributions.
+
+    Raises:
+        ValueError: `problem` already has a `pu_*` extra function that differs from the rebuilt one.
+    """
+    if meta.index_map_json is None or meta.rjt_json is None:
+        return problem, {}
+
+    index_map = IndexMap.model_validate_json(meta.index_map_json)
+    existing = {extra_func.symbol: extra_func for extra_func in problem.extra_funcs or []}
+    distributions = index_map.outcome_distributions
+    if distributions and all(
+        symbol in existing for distribution in distributions.values() for symbol in distribution.probabilities
+    ):
+        return problem, distributions
+
+    distributions, extra_funcs = build_outcome_distributions(
+        DiscreteNetwork.model_validate_json(meta.network_json),
+        DecisionAnnotation.model_validate_json(meta.annotation_json),
+        RootedJunctionTree.model_validate_json(meta.rjt_json),
+        index_map.clusters,
+    )
+    missing = []
+    for extra_func in extra_funcs:
+        if extra_func.symbol not in existing:
+            missing.append(extra_func)
+        elif existing[extra_func.symbol].func != extra_func.func:
+            msg = f"Problem's extra function '{extra_func.symbol}' doesn't match the rebuilt outcome probability."
+            raise ValueError(msg)
+    return problem.model_copy(update={"extra_funcs": [*(problem.extra_funcs or []), *missing]}), distributions
 
 
 def _apply_soft_constraints(
@@ -169,15 +351,110 @@ def _apply_soft_constraints(
     return problem
 
 
-def _apply_uncertainty_measures(problem: Problem, mods: ProblemModification, db_session: Session) -> Problem:
-    specs = mods.uncertainty_measures or []
-    sm_ids = {spec.scenario_model_id for spec in specs}
-    if len(sm_ids) > 1:
+def _apply_graphical_uncertainty_measures(
+    problem: Problem, specs: list[UncertaintyMeasureSpec], graphical_meta: GraphicalModelMetaData | None
+) -> Problem:
+    """`problem` with the aggregates in `specs` as its only objectives, over its outcome distributions.
+
+    The auxiliary variables and constraints of a compiled CVaR risk measure go with its objective.
+    """
+    if graphical_meta is None:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="All uncertainty measures in a single request must reference the same scenario_model_id.",
+            detail="No scenario_model_id was given and the problem has no graphical model.",
         )
-    sm_id = next(iter(sm_ids))
+    try:
+        problem, distributions = graphical_outcome_distributions(problem, graphical_meta)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
+    objective_symbols = {objective.symbol for objective in problem.objectives}
+
+    aggregate_symbols: set[str] = set()
+    for spec in specs:
+        if spec.measure_type == "weighted_scenarios":
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="'weighted_scenarios' is not available for a graphical model.",
+            )
+        if spec.measure_type == "conditional_value_at_risk" and spec.alpha is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="'alpha' is required for 'conditional_value_at_risk'.",
+            )
+        unknown = [s for s in spec.symbols if s not in objective_symbols or s not in distributions]
+        if unknown:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Symbol(s) {unknown} are not objectives of this problem with an outcome distribution.",
+            )
+        try:
+            if spec.measure_type == "expected_value":
+                problem, new_symbols = add_expected_value_dd(
+                    problem, distributions, spec.symbols, prefix=spec.prefix or "E_"
+                )
+            elif spec.measure_type == "worst_case_robust":
+                problem, new_symbols = add_worst_case_dd(
+                    problem, distributions, spec.symbols, prefix=spec.prefix or "robust_"
+                )
+            else:
+                problem, new_symbols = add_cvar_dd(
+                    problem, distributions, spec.symbols, alpha=spec.alpha, prefix=spec.prefix or "CVAR_"
+                )
+        except ValueError as e:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Failed to apply uncertainty measure '{spec.measure_type}': {e}",
+            ) from e
+        aggregate_symbols.update(new_symbols.values())
+
+    if not aggregate_symbols:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="The uncertainty measures produced no aggregates to use as objectives.",
+        )
+
+    objectives = [objective for objective in problem.objectives if objective.symbol in aggregate_symbols]
+    dropped = {objective.symbol for objective in problem.objectives} - aggregate_symbols
+
+    risk_aux: set[str] = set()
+    risk_constraints: set[str] = set()
+    for symbol, risk_map in IndexMap.model_validate_json(graphical_meta.index_map_json).risk_measures.items():
+        if symbol in dropped:
+            risk_aux |= {
+                risk_map.eta_symbol,
+                risk_map.lambda_symbol,
+                risk_map.lambda_bar_symbol,
+                risk_map.rho_symbol,
+                risk_map.rho_bar_symbol,
+            }
+            risk_constraints |= cvar_dd_constraint_symbols(symbol, len(risk_map.utility_values))
+    variables = [variable for variable in problem.variables if variable.symbol not in risk_aux]
+    constraints = [c for c in problem.constraints or [] if c.symbol not in risk_constraints]
+
+    gone = dropped | risk_aux
+    referencing = [
+        element.symbol
+        for element in [*constraints, *(problem.extra_funcs or []), *(problem.scalarization_funcs or [])]
+        if symbols_in(element.func) & gone
+    ]
+    if referencing:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"Element(s) {referencing} reference objectives the uncertainty aggregates replace "
+                f"({sorted(dropped)}), or their risk-measure variables."
+            ),
+        )
+
+    return problem.model_copy(
+        update={"objectives": objectives, "variables": variables, "constraints": constraints or None}
+    )
+
+
+def _apply_scenario_uncertainty_measures(
+    problem: Problem, specs: list[UncertaintyMeasureSpec], sm_id: int, db_session: Session
+) -> Problem:
+    """The combined scenario problem of `problem` with the aggregates in `specs` added."""
     scenario_model_db = db_session.get(ScenarioModelDB, sm_id)
     if scenario_model_db is None:
         raise HTTPException(
@@ -241,6 +518,28 @@ def _apply_uncertainty_measures(problem: Problem, mods: ProblemModification, db_
                 detail=f"Failed to apply uncertainty measure '{spec.measure_type}': {e}",
             ) from e
 
+    return combined
+
+
+def _apply_uncertainty_measures(
+    problem: Problem,
+    mods: ProblemModification,
+    db_session: Session,
+    graphical_meta: GraphicalModelMetaData | None = None,
+) -> Problem:
+    specs = mods.uncertainty_measures or []
+    sm_ids = {spec.scenario_model_id for spec in specs}
+    if len(sm_ids) > 1:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="All uncertainty measures in a single request must reference the same scenario_model_id.",
+        )
+    sm_id = next(iter(sm_ids))
+    if sm_id is None:
+        combined = _apply_graphical_uncertainty_measures(problem, specs, graphical_meta)
+    else:
+        combined = _apply_scenario_uncertainty_measures(problem, specs, sm_id, db_session)
+
     # Run the payoff table synchronously so the combined problem already has correct
     # ideal/nadir when it is saved to the database. Combined objectives are new symbols
     # with no bounds; we can't safely inherit from the originals.
@@ -295,7 +594,7 @@ def _constraints_without_stated_properties(mods: ProblemModification) -> list[st
     return symbols
 
 
-def _parse_and_merge_elements(
+def _parse_and_merge_elements(  # noqa: C901
     problem: Problem,
     mods: ProblemModification,
     symbol_to_type: dict,
@@ -311,7 +610,9 @@ def _parse_and_merge_elements(
             return TensorVariable.model_validate(d, by_name=True)
         return Variable.model_validate(d, by_name=True)
 
-    def _parse_constant(d: dict) -> Constant | TensorConstant:
+    def _parse_constant(d: dict) -> Constant | TensorConstant | SparseTensorConstant:
+        if "indices" in d:
+            return SparseTensorConstant.model_validate(d, by_name=True)
         if "shape" in d:
             return TensorConstant.model_validate(d, by_name=True)
         return Constant.model_validate(d, by_name=True)
@@ -440,7 +741,12 @@ def determine_unstated_constraint_properties(problem: Problem, symbols: Iterable
     return problem
 
 
-def apply_problem_modifications(problem: Problem, mods: ProblemModification, db_session: Session) -> Problem:
+def apply_problem_modifications(
+    problem: Problem,
+    mods: ProblemModification,
+    db_session: Session,
+    graphical_meta: GraphicalModelMetaData | None = None,
+) -> Problem:
     """Apply a ProblemModification spec to a Problem and return the modified result.
 
     Operations are applied in this order:
@@ -458,6 +764,8 @@ def apply_problem_modifications(problem: Problem, mods: ProblemModification, db_
         problem: the current Problem instance to modify.
         mods: the modification specification from the request.
         db_session: an active database session (needed for uncertainty-measure look-ups).
+        graphical_meta: the problem's graphical model, which uncertainty measures without a
+            ``scenario_model_id`` aggregate over.
 
     Raises:
         HTTPException 404: a referenced ScenarioModelDB does not exist.
@@ -487,7 +795,7 @@ def apply_problem_modifications(problem: Problem, mods: ProblemModification, db_
     modified_problem = _apply_soft_constraints(modified_problem, mods, soft_candidate_constraints)
 
     if mods.uncertainty_measures:
-        modified_problem = _apply_uncertainty_measures(modified_problem, mods, db_session)
+        modified_problem = _apply_uncertainty_measures(modified_problem, mods, db_session, graphical_meta)
 
     # Last, so that the analysis sees the problem in its final shape.
     return determine_unstated_constraint_properties(modified_problem, _constraints_without_stated_properties(mods))
@@ -883,10 +1191,19 @@ def filter_duplicates(solutions: list[SavedSolutionReference]) -> list[SavedSolu
 
 
 def collect_saved_solutions(user: User, problem_id: int, session: Session) -> list[SavedSolutionReference]:
-    """Collects all saved solutions for the user and problem."""
+    """Collects the user's saved solutions for the problem in their active session.
+
+    A save belongs to the session of the state that saved it, or else of the state it came from.
+    """
     user_saved_solutions = session.exec(
-        select(UserSavedSolutionDB).where(
-            UserSavedSolutionDB.problem_id == problem_id, UserSavedSolutionDB.user_id == user.id
+        select(UserSavedSolutionDB)
+        .join(
+            StateDB, StateDB.id == func.coalesce(UserSavedSolutionDB.save_state_id, UserSavedSolutionDB.origin_state_id)
+        )
+        .where(
+            UserSavedSolutionDB.problem_id == problem_id,
+            UserSavedSolutionDB.user_id == user.id,
+            StateDB.session_id == user.active_session_id,
         )
     ).all()
 
