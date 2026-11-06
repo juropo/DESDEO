@@ -2,9 +2,12 @@
 
 import contextlib
 import io
+import logging
 import sys
+from typing import Any, Self
 
 import gurobipy as gp
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from desdeo.problem import (
     Constraint,
@@ -16,6 +19,93 @@ from desdeo.problem import (
     Variable,
 )
 from desdeo.tools.generics import BaseSolver, PersistentSolver, SolverResults
+
+logger = logging.getLogger(__name__)
+
+_GUROBI_PARAMETER_NAMES = {name.lower(): name for name in dir(gp.GRB.Param) if not name.startswith("_")}
+"""Gurobi's parameter names by their lowercased name (Gurobi matches them case-insensitively)."""
+
+
+class GurobipyOptions(BaseModel):
+    """Defines a pydantic model to store and pass Gurobi parameters to the gurobipy solvers.
+
+    Fields are named by Gurobi's parameter names. Any other Gurobi parameter can be given by its Gurobi name
+    and is passed on as is; Gurobi validates the values. Names are matched case-insensitively, as Gurobi does,
+    and normalised to the field's or Gurobi's spelling. An explicit `None` for an optional field means Gurobi's
+    default, also overriding a stored value. For available parameters see
+    https://docs.gurobi.com/projects/optimizer/en/current/reference/parameters.html
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    OutputFlag: int = Field(description="Whether Gurobi logs its output.", default=0)
+    LogToConsole: int = Field(description="Whether Gurobi logs to the console.", default=0)
+    IntegralityFocus: int = Field(
+        description=(
+            "Whether Gurobi keeps MIP solutions feasible after rounding binaries, so that big-M "
+            "formulations cannot pass flow through nearly-zero binaries."
+        ),
+        default=1,
+    )
+    FeasibilityTol: float | None = Field(
+        description="Primal feasibility tolerance. None leaves Gurobi's default.", default=None
+    )
+    OptimalityTol: float | None = Field(
+        description="Dual feasibility tolerance. None leaves Gurobi's default.", default=None
+    )
+    TimeLimit: float | None = Field(description="Time limit in seconds. None leaves Gurobi's default.", default=None)
+    MIPGap: float | None = Field(description="Relative MIP optimality gap. None leaves Gurobi's default.", default=None)
+    Threads: int | None = Field(
+        description="Number of threads, 0 letting Gurobi choose. None leaves Gurobi's default.", default=None
+    )
+    NumericFocus: int | None = Field(
+        description="Numerical caution; higher values make Gurobi more careful. None leaves Gurobi's default.",
+        default=None,
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_parameter_names(cls, data: Any) -> Any:
+        """Rename keys to the declared field's or Gurobi's spelling; of case-variants, keep the one in that spelling."""
+        if not isinstance(data, dict):
+            return data
+        declared = {name.lower(): name for name in cls.model_fields}
+        normalized = {}
+        for key, value in data.items():
+            if not isinstance(key, str):
+                normalized[key] = value
+                continue
+            name = declared.get(key.lower()) or _GUROBI_PARAMETER_NAMES.get(key.lower(), key)
+            if name in normalized:
+                logger.warning(
+                    "Gurobi parameter %r is given in several spellings (including %r); the spelling %r is kept if "
+                    "given, else the first.",
+                    name,
+                    key,
+                    name,
+                )
+                if key != name:
+                    continue
+            normalized[name] = value
+        return normalized
+
+    @model_validator(mode="after")
+    def _warn_unknown_parameters(self) -> Self:
+        """Warn about extra parameters the installed Gurobi doesn't know; they are kept."""
+        unknown = sorted(key for key in self.model_extra if key.lower() not in _GUROBI_PARAMETER_NAMES)
+        if unknown:
+            logger.warning(
+                "Unknown Gurobi parameters %s are kept; Gurobi rejects them when the solver is constructed.", unknown
+            )
+        return self
+
+
+def _set_gurobi_parameters(model: gp.Model, options: GurobipyOptions | dict[str, Any] | None) -> None:
+    """Set the non-None fields and the extras of `options` (a dict is validated first) on `model`."""
+    if not isinstance(options, GurobipyOptions):
+        options = GurobipyOptions.model_validate(options or {})
+    for key, value in options.model_dump(exclude_none=True).items():
+        model.setParam(key, value)
 
 
 def _constraint_contains_objective(constraint: Constraint, objective_symbol: str) -> bool:
@@ -114,15 +204,10 @@ def parse_gurobipy_optimizer_results(problem: Problem, evaluator: GurobipyEvalua
     )
 
 
-# Gurobi output is suppressed. IntegralityFocus keeps MIP solutions feasible after rounding
-# binaries, so that big-M formulations cannot pass flow through nearly-zero binaries.
-_DEFAULT_GUROBI_OPTIONS: dict[str, any] = {"OutputFlag": 0, "LogToConsole": 0, "IntegralityFocus": 1}
-
-
 class GurobipySolver(BaseSolver):
     """Creates a gurobipy solver that utilizes gurobi's own Python implementation."""
 
-    def __init__(self, problem: Problem, options: dict[str, any] | None = None):
+    def __init__(self, problem: Problem, options: GurobipyOptions | dict[str, Any] | None = None):
         """The solver is initialized by supplying a problem and options.
 
         Unlike with Pyomo you do not need to have gurobi installed on your system
@@ -131,15 +216,12 @@ class GurobipySolver(BaseSolver):
 
         Args:
             problem (Problem): the problem to be solved.
-            options (dict[str,any]): Dictionary of Gurobi parameters to set.
-                These override the defaults in `_DEFAULT_GUROBI_OPTIONS`, which are applied otherwise.
-                For available parameters see https://www.gurobi.com/documentation/current/refman/parameters.html
+            options (GurobipyOptions | dict[str, Any] | None): Gurobi parameters to set. A dict is validated
+                as `GurobipyOptions`. If `None`, the defaults of `GurobipyOptions` are used.
         """
         self.evaluator = GurobipyEvaluator(problem)
         self.problem = problem
-
-        for key, value in (_DEFAULT_GUROBI_OPTIONS | (options or {})).items():
-            self.evaluator.model.setParam(key, value)
+        _set_gurobi_parameters(self.evaluator.model, options)
 
     def solve(self, target: str) -> SolverResults:
         """Solve the problem for the given target.
@@ -165,19 +247,17 @@ class PersistentGurobipySolver(PersistentSolver):
 
     evaluator: GurobipyEvaluator
 
-    def __init__(self, problem: Problem, options: dict[str, any] | None = None):
+    def __init__(self, problem: Problem, options: GurobipyOptions | dict[str, Any] | None = None):
         """Initializer for the persistent solver.
 
         Args:
             problem (Problem): the problem to be transformed in a GurobipyModel.
-            options (dict[str,any]): Dictionary of Gurobi parameters to set.
-                These override the defaults in `_DEFAULT_GUROBI_OPTIONS`, which are applied otherwise.
-                For available parameters see https://www.gurobi.com/documentation/current/refman/parameters.html
+            options (GurobipyOptions | dict[str, Any] | None): Gurobi parameters to set. A dict is validated
+                as `GurobipyOptions`. If `None`, the defaults of `GurobipyOptions` are used.
         """
         self.problem = problem
         self.evaluator = GurobipyEvaluator(problem)
-        for key, value in (_DEFAULT_GUROBI_OPTIONS | (options or {})).items():
-            self.evaluator.model.setParam(key, value)
+        _set_gurobi_parameters(self.evaluator.model, options)
 
     def add_constraint(self, constraint: Constraint | list[Constraint]) -> gp.Constr | list[gp.Constr]:
         """Add one or more constraint expressions to the solver.

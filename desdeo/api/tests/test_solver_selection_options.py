@@ -15,7 +15,7 @@ from desdeo.api.routers import utils
 from desdeo.api.routers.problem import _solver_selection, effective_solver_options
 from desdeo.api.routers.utils import copy_problem_metadata
 from desdeo.problem import Problem
-from desdeo.tools import CVXPYSolver, GurobipySolver
+from desdeo.tools import CVXPYSolver, GurobipyOptions, GurobipySolver
 from desdeo.tools.cvxpy_solver_interfaces import CVXPYSolverOptions
 from desdeo.tools.utils import available_solvers, normalize_solver_options
 
@@ -65,6 +65,23 @@ def test_assign_solver_with_options_gurobipy(client: TestClient, session_and_use
     session.refresh(problem_db)
     session.refresh(problem_db.problem_metadata)
     assert _stored_options(problem_db) == {"FeasibilityTol": 1e-9}
+
+
+def test_assign_solver_rejects_invalid_gurobi_value(client: TestClient, session_and_user: dict):
+    """A Gurobi parameter of the wrong type gives 422 at /assign_solver instead of failing at solve time."""
+    problem_db = _add(session_and_user)
+    resp = post_json(
+        client,
+        "/problem/assign_solver",
+        {
+            "problem_id": problem_db.id,
+            "solver_string_representation": "gurobipy",
+            "solver_options": {"FeasibilityTol": "abc"},
+        },
+        login(client),
+    )
+    assert resp.status_code == 422
+    assert "FeasibilityTol" in resp.text
 
 
 def test_assign_solver_invalid_and_no_options(client: TestClient, session_and_user: dict):
@@ -138,10 +155,15 @@ def test_effective_solver_options_merging(session_and_user: dict):
         solver_options={"FeasibilityTol": 1e-9, "OptimalityTol": 1e-9},
     )
     result = effective_solver_options(problem_db, {"OptimalityTol": 1e-6, "Method": 2})
-    assert result == {"FeasibilityTol": 1e-9, "OptimalityTol": 1e-6, "Method": 2}
+    assert isinstance(result, GurobipyOptions)
+    assert result.model_dump(exclude_unset=True) == {"FeasibilityTol": 1e-9, "OptimalityTol": 1e-6, "Method": 2}
 
     result = effective_solver_options(problem_db, None)
-    assert result == {"FeasibilityTol": 1e-9, "OptimalityTol": 1e-9}
+    assert result.model_dump(exclude_unset=True) == {"FeasibilityTol": 1e-9, "OptimalityTol": 1e-9}
+
+    with pytest.raises(HTTPException) as exc_info:
+        effective_solver_options(problem_db, {"FeasibilityTol": "abc"})
+    assert exc_info.value.status_code == 422
 
     plain_db = _add(session_and_user)
     assert effective_solver_options(plain_db, None) is None
@@ -154,6 +176,16 @@ def test_effective_solver_options_merging(session_and_user: dict):
     with pytest.raises(HTTPException) as exc_info:
         effective_solver_options(cvxpy_db, {"verbose": "not a bool"})
     assert exc_info.value.status_code == 422
+
+
+@pytest.mark.gurobipy
+def test_effective_solver_options_case_variant_request_wins(session_and_user):
+    """Request options with case-variant name override stored options."""
+    problem_db = _add(session_and_user, solver="gurobipy", solver_options={"feasibilitytol": 1e-6})
+    options = effective_solver_options(problem_db, {"FeasibilityTol": 1e-9})
+    assert options.model_dump(exclude_unset=True) == {"FeasibilityTol": 1e-9}
+    solver = GurobipySolver(Problem.from_problemdb(problem_db), options)
+    assert solver.evaluator.model.Params.FeasibilityTol == 1e-9
 
 
 def _cumulus_solve(client: TestClient, problem_db: ProblemDB, solver_options: dict, expected_status: int = 200):
@@ -209,7 +241,7 @@ def test_cumulus_with_solver_options(client: TestClient, session_and_user: dict,
 
 @pytest.mark.gurobipy
 def test_cumulus_passes_gurobi_parameters(client: TestClient, session_and_user: dict, monkeypatch: pytest.MonkeyPatch):
-    """A stored Gurobi parameter reaches `GurobipySolver` as a dict and is set on the model."""
+    """A stored Gurobi parameter reaches `GurobipySolver` as `GurobipyOptions` and is set on the model."""
     monkeypatch.setattr(utils, "_problem_cache", OrderedDict())
     problem_db = _add(session_and_user, solver="gurobipy", solver_options={"FeasibilityTol": 1e-9})
 
@@ -224,8 +256,8 @@ def test_cumulus_passes_gurobi_parameters(client: TestClient, session_and_user: 
     _cumulus_solve(client, problem_db, {"OptimalityTol": 1e-8})
 
     assert captured
-    assert all(isinstance(options, dict) and tol == 1e-9 for options, tol in captured)
-    assert captured[-1][0] == {"FeasibilityTol": 1e-9, "OptimalityTol": 1e-8}
+    assert all(isinstance(options, GurobipyOptions) and tol == 1e-9 for options, tol in captured)
+    assert captured[-1][0].model_dump(exclude_unset=True) == {"FeasibilityTol": 1e-9, "OptimalityTol": 1e-8}
 
 
 def test_copy_problem_metadata_copies_solver_options(session_and_user: dict):

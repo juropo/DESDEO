@@ -20,7 +20,12 @@ from desdeo.problem import (
 )
 from desdeo.tools.cvxpy_solver_interfaces import CVXPYSolver, CVXPYSolverOptions, check_cvxpy_suitability
 from desdeo.tools.generics import BaseSolver
-from desdeo.tools.gurobipy_solver_interfaces import GurobipySolver, PersistentGurobipySolver, check_gurobi_license
+from desdeo.tools.gurobipy_solver_interfaces import (
+    GurobipyOptions,
+    GurobipySolver,
+    PersistentGurobipySolver,
+    check_gurobi_license,
+)
 from desdeo.tools.ng_solver_interfaces import NevergradGenericOptions, NevergradGenericSolver
 from desdeo.tools.proximal_solver import ProximalSolver
 from desdeo.tools.pyomo_solver_interfaces import (
@@ -80,12 +85,12 @@ available_solvers = {
     "pyomo_gurobi": {"constructor": PyomoGurobiSolver, "options": None, "heuristic": False},
     "gurobipy": {
         "constructor": GurobipySolver,
-        "options": None,
+        "options": GurobipyOptions,
         "heuristic": False,
     },
     "gurobipy_persistent": {
         "constructor": PersistentGurobipySolver,
-        "options": None,
+        "options": GurobipyOptions,
         "heuristic": False,
     },
     "cvxpy": {
@@ -96,8 +101,8 @@ available_solvers = {
 }
 """Solvers by name. `heuristic` marks stochastic ones, whose results are not guaranteed optimal.
 
-Stored option keys an `options` model doesn't declare don't reach the solver (see `normalize_solver_options`);
-solvers with `options: None` get their dict as is.
+Stored option keys an `options` model doesn't declare don't reach the solver (see `normalize_solver_options`),
+unless the model allows extras, as `GurobipyOptions` does; solvers with `options: None` get their dict as is.
 """
 
 
@@ -132,8 +137,8 @@ def normalize_solver_options(solver_string_representation: str, options: dict[st
                 doubled,
                 solver_string_representation,
             )
-        # Undeclared keys are kept but dropped by `model_validate` at solve time (the options models don't
-        # allow extras), so they don't reach model-based solvers.
+        # Undeclared keys are kept but dropped by `model_validate` at solve time (this model doesn't allow
+        # extras), so they don't reach the solver.
         if unknown:
             logger.warning(
                 "Options %s are not declared by the options model of solver %r; they are kept as given.",
