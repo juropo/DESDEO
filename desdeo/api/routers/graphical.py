@@ -21,6 +21,7 @@ pyAgrum behaviour relied on below:
 import hashlib
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime
 from math import isfinite, prod, sqrt
@@ -28,6 +29,7 @@ from typing import Annotated, Literal
 
 import numpy as np
 import pyagrum as gum
+import sqlalchemy
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlmodel import Session, select
@@ -39,6 +41,7 @@ from desdeo.api.models import (
     ProblemDB,
     ProblemMetaDataDB,
     StateDB,
+    StationaryModelMetaData,
     User,
     UserRole,
     UserSavedSolutionDB,
@@ -49,6 +52,7 @@ from desdeo.api.routers.utils import (
     fetch_interactive_session_with_role_check,
     fetch_problem_with_role_check,
     find_graphical_metadata,
+    find_stationary_metadata,
     get_solver_results_at,
     load_problem,
 )
@@ -60,14 +64,21 @@ from desdeo.problem.graphical import (
     DiscreteVariable,
     IndexMap,
     Potential,
+    RandomisedPolicy,
+    StationaryDiagram,
+    StationaryLPIndexMap,
     build_rooted_junction_tree,
     compile_diagram,
+    evaluate_stationary_policy,
     read_policy_from_solution,
+    read_randomised_policy,
+    stationary_step_posteriors,
 )
 from desdeo.problem.graphical.adapters.pyagrum import to_pyagrum, to_pyagrum_influence_diagram
 from desdeo.problem.graphical.demo import build_irrigation_demo
+from desdeo.problem.graphical.dynamic import _initial_joint, _network_factors
 from desdeo.problem.graphical.index_map import mixed_radix_encode
-from desdeo.tools import find_compatible_solvers, guess_best_solver
+from desdeo.tools import SolverResults, find_compatible_solvers, guess_best_solver
 
 router = APIRouter(prefix="/graphical", tags=["Graphical models"])
 
@@ -101,6 +112,8 @@ class StructureNode(BaseModel):
     """Chance and decision nodes' state labels; `None` for objectives."""
     description: str | None = None
     """Chance nodes' `DiscreteVariable.description`; `None` if empty or for other node kinds."""
+    slice: Literal["slice0", "slicet", "atemporal"] | None = None
+    """A stationary 2TBN node's time slice, from `classify_2tbn`; `None` for single-slice diagrams and objectives."""
 
 
 class StructureEdge(BaseModel):
@@ -143,6 +156,17 @@ class WhatIfRequest(BaseModel):
     that solution's decoded policy (see `_compute_utilities_with_decision_pins`)."""
 
 
+class StationaryWhatIfInfo(BaseModel):
+    """The unconditional values of a stationary problem's policy, in a `WhatIfResponse`."""
+
+    objectives: dict[str, float]
+    """Objective symbol -> the policy's per-step expected utility, ignoring the evidence."""
+    arrival_shares: dict[str, list[float]]
+    """Atemporal decision symbol -> the probability of each of its states for an arriving patient."""
+    discount: float
+    """The diagram's discount factor."""
+
+
 class WhatIfResponse(BaseModel):
     """Response for `POST /graphical/whatif`."""
 
@@ -164,6 +188,8 @@ class WhatIfResponse(BaseModel):
     """With `solution`: followed decision symbol -> per-state probability under the solution's policy,
     in the decision's `states` order. Omits decisions pinned by the request and off-policy ones. Also
     holds, one-hot, the decisions a hypothetical problem assumes."""
+    stationary: StationaryWhatIfInfo | None = None
+    """For a stationary problem only (see `_stationary_whatif`)."""
 
 
 # --- POST /graphical/compile ----------------------------------------------------------------------
@@ -270,9 +296,17 @@ def compile_graphical_model(
 
 
 def _fetch_graphical_metadata(problem_id: int, db_session: Session) -> GraphicalModelMetaData:
-    """`find_graphical_metadata` for `problem_id`, or 404 if there is none."""
+    """`find_graphical_metadata` for `problem_id`; 501 for a stationary problem, 404 if there is neither."""
     row = find_graphical_metadata(problem_id, db_session)
     if row is None:
+        if find_stationary_metadata(problem_id, db_session) is not None:
+            raise HTTPException(
+                status_code=status.HTTP_501_NOT_IMPLEMENTED,
+                detail=(
+                    f"Problem {problem_id} is a stationary LP diagram; this operation supports single-slice "
+                    "influence diagrams only."
+                ),
+            )
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"No graphical model metadata found for problem {problem_id}.",
@@ -318,14 +352,20 @@ def get_structure(
 ) -> StructureResponse:
     """The DAG and node types of a graphical model, without inference.
 
+    A stationary problem's structure comes from its `StationaryModelMetaData` (see `_stationary_structure`).
+
     Raises:
-        HTTPException: 404 if the problem doesn't exist, isn't visible to `user`, or has no
-            `GraphicalModelMetaData` row.
+        HTTPException: 404 if the problem doesn't exist, isn't visible to `user`, or has neither a
+            `GraphicalModelMetaData` nor a `StationaryModelMetaData` row.
     """
     problem_db = fetch_problem_with_role_check(user, problem_id, db_session)
     if problem_db is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Problem with id={problem_id} not found.")
 
+    if find_graphical_metadata(problem_id, db_session) is None:
+        stationary_meta = find_stationary_metadata(problem_id, db_session)
+        if stationary_meta is not None:
+            return _stationary_structure(StationaryDiagram.model_validate_json(stationary_meta.diagram_json))
     meta = _fetch_graphical_metadata(problem_id, db_session)
     network = DiscreteNetwork.model_validate_json(meta.network_json)
     annotation = DecisionAnnotation.model_validate_json(meta.annotation_json)
@@ -849,27 +889,25 @@ def _validate_decision_evidence(annotation: DecisionAnnotation, decision_evidenc
             )
 
 
-def _fetch_solution_policies(
-    solution: SolutionRef, problem_id: int, meta: GraphicalModelMetaData, user: User, db_session: Session
-) -> dict[str, DecisionPolicy]:
-    """Every decision's policy, decoded from the solution `solution` refers to.
-
-    Raises:
-        HTTPException: 404 if the problem has no `IndexMap`, or the state is missing, not
-            accessible to `user`, or belongs to another problem; 400 for a bad `solution_index`
-            or `z` values that don't fit the `IndexMap`.
-    """
-    if meta.index_map_json is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Problem {problem_id} has no IndexMap yet -- it wasn't compiled via /graphical/compile.",
-        )
+def _fetch_solution_state(solution: SolutionRef, problem_id: int, user: User, db_session: Session) -> StateDB:
+    """The `StateDB` row `solution` refers to; 404 if it's missing, not accessible to `user`, or of another problem."""
     state = db_session.get(StateDB, solution.state_id)
     if state is None or state.problem_id != problem_id or not _may_access_state(user, state, db_session):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"No state with id={solution.state_id} for problem {problem_id}.",
         )
+    return state
+
+
+def _fetch_solution_results(solution: SolutionRef, problem_id: int, user: User, db_session: Session) -> SolverResults:
+    """The `SolverResults` of the solution `solution` refers to.
+
+    Raises:
+        HTTPException: 404 for an inaccessible state (see `_fetch_solution_state`); 400 for a bad
+            `solution_index`.
+    """
+    state = _fetch_solution_state(solution, problem_id, user, db_session)
     bad_index = HTTPException(
         status_code=status.HTTP_400_BAD_REQUEST,
         detail=f"State {solution.state_id} has no solution at index {solution.solution_index}.",
@@ -877,9 +915,27 @@ def _fetch_solution_policies(
     if solution.solution_index < 0:
         raise bad_index
     try:
-        results = get_solver_results_at(state.state, solution.solution_index)
+        return get_solver_results_at(state.state, solution.solution_index)
     except (AttributeError, IndexError) as e:
         raise bad_index from e
+
+
+def _fetch_solution_policies(
+    solution: SolutionRef, problem_id: int, meta: GraphicalModelMetaData, user: User, db_session: Session
+) -> dict[str, DecisionPolicy]:
+    """Every decision's policy, decoded from the solution `solution` refers to.
+
+    Raises:
+        HTTPException: 404 if the problem has no `IndexMap`, or for an unusable `solution` (see
+            `_fetch_solution_results`); 400 for a bad `solution_index` or `z` values that don't fit
+            the `IndexMap`.
+    """
+    if meta.index_map_json is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Problem {problem_id} has no IndexMap yet -- it wasn't compiled via /graphical/compile.",
+        )
+    results = _fetch_solution_results(solution, problem_id, user, db_session)
     return _read_solution_policies(IndexMap.model_validate_json(meta.index_map_json), results.optimal_variables)
 
 
@@ -893,11 +949,12 @@ def whatif(
 
     Uses a cached engine (see `_engine_cache`), except with `request.solution` and some decision
     unpinned, which uses a fresh one where unpinned decisions follow that solution's policy. The
-    decisions a hypothetical problem assumes are always pinned.
+    decisions a hypothetical problem assumes are always pinned. A stationary problem is handled by
+    `_stationary_whatif`.
 
     Raises:
-        HTTPException: 404 if the problem or session isn't found or visible, or the problem has no
-            `GraphicalModelMetaData`, or for an unusable `solution` (see
+        HTTPException: 404 if the problem or session isn't found or visible, or the problem has
+            neither kind of graphical metadata, or for an unusable `solution` (see
             `_fetch_solution_policies`); 400 for invalid evidence/decision_evidence/solution, a pin
             contradicting an assumed decision, or a diagram pyAgrum rejects; 501 for several
             objectives with decisions, unless `decision_evidence` pins every decision or
@@ -909,6 +966,12 @@ def whatif(
             status_code=status.HTTP_404_NOT_FOUND, detail=f"Problem with id={request.problem_id} not found."
         )
 
+    if find_graphical_metadata(request.problem_id, db_session) is None:
+        stationary_meta = find_stationary_metadata(request.problem_id, db_session)
+        if stationary_meta is not None:
+            # Checks `session_id` ownership, as below.
+            _resolve_cache_key(user, request.session_id, request.problem_id, db_session)
+            return _stationary_whatif(request, stationary_meta, user, db_session)
     meta = _fetch_graphical_metadata(request.problem_id, db_session)
     network = DiscreteNetwork.model_validate_json(meta.network_json)
     annotation = DecisionAnnotation.model_validate_json(meta.annotation_json)
@@ -969,6 +1032,238 @@ def whatif(
         utility_std_devs=utility_std_devs,
         off_policy_decisions=off_policy,
         decision_posteriors=decision_posteriors,
+    )
+
+
+# --- Stationary LP problems -----------------------------------------------------------------------
+
+
+def _stationary_structure(diagram: StationaryDiagram) -> StructureResponse:
+    """`diagram`'s nodes and edges, each network node marked with its time slice.
+
+    A decision's incoming edges come from its information set, which replaces its status-quo parents.
+    """
+    structure = diagram.structure
+    slices = {
+        **dict.fromkeys(structure.slice0, "slice0"),
+        **dict.fromkeys(structure.slicet, "slicet"),
+        **dict.fromkeys(structure.atemporal, "atemporal"),
+    }
+    decisions = {decision.symbol: decision for decision in diagram.decisions}
+
+    nodes: list[StructureNode] = []
+    for variable in diagram.network.variables:
+        decision = decisions.get(variable.name)
+        if decision is not None:
+            node = StructureNode(
+                id=decision.symbol, label=decision.name or decision.symbol, kind="decision", states=decision.states
+            )
+        else:
+            node = StructureNode(
+                id=variable.name,
+                label=variable.name,
+                kind="chance",
+                states=variable.labels,
+                description=variable.description or None,
+            )
+        nodes.append(node.model_copy(update={"slice": slices[variable.name]}))
+
+    arcs = [(parent, child) for parent, child in diagram.network.arcs if child not in decisions]
+    arcs += [(parent, decision.symbol) for decision in diagram.decisions for parent in decision.information_set]
+    for objective in diagram.objectives:
+        # The same `util_` prefix as single-slice objectives.
+        objective_id = f"util_{objective.symbol}"
+        nodes.append(StructureNode(id=objective_id, label=objective.name or objective.symbol, kind="objective"))
+        arcs += [(parent, objective_id) for parent in objective.parents]
+
+    edges = [StructureEdge(id=f"{source}->{target}", source=source, target=target) for source, target in arcs]
+    return StructureResponse(nodes=nodes, edges=edges)
+
+
+@dataclass(frozen=True)
+class _StationaryPolicy:
+    """A stationary problem's policies and their unconditional values."""
+
+    policies: dict[str, RandomisedPolicy]
+    """Decision symbol -> its read-back policy; empty for the status quo."""
+    info: StationaryWhatIfInfo
+
+
+_STATIONARY_CACHE_SIZE = 16
+"""Maximum number of cached `_StationaryPolicy`s; least-recently-used are evicted first."""
+
+_stationary_cache: OrderedDict[tuple[int, int | None, int | None], _StationaryPolicy] = OrderedDict()
+"""(problem id, state id, solution index) -> its `_StationaryPolicy`; `None` ids for the status quo."""
+
+_stationary_cache_lock = threading.Lock()
+
+
+def _evict_stationary_cache(position: int, deleted_id: int) -> None:
+    """Drop the `_stationary_cache` entries whose key has `deleted_id` at `position`."""
+    with _stationary_cache_lock:
+        for key in [key for key in _stationary_cache if key[position] == deleted_id]:
+            del _stationary_cache[key]
+
+
+@sqlalchemy.event.listens_for(ProblemDB, "after_delete")
+def _evict_deleted_stationary_problem(mapper, connection, target: ProblemDB) -> None:
+    """Drop a deleted problem's `_stationary_cache` entries, since SQLite may reuse its id."""
+    _evict_stationary_cache(0, target.id)
+
+
+@sqlalchemy.event.listens_for(StateDB, "after_delete")
+def _evict_deleted_stationary_state(mapper, connection, target: StateDB) -> None:
+    """Drop a deleted state's `_stationary_cache` entries, since SQLite may reuse its id."""
+    _evict_stationary_cache(1, target.id)
+
+
+def _status_quo_arrival_shares(diagram: StationaryDiagram) -> dict[str, list[float]]:
+    """Atemporal decision symbol -> its status-quo marginal, contracting the CPTs of its ancestors.
+
+    An atemporal node's ancestors are all atemporal, so this is its distribution for an arriving patient.
+    """
+    factors = _network_factors(diagram.network)
+    parents = {name: axes[1:] for name, (axes, _) in factors.items()}
+    return {
+        decision.symbol: _initial_joint(factors, parents, [decision.symbol], set()).tolist()
+        for decision in diagram.decisions
+        if decision.symbol in diagram.structure.atemporal
+    }
+
+
+def _stationary_policy(
+    request: WhatIfRequest,
+    meta: StationaryModelMetaData,
+    diagram: StationaryDiagram,
+    user: User,
+    db_session: Session,
+) -> _StationaryPolicy:
+    """The `_StationaryPolicy` of `request.solution`, or of the status quo without one, cached in `_stationary_cache`.
+
+    Raises:
+        HTTPException: 404 or 400 for an unusable `solution` (see `_fetch_solution_results`); 400 if
+            its policy can't be read back; 422 or 501 if `evaluate_stationary_policy` raises a
+            `ValueError` or a `NotImplementedError`.
+    """
+    solution = request.solution
+    if solution is None:
+        key = (request.problem_id, None, None)
+    else:
+        # Checked on every request, since a cached entry may have been filled for another user.
+        _fetch_solution_state(solution, request.problem_id, user, db_session)
+        key = (request.problem_id, solution.state_id, solution.solution_index)
+    with _stationary_cache_lock:
+        if key in _stationary_cache:
+            _stationary_cache.move_to_end(key)
+            return _stationary_cache[key]
+
+    if solution is None:
+        policies = {}
+        arrival_shares = _status_quo_arrival_shares(diagram)
+    else:
+        results = _fetch_solution_results(solution, request.problem_id, user, db_session)
+        index_map = StationaryLPIndexMap.model_validate_json(meta.index_map_json)
+        try:
+            policies = read_randomised_policy(index_map, results.optimal_variables)
+        except (KeyError, TypeError, ValueError) as e:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail=f"Can't read the solution's policy: {e}"
+            ) from e
+        atemporal = diagram.structure.atemporal
+        arrival_shares = {symbol: policy.probabilities[0] for symbol, policy in policies.items() if symbol in atemporal}
+    try:
+        objectives = evaluate_stationary_policy(diagram, policies).objectives
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
+    except NotImplementedError as e:
+        raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail=str(e)) from e
+
+    entry = _StationaryPolicy(
+        policies=policies,
+        info=StationaryWhatIfInfo(objectives=objectives, arrival_shares=arrival_shares, discount=diagram.discount),
+    )
+    with _stationary_cache_lock:
+        _stationary_cache[key] = entry
+        while len(_stationary_cache) > _STATIONARY_CACHE_SIZE:
+            _stationary_cache.popitem(last=False)
+    return entry
+
+
+def _stationary_evidence(diagram: StationaryDiagram, request: WhatIfRequest) -> dict[str, int]:
+    """`request.evidence` and `request.decision_evidence` as state indices.
+
+    Raises:
+        HTTPException: 422 for a node that isn't in the network, a `decision_evidence` node that
+            isn't a decision, an unknown label, or a node pinned to two labels.
+    """
+    labels = {variable.name: variable.labels for variable in diagram.network.variables}
+    unknown = sorted(set(request.evidence) - set(labels))
+    if unknown:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Evidence references node(s) that aren't in the network: {unknown}.",
+        )
+    not_decisions = sorted(set(request.decision_evidence) - {decision.symbol for decision in diagram.decisions})
+    if not_decisions:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"decision_evidence references node(s) that aren't decisions: {not_decisions}.",
+        )
+    conflicts = sorted(
+        name
+        for name in request.evidence.keys() & request.decision_evidence.keys()
+        if request.evidence[name] != request.decision_evidence[name]
+    )
+    if conflicts:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"evidence and decision_evidence pin {conflicts} to different states.",
+        )
+
+    pins = {**request.evidence, **request.decision_evidence}
+    for name, label in pins.items():
+        if label not in labels[name]:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Evidence value '{label}' for node '{name}' isn't one of its own states {labels[name]}.",
+            )
+    return {name: labels[name].index(label) for name, label in pins.items()}
+
+
+def _stationary_whatif(
+    request: WhatIfRequest, meta: StationaryModelMetaData, user: User, db_session: Session
+) -> WhatIfResponse:
+    """`/whatif` for a stationary problem: one step's distributions under a policy's discounted occupation.
+
+    The policy is `request.solution`'s read-back randomised policy, or without it the status quo,
+    with every decision at its network CPT. `evidence` and `decision_evidence` both condition on
+    the steps where they hold; neither changes the policy. Nodes outside the step joint get no
+    posterior, and evidence on them gives 422.
+
+    Raises:
+        HTTPException: 404 or 400 for an unusable `solution`, and 422 for invalid evidence (see
+            `_stationary_policy` and `_stationary_evidence`); 422 for evidence on a node outside
+            the step joint or with probability 0; 501 for a randomised atemporal policy with an
+            initial distribution.
+    """
+    diagram = StationaryDiagram.model_validate_json(meta.diagram_json)
+    evidence = _stationary_evidence(diagram, request)
+    policy = _stationary_policy(request, meta, diagram, user, db_session)
+    try:
+        result = stationary_step_posteriors(diagram, policy.policies, evidence)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
+    except NotImplementedError as e:
+        raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail=str(e)) from e
+
+    decisions = {decision.symbol for decision in diagram.decisions}
+    return WhatIfResponse(
+        posteriors={name: values for name, values in result.posteriors.items() if name not in decisions},
+        policy={},
+        utilities=result.utilities,
+        utility_std_devs={},
+        decision_posteriors={name: values for name, values in result.posteriors.items() if name in decisions},
+        stationary=policy.info,
     )
 
 
@@ -1076,7 +1371,7 @@ def get_policy(
             `IndexMap`, or `solution_id` isn't a saved solution of `problem_id`; 403 if the saved
             solution belongs to another user and `user` is not an admin/analyst; 400 if not
             exactly one of `variable_values`/`solution_id` is given, or for invalid evidence or
-            variable values.
+            variable values; 501 for a stationary problem.
     """
     problem_db = fetch_problem_with_role_check(user, problem_id, db_session)
     if problem_db is None:
@@ -1162,16 +1457,26 @@ def create_evidence_set(
 ) -> EvidenceSetResponse:
     """Save the current evidence dict under a name, for later reuse/sharing by id.
 
+    A stationary problem's evidence is checked against its whole network, since the step joint depends on the
+    policy; nodes outside it (e.g. a barren slice-0 decision) pass here but give 422 in `/whatif`.
+
     Raises:
         HTTPException: 404 if the problem doesn't exist, isn't visible to `user`, or has no
-            `GraphicalModelMetaData`; 400 for invalid evidence.
+            `GraphicalModelMetaData` or `StationaryModelMetaData`; 400 for invalid evidence.
     """
     problem_db = fetch_problem_with_role_check(user, problem_id, db_session)
     if problem_db is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Problem with id={problem_id} not found.")
 
-    meta = _fetch_graphical_metadata(problem_id, db_session)
-    network = DiscreteNetwork.model_validate_json(meta.network_json)
+    stationary_meta = (
+        find_stationary_metadata(problem_id, db_session)
+        if find_graphical_metadata(problem_id, db_session) is None
+        else None
+    )
+    if stationary_meta is not None:
+        network = StationaryDiagram.model_validate_json(stationary_meta.diagram_json).network
+    else:
+        network = DiscreteNetwork.model_validate_json(_fetch_graphical_metadata(problem_id, db_session).network_json)
     _validate_chance_evidence(network, request.evidence)
 
     row = GraphicalEvidenceSetDB(
@@ -1392,8 +1697,8 @@ def sensitivity(
         HTTPException: 401 for a guest user; 404 if the problem isn't found or visible, or has no
             `GraphicalModelMetaData`; 400 for invalid evidence, `target`, `target_state` or
             `nodes`, or too many nodes to sweep; 501 if `target` is an objective of a diagram
-            with several objectives and a decision (see `_compute_utilities`), or the problem
-            assumes a decision.
+            with several objectives and a decision (see `_compute_utilities`), the problem
+            assumes a decision, or it is a stationary problem.
     """
     if user.role == UserRole.guest:
         raise HTTPException(
@@ -1537,7 +1842,7 @@ def value_of_information(
             `GraphicalModelMetaData`; 400 if the diagram has no decisions, or for an invalid
             `target`, `node` (or one already in `evidence`), or evidence; 501 for several
             objectives with a decision (see `_compute_utilities`), or if the problem assumes a
-            decision.
+            decision or is a stationary problem.
     """
     problem_db = fetch_problem_with_role_check(user, request.problem_id, db_session)
     if problem_db is None:
@@ -1714,7 +2019,7 @@ def solve_graphical_model(
     Raises:
         HTTPException: 404 if the problem isn't found or visible, or isn't a compiled graphical
             diagram; 400 for an unknown `objective_symbol` or if no compatible solver exists;
-            500 if the solver raises or reports failure.
+            500 if the solver raises or reports failure; 501 for a stationary problem.
     """
     problem_db = fetch_problem_with_role_check(user, problem_id, db_session)
     if problem_db is None:
