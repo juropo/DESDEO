@@ -5,10 +5,10 @@ import {
 	createWhatIfRunner,
 	dominantDeltaIndex,
 	formatUtility,
-	hasEvidenceDiverged
+	hasEvidenceDiverged,
+	mapWhatIfResponse,
+	type WhatIfResponse
 } from './whatif';
-import { filterChanceEvidence } from './interaction';
-import type { NetworkModel } from './types';
 
 describe('createDebouncer', () => {
 	beforeEach(() => vi.useFakeTimers());
@@ -256,5 +256,84 @@ describe('formatUtility', () => {
 
 	it('omits the std dev when not given', () => {
 		expect(formatUtility(-1500)).toBe('-1.5K');
+	});
+});
+
+describe('mapWhatIfResponse', () => {
+	it('maps a stationary response', () => {
+		const response: WhatIfResponse = {
+			posteriors: { LYH0: [0.4, 0.6] },
+			policy: {},
+			utilities: { cost: 0.5 },
+			utility_std_devs: {},
+			off_policy_decisions: [],
+			decision_posteriors: { GERt: [0.66, 0.34] },
+			stationary: {
+				objectives: { cost: 0.703, illness: 1.602 },
+				arrival_shares: { OMA: [0.5, 0.5] },
+				discount: 0.95
+			}
+		};
+
+		const result = mapWhatIfResponse(response);
+
+		expect(result).toEqual({
+			posteriors: { LYH0: [0.4, 0.6] },
+			policy: {},
+			utilities: { util_cost: 0.5 },
+			utilityStdDevs: {},
+			offPolicyDecisions: [],
+			decisionPosteriors: { GERt: [0.66, 0.34] },
+			stationary: {
+				objectives: { cost: 0.703, illness: 1.602 },
+				arrivalShares: { OMA: [0.5, 0.5] },
+				discount: 0.95
+			}
+		});
+	});
+
+	it('maps a single-slice response without stationary', () => {
+		const response: WhatIfResponse = {
+			posteriors: { weather: [0.3, 0.7] },
+			policy: { plant: 'yes' },
+			utilities: { profit: 10 },
+			utility_std_devs: { profit: 2 },
+			off_policy_decisions: ['plant'],
+			decision_posteriors: { plant: [0, 1] }
+		};
+
+		const result = mapWhatIfResponse(response);
+
+		expect(result).toEqual({
+			posteriors: { weather: [0.3, 0.7] },
+			policy: { plant: 'yes' },
+			utilities: { util_profit: 10 },
+			utilityStdDevs: { util_profit: 2 },
+			offPolicyDecisions: ['plant'],
+			decisionPosteriors: { plant: [0, 1] },
+			stationary: null
+		});
+	});
+
+	it('maps stationary null to null', () => {
+		const response: WhatIfResponse = {
+			posteriors: {},
+			stationary: null
+		};
+
+		const result = mapWhatIfResponse(response);
+
+		expect(result.stationary).toBeNull();
+	});
+
+	it('keeps missing utilities and utility_std_devs undefined', () => {
+		const response: WhatIfResponse = {
+			posteriors: {}
+		};
+
+		const result = mapWhatIfResponse(response);
+
+		expect(result.utilities).toBeUndefined();
+		expect(result.utilityStdDevs).toBeUndefined();
 	});
 });

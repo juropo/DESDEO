@@ -17,12 +17,15 @@ export type {
 	DecisionMode,
 	NetworkEvidence,
 	NetworkEvidenceSet,
+	NetworkKind,
 	NetworkPosteriors,
 	NetworkPolicy,
 	NetworkPolicySource,
 	NetworkSolutionRef,
 	NetworkUtilities,
 	NetworkUtilityStdDevs,
+	StationaryWhatIfInfo,
+	WhatIfContext,
 	WhatIfResult
 } from './types';
 
@@ -62,9 +65,13 @@ export {
 	decisionsBlockingUtilities,
 	describeDecisions,
 	solutionStateTier,
+	withDecisionShares,
+	formatShare,
+	sharesLabel,
+	describeShares,
 	EVIDENCE_MODE_NOTE
 } from './interaction';
-export type { DecisionStatus } from './interaction';
+export type { DecisionStatus, DecisionShares, StateShare } from './interaction';
 
 export { createNetworkHighlightStore } from './highlight-store';
 export type { NetworkHighlightStore } from './highlight-store';
@@ -76,11 +83,12 @@ export {
 	dominantDeltaIndex,
 	hasEvidenceDiverged,
 	formatUtility,
+	mapWhatIfResponse,
 	EVIDENCE_DEBOUNCE_MS,
 	BAR_TRANSITION_MS,
 	DELTA_DISPLAY_THRESHOLD
 } from './whatif';
-export type { Debouncer, WhatIfRunner } from './whatif';
+export type { Debouncer, WhatIfResponse, WhatIfRunner } from './whatif';
 
 export { explainNoChange } from './null-explanation';
 

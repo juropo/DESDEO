@@ -96,6 +96,30 @@ export interface WhatIfResult {
 	/** With a followed solution: decision id -> per-state probability under its policy, in the
 	 *  decision's own `states` order. Only for followed decisions that aren't off-policy. */
 	decisionPosteriors?: NetworkPosteriors;
+	/** Stationary diagrams only; `null` or absent for single-slice ones. */
+	stationary?: StationaryWhatIfInfo | null;
+}
+
+/** What a delivered `WhatIfResult` was computed for, as `<NetworkPanel>`'s `onWhatIfResult`
+ *  reports it. */
+export interface WhatIfContext {
+	/** The chance and decision evidence sent with the request. */
+	evidence: NetworkEvidence;
+	/** The followed solution, or `null` for none. */
+	solution: NetworkSolutionRef | null;
+}
+
+/** Which kind of diagram a network shows: a single-slice influence diagram, or a stationary
+ *  2TBN solved as an LP, whose decisions follow a randomised policy. */
+export type NetworkKind = 'graphical' | 'stationary';
+
+/** The stationary part of a what-if result. */
+export interface StationaryWhatIfInfo {
+	/** Objective symbol -> the policy's unconditional per-step value. */
+	objectives: Record<string, number>;
+	/** Atemporal decision id -> the policy's arrival share per state, in `states` order. */
+	arrivalShares: Record<string, number[]>;
+	discount: number;
 }
 
 /**

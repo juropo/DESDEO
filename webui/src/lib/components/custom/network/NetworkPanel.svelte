@@ -13,12 +13,18 @@
 	 */
 	import { untrack, type Snippet } from 'svelte';
 	import NetworkView from './NetworkView.svelte';
-	import { createWhatIfRunner, EVIDENCE_DEBOUNCE_MS } from './whatif';
+	import {
+		createWhatIfRunner,
+		EVIDENCE_DEBOUNCE_MS,
+		mapWhatIfResponse,
+		type WhatIfResponse
+	} from './whatif';
 	import {
 		assumableEvidence,
 		decisionsBlockingUtilities,
 		filterChanceEvidence,
-		filterDecisionEvidence
+		filterDecisionEvidence,
+		withDecisionShares
 	} from './interaction';
 	import { defaultFetchPolicy } from './policy';
 	import { defaultFetchEvidenceSets, defaultSaveEvidenceSet } from './evidence-sets';
@@ -27,6 +33,7 @@
 		NetworkAssumptions,
 		NetworkEvidence,
 		NetworkEvidenceSet,
+		NetworkKind,
 		NetworkModel,
 		NetworkPolicy,
 		NetworkPolicySource,
@@ -34,6 +41,7 @@
 		NetworkSolutionRef,
 		NetworkUtilities,
 		NetworkUtilityStdDevs,
+		WhatIfContext,
 		WhatIfResult
 	} from './types';
 	import type { NetworkChromeContext } from './view-types';
@@ -46,9 +54,7 @@
 	}
 
 	/**
-	 * Calls `POST /graphical/whatif` and maps the response onto `WhatIfResult`. The backend keys
-	 * `utilities`/`utility_std_devs` by objective symbol, while objective node ids are
-	 * `util_<symbol>`, so the prefix is added here.
+	 * Calls `POST /graphical/whatif` and maps the response onto `WhatIfResult` (`mapWhatIfResponse`).
 	 *
 	 * `evidence` must already be filtered to chance nodes (`filterChanceEvidence`), and
 	 * `decisionEvidence` to decision nodes (`filterDecisionEvidence`); the endpoint rejects
@@ -83,33 +89,15 @@
 			const suffix = typeof detail === 'string' ? `: ${detail}` : '';
 			throw new Error(`Failed to fetch what-if result (status ${res.status})${suffix}`);
 		}
-		const result = (await res.json()) as {
-			posteriors: NetworkPosteriors;
-			policy?: NetworkPolicy;
-			utilities?: NetworkUtilities;
-			utility_std_devs?: NetworkUtilityStdDevs;
-			off_policy_decisions?: string[];
-			decision_posteriors?: NetworkPosteriors;
-		};
-		const withUtilPrefix = <T extends Record<string, number>>(map: T | undefined): T | undefined =>
-			map
-				? (Object.fromEntries(
-						Object.entries(map).map(([symbol, value]) => [`util_${symbol}`, value])
-					) as T)
-				: undefined;
-		return {
-			posteriors: result.posteriors,
-			policy: result.policy,
-			utilities: withUtilPrefix(result.utilities),
-			utilityStdDevs: withUtilPrefix(result.utility_std_devs),
-			offPolicyDecisions: result.off_policy_decisions,
-			decisionPosteriors: result.decision_posteriors
-		};
+		return mapWhatIfResponse((await res.json()) as WhatIfResponse);
 	}
 
 	interface Props {
 		/** Problem id of a compiled diagram. */
 		modelId: string | number;
+		/** `'stationary'`: decisions show their shares as posteriors and are pinned as conditioning
+		 *  evidence, utilities are never blocked, and a failed what-if keeps the previous result. */
+		kind?: NetworkKind;
 		fetchStructure?: (modelId: string | number) => Promise<NetworkModel>;
 		fetchWhatIf?: (
 			modelId: string | number,
@@ -153,9 +141,12 @@
 		onNodeSelect?: (id: string | null) => void;
 		onNodeHover?: (id: string | null) => void;
 		/** Fired with every what-if response (including the initial prior), e.g. so the host can
-		 *  list `utilities`. Fired with an empty result when `decisionsBlockingUtilities` skips
-		 *  the request. */
-		onWhatIfResult?: (result: WhatIfResult) => void;
+		 *  list `utilities`, and what it was computed for. Fired with an empty result when
+		 *  `decisionsBlockingUtilities` skips the request. */
+		onWhatIfResult?: (result: WhatIfResult, context: WhatIfContext) => void;
+		/** Fired with the message of a failed what-if request. In `kind: 'stationary'` the last
+		 *  result delivered to `onWhatIfResult` stays shown. */
+		onWhatIfError?: (message: string) => void;
 		/** Fired when the DM commits evidence as the comparison baseline, or selects a saved
 		 *  evidence set as the baseline. Local to the panel; nothing is persisted. */
 		onCommitEvidence?: (evidence: NetworkEvidence) => void;
@@ -181,6 +172,7 @@
 
 	let {
 		modelId,
+		kind = 'graphical',
 		fetchStructure = defaultFetchStructure,
 		fetchWhatIf = defaultFetchWhatIf,
 		policySolution = null,
@@ -197,6 +189,7 @@
 		onNodeSelect,
 		onNodeHover,
 		onWhatIfResult,
+		onWhatIfError,
 		onCommitEvidence,
 		onExploreAssumptions,
 		exploreLabel = 'Explore these assumptions',
@@ -218,12 +211,21 @@
 	let offPolicyDecisions = $state<string[] | undefined>(undefined);
 	// The solution sent with what-if requests: only followed in 'manual' mode.
 	let requestSolution = $derived(decisionMode === 'manual' ? policySolution : null);
+	// A stationary problem always has a policy to follow: the solution's or the status quo.
+	let followsPolicy = $derived(!!requestSolution || kind === 'stationary');
+	// Posteriors as shown: a stationary problem's decision shares render like chance posteriors.
+	const shownPosteriors = (result: WhatIfResult) =>
+		kind === 'stationary' ? withDecisionShares(result) : result.posteriors;
 	let loading = $state(true);
 	// Fatal: replaces the whole pane.
 	let structureError = $state<string | null>(null);
 	// Non-fatal: a dismissible banner. Cleared on the next successful result or new request.
 	let whatIfError = $state<string | null>(null);
 	let stale = $state(false);
+	// Stationary only: the last what-if request failed, so the shown result is for older evidence.
+	let showingPreviousResult = $state(false);
+	// What the latest what-if request is for; the runner only reports the latest request.
+	let requestContext: WhatIfContext = { evidence: {}, solution: null };
 
 	// Ghost baseline: the prior until the DM commits evidence, then the committed posteriors.
 	let priorPosteriors = $state<NetworkPosteriors | undefined>(undefined);
@@ -258,7 +260,7 @@
 	const whatIfRunner = createWhatIfRunner<WhatIfResult>(
 		EVIDENCE_DEBOUNCE_MS,
 		(result) => {
-			posteriors = result.posteriors;
+			posteriors = shownPosteriors(result);
 			// Also when `undefined`, so a stale policy is cleared.
 			policy = result.policy;
 			utilities = result.utilities;
@@ -266,18 +268,25 @@
 			decisionPosteriors = result.decisionPosteriors;
 			offPolicyDecisions = result.offPolicyDecisions;
 			whatIfError = null;
-			onWhatIfResult?.(result);
+			showingPreviousResult = false;
+			onWhatIfResult?.(result, requestContext);
 		},
 		(e) => {
-			// Aborted requests never get here. Clear the previous result, same as a skipped request.
+			// Aborted requests never get here. Clear the previous result, same as a skipped request,
+			// except for stationary problems, where it is usually zero-probability evidence.
 			whatIfError = e instanceof Error ? e.message : 'Failed to fetch what-if result';
+			onWhatIfError?.(whatIfError);
+			if (kind === 'stationary') {
+				showingPreviousResult = true;
+				return;
+			}
 			posteriors = undefined;
 			policy = undefined;
 			utilities = undefined;
 			utilityStdDevs = undefined;
 			decisionPosteriors = undefined;
 			offPolicyDecisions = undefined;
-			onWhatIfResult?.({ posteriors: {} });
+			onWhatIfResult?.({ posteriors: {} }, requestContext);
 		},
 		(next) => {
 			stale = next;
@@ -301,6 +310,7 @@
 		loading = true;
 		structureError = null;
 		whatIfError = null;
+		showingPreviousResult = false;
 		// Reset all state tied to the previous model.
 		const keepEvidence = !hasLoadedStructure;
 		hasLoadedStructure = true;
@@ -359,23 +369,25 @@
 		priorFetcher: (evidence: NetworkEvidence) => Promise<WhatIfResult>
 	) {
 		const ownRequestId = ++priorRequestId;
-		if (!model || decisionsBlockingUtilities(model, {}, !!requestSolution).length > 0) {
+		const context: WhatIfContext = { evidence: {}, solution: requestSolution };
+		if (!model || decisionsBlockingUtilities(model, {}, followsPolicy).length > 0) {
 			priorPosteriors = undefined;
 			return;
 		}
 		try {
 			const prior = await priorFetcher({});
 			if (requestId !== structureRequestId || ownRequestId !== priorRequestId) return;
-			priorPosteriors = prior.posteriors;
+			priorPosteriors = shownPosteriors(prior);
 			// Also seed the live state, unless the DM has set evidence meanwhile.
 			if (Object.keys(evidence).length === 0) {
-				posteriors = prior.posteriors;
+				posteriors = shownPosteriors(prior);
 				policy = prior.policy;
 				utilities = prior.utilities;
 				utilityStdDevs = prior.utilityStdDevs;
 				decisionPosteriors = prior.decisionPosteriors;
 				offPolicyDecisions = prior.offPolicyDecisions;
-				onWhatIfResult?.(prior);
+				showingPreviousResult = false;
+				onWhatIfResult?.(prior, context);
 			}
 		} catch (e) {
 			// Non-fatal: the panel just has no ghost baseline. Shown unless the DM has moved on.
@@ -470,7 +482,11 @@
 		// through `decision_evidence` instead, so they're pinned rather than treated as observed.
 		const chanceEvidence = filterChanceEvidence(model, next);
 		const decisionEvidence = decisionMode === 'manual' ? filterDecisionEvidence(model, next) : {};
-		if (decisionsBlockingUtilities(model, decisionEvidence, !!requestSolution).length > 0) {
+		requestContext = {
+			evidence: { ...chanceEvidence, ...decisionEvidence },
+			solution: requestSolution
+		};
+		if (decisionsBlockingUtilities(model, decisionEvidence, followsPolicy).length > 0) {
 			// Known to fail (501) until every decision is pinned, so skip it and clear the results.
 			whatIfRunner.cancel();
 			stale = false;
@@ -480,7 +496,7 @@
 			utilityStdDevs = undefined;
 			decisionPosteriors = undefined;
 			offPolicyDecisions = undefined;
-			onWhatIfResult?.({ posteriors: {} });
+			onWhatIfResult?.({ posteriors: {} }, requestContext);
 			return;
 		}
 		whatIfRunner.request((signal) =>
@@ -490,7 +506,8 @@
 
 	function handleCommitEvidence(committed: NetworkEvidence) {
 		committedEvidence = committed;
-		// The live posteriors already match `committed`: Commit is disabled while stale.
+		// The live posteriors already match `committed`: Commit is disabled while stale, and while
+		// a previous result is shown.
 		committedPosteriors = posteriors;
 		// The baseline is no longer a saved set.
 		selectedBaselineId = '';
@@ -567,7 +584,7 @@
 			);
 			if (requestId !== structureRequestId || ownRequestId !== baselineRequestId) return;
 			committedEvidence = chanceEvidence;
-			committedPosteriors = result.posteriors;
+			committedPosteriors = shownPosteriors(result);
 			onCommitEvidence?.(chanceEvidence);
 		} catch (e) {
 			if (requestId !== structureRequestId || ownRequestId !== baselineRequestId) return;
@@ -671,6 +688,7 @@
 			{#key modelId}
 				<NetworkView
 					bind:model
+					{kind}
 					bind:evidence
 					{posteriors}
 					{ghostPosteriors}
@@ -681,6 +699,9 @@
 					{decisionPosteriors}
 					{offPolicyDecisions}
 					{stale}
+					commitDisabledReason={showingPreviousResult
+						? 'The last what-if request failed, so the shown values are for earlier evidence.'
+						: null}
 					{decisionMode}
 					{highlight}
 					{compact}

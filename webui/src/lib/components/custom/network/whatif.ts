@@ -3,7 +3,14 @@
  * Kept out of the Svelte components so it can be unit tested (see `whatif.test.ts`).
  */
 
-import type { NetworkEvidence, NetworkSolutionRef } from './types';
+import type {
+	NetworkEvidence,
+	NetworkPolicy,
+	NetworkPosteriors,
+	NetworkUtilities,
+	NetworkUtilityStdDevs,
+	WhatIfResult
+} from './types';
 
 /** Coalesces a burst of state-chip clicks into one request. */
 export const EVIDENCE_DEBOUNCE_MS = 150;
@@ -145,4 +152,49 @@ const COMPACT_NUMBER = new Intl.NumberFormat('en', {
 export function formatUtility(mean: number, stdDev?: number): string {
 	const formatted = COMPACT_NUMBER.format(mean);
 	return stdDev == null ? formatted : `${formatted} ± ${COMPACT_NUMBER.format(stdDev)}`;
+}
+
+/** Raw JSON shape `POST /graphical/whatif` returns, matching `WhatIfResponse` (`graphical.py`). */
+export interface WhatIfResponse {
+	posteriors: NetworkPosteriors;
+	policy?: NetworkPolicy;
+	utilities?: NetworkUtilities;
+	utility_std_devs?: NetworkUtilityStdDevs;
+	off_policy_decisions?: string[];
+	decision_posteriors?: NetworkPosteriors;
+	stationary?: {
+		objectives: Record<string, number>;
+		arrival_shares: Record<string, number[]>;
+		discount: number;
+	} | null;
+}
+
+/**
+ * Maps a `WhatIfResponse` onto `WhatIfResult`. The backend keys `utilities`/`utility_std_devs` by
+ * objective symbol, while objective node ids are `util_<symbol>`, so the prefix is added here.
+ * `stationary.objectives` stays keyed by bare symbol.
+ */
+export function mapWhatIfResponse(response: WhatIfResponse): WhatIfResult {
+	const withUtilPrefix = <T extends Record<string, number>>(map: T | undefined): T | undefined =>
+		map
+			? (Object.fromEntries(
+					Object.entries(map).map(([symbol, value]) => [`util_${symbol}`, value])
+				) as T)
+			: undefined;
+	const stationary = response.stationary;
+	return {
+		posteriors: response.posteriors,
+		policy: response.policy,
+		utilities: withUtilPrefix(response.utilities),
+		utilityStdDevs: withUtilPrefix(response.utility_std_devs),
+		offPolicyDecisions: response.off_policy_decisions,
+		decisionPosteriors: response.decision_posteriors,
+		stationary: stationary
+			? {
+					objectives: stationary.objectives,
+					arrivalShares: stationary.arrival_shares,
+					discount: stationary.discount
+				}
+			: null
+	};
 }

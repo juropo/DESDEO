@@ -3,13 +3,17 @@ import {
 	assumableEvidence,
 	decisionsBlockingUtilities,
 	describeDecisions,
+	describeShares,
 	filterChanceEvidence,
 	filterDecisionEvidence,
+	formatShare,
 	isNodeEditable,
 	isStatePinned,
 	mergeHighlightSets,
+	sharesLabel,
 	solutionStateTier,
-	toggleEvidenceState
+	toggleEvidenceState,
+	withDecisionShares
 } from './interaction';
 import type { NetworkModel } from './types';
 
@@ -297,5 +301,158 @@ describe('assumableEvidence', () => {
 		const result = assumableEvidence(hypothetical, { structure: 'dry', drill: 'no' }, 'manual');
 		expect(result.conflicts).toEqual(['structure = soaking', 'drill = yes']);
 		expect(result.assumptions).toEqual({ chance: {}, decisions: {} });
+	});
+});
+
+describe('withDecisionShares', () => {
+	it('merges decisionPosteriors into posteriors', () => {
+		const result = withDecisionShares({
+			posteriors: { A: [0.5, 0.5] },
+			decisionPosteriors: { B: [0.3, 0.7] }
+		});
+		expect(result).toEqual({ A: [0.5, 0.5], B: [0.3, 0.7] });
+	});
+
+	it('lets decision shares win on a key collision', () => {
+		const result = withDecisionShares({
+			posteriors: { A: [0.5, 0.5] },
+			decisionPosteriors: { A: [0.2, 0.8] }
+		});
+		expect(result).toEqual({ A: [0.2, 0.8] });
+	});
+
+	it('returns just posteriors when decisionPosteriors is undefined', () => {
+		const result = withDecisionShares({
+			posteriors: { A: [0.5, 0.5] }
+		});
+		expect(result).toEqual({ A: [0.5, 0.5] });
+	});
+});
+
+describe('formatShare', () => {
+	it('formats 0.34 as 34%', () => {
+		expect(formatShare(0.34)).toBe('34%');
+	});
+
+	it('formats 0 as 0%', () => {
+		expect(formatShare(0)).toBe('0%');
+	});
+
+	it('formats 1 as 100%', () => {
+		expect(formatShare(1)).toBe('100%');
+	});
+
+	it('formats 0.001 as <1%', () => {
+		expect(formatShare(0.001)).toBe('<1%');
+	});
+
+	it('formats 0.999 as >99%', () => {
+		expect(formatShare(0.999)).toBe('>99%');
+	});
+
+	it('formats 1 - 1e-12 as 100%', () => {
+		expect(formatShare(1 - 1e-12)).toBe('100%');
+	});
+
+	it('formats 1e-12 as 0%', () => {
+		expect(formatShare(1e-12)).toBe('0%');
+	});
+});
+
+describe('sharesLabel', () => {
+	const model: Pick<NetworkModel, 'nodes'> = {
+		nodes: [
+			{ id: 'LYH0', label: 'Life years at hospital', kind: 'chance', states: ['low', 'high'] },
+			{ id: 'GERt', label: 'Geriatric care', kind: 'decision', states: ['No', 'Yes'] }
+		]
+	};
+
+	it('returns default label for empty evidence', () => {
+		expect(sharesLabel(model, {})).toBe('share of patient-steps');
+	});
+
+	it('returns conditional label using node labels in evidence order', () => {
+		const evidence = { GERt: 'Yes', LYH0: 'high' };
+		expect(sharesLabel(model, evidence)).toBe(
+			'conditional share of patient-steps, given Geriatric care = Yes, Life years at hospital = high'
+		);
+	});
+
+	it('falls back to id when evidence key is not in model', () => {
+		const evidence = { UNKNOWN: 'value' };
+		expect(sharesLabel(model, evidence)).toBe(
+			'conditional share of patient-steps, given UNKNOWN = value'
+		);
+	});
+});
+
+describe('describeShares', () => {
+	const model: Pick<NetworkModel, 'nodes'> = {
+		nodes: [
+			{ id: 'LYH0', label: 'LYH0', kind: 'chance', states: ['low', 'high'] },
+			{ id: 'GERt', label: 'GER', kind: 'decision', states: ['No', 'Yes'] },
+			{ id: 'OMA', label: 'OMA', kind: 'decision', states: ['A', 'B', 'C'] },
+			{ id: 'util_cost', label: 'Cost', kind: 'objective' }
+		]
+	};
+
+	it('returns shares aligned with states and arrival shares only for OMA', () => {
+		const decisionPosteriors = {
+			GERt: [0.66, 0.34],
+			OMA: [0.2, 0.3, 0.5]
+		};
+		const arrivalShares = {
+			OMA: [0.5, 0.25, 0.25]
+		};
+
+		const result = describeShares(model, decisionPosteriors, arrivalShares);
+
+		expect(result).toEqual([
+			{
+				id: 'GERt',
+				label: 'GER',
+				shares: [
+					{ state: 'No', share: 0.66 },
+					{ state: 'Yes', share: 0.34 }
+				]
+			},
+			{
+				id: 'OMA',
+				label: 'OMA',
+				shares: [
+					{ state: 'A', share: 0.2 },
+					{ state: 'B', share: 0.3 },
+					{ state: 'C', share: 0.5 }
+				],
+				arrivalShares: [
+					{ state: 'A', share: 0.5 },
+					{ state: 'B', share: 0.25 },
+					{ state: 'C', share: 0.25 }
+				]
+			}
+		]);
+
+		expect('arrivalShares' in result[0]).toBe(false);
+	});
+
+	it('returns empty shares for decision without posterior', () => {
+		const result = describeShares(model, undefined);
+		expect(result).toEqual([
+			{
+				id: 'GERt',
+				label: 'GER',
+				shares: []
+			},
+			{
+				id: 'OMA',
+				label: 'OMA',
+				shares: []
+			}
+		]);
+	});
+
+	it('lists only decisions in model order', () => {
+		const result = describeShares(model, {});
+		expect(result.map((d) => d.id)).toEqual(['GERt', 'OMA']);
 	});
 });

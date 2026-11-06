@@ -1915,6 +1915,14 @@ export interface GenericIntermediateSolutionResponse {
 }
 
 /**
+ * Response model for `StationaryModelMetaData`, without the diagram and index map.
+ */
+export interface StationaryModelMetaDataPublic {
+	id: number | null;
+	metadata_type: string;
+}
+
+/**
  * Metadata for a graphical model (Bayesian network / influence diagram) compiled `Problem`.
  *
  * Mirrors `SiteSelectionMetaData`'s JSON-blob-column pattern rather than `ScenarioModelDB`'s
@@ -2592,6 +2600,7 @@ export interface ProblemMetaDataPublic {
 	site_selection_metadata: SiteSelectionMetaData[] | null;
 	solution_description_metadata: SolutionDescriptionMetaData[] | null;
 	graphical_model_metadata: GraphicalModelMetaData[] | null;
+	stationary_model_metadata: StationaryModelMetaDataPublic[] | null;
 }
 
 /**

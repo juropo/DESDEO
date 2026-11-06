@@ -9,7 +9,9 @@ import type {
 	NetworkEvidence,
 	NetworkModel,
 	NetworkNodeKind,
-	NetworkPolicy
+	NetworkPolicy,
+	NetworkPosteriors,
+	WhatIfResult
 } from './types';
 
 /**
@@ -212,4 +214,69 @@ export function assumableEvidence(
 		}
 	}
 	return { assumptions: { chance, decisions }, blocking, conflicts };
+}
+
+/** Stationary problems: the chance posteriors plus each decision's shares, so decisions render
+ *  like chance nodes. Decision shares win on a key collision. */
+export function withDecisionShares(result: WhatIfResult): NetworkPosteriors {
+	return { ...result.posteriors, ...result.decisionPosteriors };
+}
+
+/** A share as a whole percentage; nonzero shares never round to 0% or 100%. */
+export function formatShare(share: number): string {
+	const percent = Math.round(share * 100);
+	if (percent === 0 && share > 1e-9) return '<1%';
+	if (percent === 100 && share < 1 - 1e-9) return '>99%';
+	return `${percent}%`;
+}
+
+/** What a stationary decision's shares are a share of, conditional on `evidence` if set. Nodes
+ *  are named by label. */
+export function sharesLabel(model: Pick<NetworkModel, 'nodes'>, evidence: NetworkEvidence): string {
+	const labels = new Map(model.nodes.map((n) => [n.id, n.label]));
+	const pins = Object.entries(evidence).map(([id, state]) => `${labels.get(id) ?? id} = ${state}`);
+	return pins.length === 0
+		? 'share of patient-steps'
+		: `conditional share of patient-steps, given ${pins.join(', ')}`;
+}
+
+/** One state's share, as listed by `describeShares`. */
+export interface StateShare {
+	state: string;
+	share: number;
+}
+
+/** One stationary decision's action shares, as listed by `describeShares`. */
+export interface DecisionShares {
+	id: string;
+	label: string;
+	/** Empty when the decision has no posterior. */
+	shares: StateShare[];
+	/** Atemporal decisions only: the policy's arrival share per state. */
+	arrivalShares?: StateShare[];
+}
+
+/**
+ * Each decision's occupation-weighted action shares from `decisionPosteriors`, plus the arrival
+ * shares of atemporal decisions from `arrivalShares`, both in the decision's `states` order.
+ */
+export function describeShares(
+	model: Pick<NetworkModel, 'nodes'>,
+	decisionPosteriors: NetworkPosteriors | undefined,
+	arrivalShares: Record<string, number[]> = {}
+): DecisionShares[] {
+	const toShares = (states: string[], probs: number[] | undefined): StateShare[] =>
+		probs ? states.map((state, i) => ({ state, share: probs[i] ?? 0 })) : [];
+	return model.nodes
+		.filter((n) => n.kind === 'decision')
+		.map((n) => {
+			const states = n.states ?? [];
+			const arrival = arrivalShares[n.id];
+			return {
+				id: n.id,
+				label: n.label,
+				shares: toShares(states, decisionPosteriors?.[n.id]),
+				...(arrival ? { arrivalShares: toShares(states, arrival) } : {})
+			};
+		});
 }

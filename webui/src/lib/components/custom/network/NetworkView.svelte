@@ -35,6 +35,7 @@
 	import type {
 		DecisionMode,
 		NetworkEvidence,
+		NetworkKind,
 		NetworkModel,
 		NetworkPolicy,
 		NetworkPosteriors,
@@ -51,6 +52,9 @@
 	interface Props {
 		/** Bindable so a computed layout can be persisted by the caller. */
 		model: NetworkModel;
+		/** `'stationary'`: decisions carry their shares in `posteriors`, so `decisionPosteriors` isn't
+		 *  shown as a solution's choice. */
+		kind?: NetworkKind;
 		/** Hard evidence pinned per node id. Bindable: editable nodes (see `isNodeEditable`) toggle
 		 *  it on click, but a method UI or `<NetworkPanel>` is free to set/read it directly too —
 		 *  e.g. to seed evidence from elsewhere in its own UI. */
@@ -77,6 +81,8 @@
 		/** True while a what-if refresh is in flight or debounced; dims the canvas and table so
 		 *  partial updates don't show. Caller-driven. */
 		stale?: boolean;
+		/** Disables the Commit button, with this as its tooltip. */
+		commitDisabledReason?: string | null;
 		/** `'solver'` (default): decision nodes display `policy`'s choice, read-only. `'manual'`:
 		 *  decision nodes become clickable like chance nodes, writing the chosen state into
 		 *  `evidence` instead. */
@@ -106,6 +112,7 @@
 
 	let {
 		model = $bindable(),
+		kind = 'graphical',
 		evidence = $bindable({}),
 		posteriors,
 		ghostPosteriors,
@@ -116,6 +123,7 @@
 		decisionPosteriors,
 		offPolicyDecisions,
 		stale = false,
+		commitDisabledReason = null,
 		decisionMode = 'solver',
 		highlight = null,
 		nodeChrome,
@@ -192,6 +200,7 @@
 		const ghostSnapshot = ghostPosteriors;
 		const mode = decisionMode;
 		const chrome = nodeChrome;
+		const stationary = kind === 'stationary';
 
 		untrack(() => {
 			// Read without subscribing -- this effect only needs *a* value to seed with; the
@@ -222,7 +231,7 @@
 						posterior,
 						ghostPosterior,
 						solutionPosterior:
-							n.kind === 'decision' && evidenceSnapshot[n.id] === undefined
+							n.kind === 'decision' && !stationary && evidenceSnapshot[n.id] === undefined
 								? decisionPosteriorsSnapshot?.[n.id]
 								: undefined,
 						offPolicy: evidenceSnapshot[n.id] === undefined && offPolicySnapshot?.includes(n.id),
@@ -360,11 +369,12 @@
 				<Button
 					variant="outline"
 					size="sm"
-					disabled={!diverged || stale}
+					disabled={!diverged || stale || !!commitDisabledReason}
 					onclick={handleCommit}
 					title={stale
 						? 'Waiting for the current evidence to finish refreshing before it can be committed.'
-						: 'Accept the current evidence as the new baseline for future ghost/delta comparisons.'}
+						: (commitDisabledReason ??
+							'Accept the current evidence as the new baseline for future ghost/delta comparisons.')}
 				>
 					<IconCheck class="size-3.5" />
 					Commit evidence

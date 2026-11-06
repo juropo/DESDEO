@@ -43,15 +43,20 @@
 		describeDecisions,
 		solutionStateTier,
 		filterDecisionEvidence,
-		formatUtility
+		formatUtility,
+		formatShare,
+		sharesLabel,
+		describeShares
 	} from '$lib/components/custom/network';
 	import type {
 		DecisionMode,
 		NetworkAssumptions,
 		NetworkEvidence,
+		NetworkKind,
 		NetworkModel,
 		NetworkPolicySource,
 		NetworkSolutionRef,
+		WhatIfContext,
 		WhatIfResult
 	} from '$lib/components/custom/network';
 	import IconFlag from '@lucide/svelte/icons/flag';
@@ -239,12 +244,15 @@
 	let network_flagged: Set<string> = $state(new Set());
 
 	// Network dialog for the current problem, available when it was compiled from a graphical model
-	// (it has `graphical_model_metadata`).
+	// (`graphical_model_metadata`) or a stationary diagram (`stationary_model_metadata`).
 	// `$derived.by` because the inline `$derived(...)` form makes svelte-check misreport `problem`
 	// as `never` here.
-	let network_real_available = $derived.by(
-		() => !!problem?.problem_metadata?.graphical_model_metadata?.length
-	);
+	let network_kind = $derived.by((): NetworkKind | null => {
+		const metadata = problem?.problem_metadata;
+		if (metadata?.graphical_model_metadata?.length) return 'graphical';
+		if (metadata?.stationary_model_metadata?.length) return 'stationary';
+		return null;
+	});
 	let show_network_dialog_real = $state(false);
 
 	// The real dialog's side panel: per-objective utilities and each decision's state.
@@ -253,6 +261,11 @@
 	let network_real_model = $state<NetworkModel | null>(null);
 	let network_real_evidence = $state<NetworkEvidence>({});
 	let network_real_result = $state<WhatIfResult | null>(null);
+	// What `network_real_result` was computed for, and the name of its solution if it had one.
+	let network_real_result_context = $state<WhatIfContext | null>(null);
+	let network_real_result_solution_name = $state<string | null>(null);
+	// Stationary only: the last what-if request failed, and the panel still shows the previous result.
+	let network_real_error = $state<string | null>(null);
 	// Pins belong to one problem; they survive the panel remounting, not a change of problem.
 	$effect.pre(() => {
 		void network_real_model_id;
@@ -261,13 +274,29 @@
 	function handle_network_real_structure_load(model: NetworkModel) {
 		network_real_model = model;
 		network_real_result = null;
+		network_real_result_context = null;
+		network_real_result_solution_name = null;
+		network_real_error = null;
 	}
-	function handle_network_real_whatif_result(result: WhatIfResult) {
+	function handle_network_real_whatif_result(result: WhatIfResult, context: WhatIfContext) {
 		network_real_result = result;
+		network_real_result_context = context;
+		network_real_result_solution_name = same_solution(context.solution, network_real_solution_ref)
+			? (network_real_solution?.name ?? null)
+			: null;
+		network_real_error = null;
+	}
+	function handle_network_real_whatif_error(message: string) {
+		network_real_error = message;
+	}
+	function same_solution(a: NetworkSolutionRef | null, b: NetworkSolutionRef | null): boolean {
+		return a?.stateId === b?.stateId && a?.solutionIndex === b?.solutionIndex;
 	}
 	// Unpinned decisions follow the solution selected in the main UI, else the first current one.
+	// A stationary problem shows the status-quo policy instead of the first current solution.
 	let network_real_solution = $derived.by(() => {
 		const selected = mode === 'iterate' ? chosen_solutions[selected_iteration_index[0]] : undefined;
+		if (network_kind === 'stationary') return selected ?? null;
 		return selected ?? current_state.current_solutions?.[0] ?? null;
 	});
 	let network_real_solution_ref = $derived.by((): NetworkSolutionRef | null =>
@@ -325,10 +354,46 @@
 		network_real_decisions.filter((d) => d.source === 'off-policy').map((d) => d.label)
 	);
 	let network_real_objectives = $derived(
-		(network_real_model?.nodes.filter((n) => n.kind === 'objective') ?? []).map((node) => ({
-			node,
-			maximize: problem?.objectives.find((o) => `util_${o.symbol}` === node.id)?.maximize
-		}))
+		(network_real_model?.nodes.filter((n) => n.kind === 'objective') ?? []).map((node) => {
+			const objective = problem?.objectives.find((o) => `util_${o.symbol}` === node.id);
+			return { node, symbol: objective?.symbol, maximize: objective?.maximize };
+		})
+	);
+	// The stationary side panel's labels, for what the shown result was computed for.
+	let network_stationary_evidence = $derived(
+		network_real_result_context?.evidence ?? network_real_evidence
+	);
+	let network_stationary_shares_label = $derived(
+		network_real_model ? sharesLabel(network_real_model, network_stationary_evidence) : ''
+	);
+	let network_stationary_has_solution = $derived(
+		network_real_result_context ? !!network_real_result_context.solution : !!network_real_solution
+	);
+	let network_stationary_policy_label = $derived.by(() => {
+		const context = network_real_result_context;
+		if (!context) {
+			return network_real_solution
+				? `Policy of the selected solution${network_real_solution.name ? ` ${network_real_solution.name}` : ''}.`
+				: 'No solution is selected: showing the status-quo policy.';
+		}
+		if (!context.solution) {
+			return network_real_solution_ref
+				? 'Showing the status-quo policy.'
+				: 'No solution is selected: showing the status-quo policy.';
+		}
+		const name = network_real_result_solution_name ? ` ${network_real_result_solution_name}` : '';
+		return same_solution(context.solution, network_real_solution_ref)
+			? `Policy of the selected solution${name}.`
+			: `Policy of a previously selected solution${name}.`;
+	});
+	let network_real_shares = $derived(
+		network_real_model
+			? describeShares(
+					network_real_model,
+					network_real_result?.decisionPosteriors,
+					network_real_result?.stationary?.arrivalShares
+				)
+			: []
 	);
 
 	function toggle_network_flag(id: string) {
@@ -485,9 +550,9 @@
 		show_network_dialog_real = true;
 	}
 
-	// Close the dialog if the problem is replaced by one without a graphical model.
+	// Close the dialog if the problem is replaced by one without a network.
 	$effect(() => {
-		if (!network_real_available) show_network_dialog_real = false;
+		if (network_kind === null) show_network_dialog_real = false;
 	});
 
 	$effect(() => {
@@ -640,14 +705,15 @@
 		if (hasSolutionDescription) {
 			tabs.push({ id: 'description', label: 'Explanation', content: solution_description_tab });
 		}
-		if (network_real_available)
-			tabs.push({ id: 'network', label: 'Network', content: network_tab });
+		if (network_kind !== null) tabs.push({ id: 'network', label: 'Network', content: network_tab });
 		return tabs;
 	});
-	// The network tab follows the selected solution, else the first current one.
+	// The network tab follows the selected solution, else the first current one (else, for a
+	// stationary problem, the status quo).
 	let network_tab_solution_ref = $derived.by((): NetworkSolutionRef | null => {
 		const solution =
-			chosen_solutions[selected_iteration_index[0]] ?? current_state.current_solutions?.[0];
+			chosen_solutions[selected_iteration_index[0]] ??
+			(network_kind === 'stationary' ? undefined : current_state.current_solutions?.[0]);
 		return solution
 			? { stateId: solution.state_id, solutionIndex: solution.solution_index ?? 0 }
 			: null;
@@ -1243,7 +1309,9 @@
 		<div class="flex h-full min-h-0 flex-col gap-2 p-2">
 			<div class="flex items-center justify-between gap-2 text-xs">
 				<span class="text-muted-foreground"
-					>Policy and expected utilities of the selected solution.</span
+					>{network_kind === 'stationary' && !network_tab_solution_ref
+						? 'Status-quo policy: no solution is selected.'
+						: 'Policy and expected utilities of the selected solution.'}</span
 				>
 				<Button variant="outline" size="sm" onclick={() => (show_network_dialog_real = true)}>
 					Explore
@@ -1252,6 +1320,7 @@
 			<div class="min-h-0 flex-1">
 				<NetworkPanel
 					modelId={network_real_model_id ?? problem.id}
+					kind={network_kind ?? 'graphical'}
 					decisionMode="manual"
 					policySolution={network_tab_solution_ref}
 					readonly
@@ -1420,8 +1489,9 @@
 						Add uncertainty measures
 					</DropdownMenu.Item>
 					<DropdownMenu.Item>Modify problem</DropdownMenu.Item>
-					{#if network_real_available}
-						<!-- Shown when the current problem was compiled from a graphical model. -->
+					{#if network_kind !== null}
+						<!-- Shown when the current problem was compiled from a graphical model or a
+						     stationary diagram. -->
 						<DropdownMenu.Item onclick={() => (show_network_dialog_real = true)}>
 							View network structure
 						</DropdownMenu.Item>
@@ -1957,24 +2027,34 @@
 			<Dialog.Header>
 				<Dialog.Title>Network structure</Dialog.Title>
 				<Dialog.Description>
-					The graphical model (Bayesian network / influence diagram) this problem was compiled from,
-					read live via the same `/graphical/*` endpoints the demo above uses -- structure,
-					evidence-driven what-if inference, and saved evidence sets, against the problem currently
-					loaded in this session rather than a fixed sample diagram. Exploring evidence here changes
-					nothing; "Explore in CUMULUS" creates a new problem under the evidence on decisions and
-					chance nodes without parents, and switches the method to it.
+					{#if network_kind === 'stationary'}
+						The stationary diagram this problem was compiled from, with each decision's share of
+						patient-steps under the selected solution's randomised policy, or the status quo when no
+						solution is selected. Pinning states conditions on observed patient-steps.
+					{:else}
+						The graphical model (Bayesian network / influence diagram) this problem was compiled
+						from, read live via the same `/graphical/*` endpoints the demo above uses -- structure,
+						evidence-driven what-if inference, and saved evidence sets, against the problem
+						currently loaded in this session rather than a fixed sample diagram. Exploring evidence
+						here changes nothing; "Explore in CUMULUS" creates a new problem under the evidence on
+						decisions and chance nodes without parents, and switches the method to it.
+					{/if}
 				</Dialog.Description>
 			</Dialog.Header>
 			<div class="min-h-0 flex-1">
 				{#if problem}
 					<NetworkPanel
 						modelId={network_real_model_id ?? problem.id}
+						kind={network_kind ?? 'graphical'}
 						decisionMode="manual"
 						policySolution={network_real_solution_ref}
 						bind:evidence={network_real_evidence}
 						onWhatIfResult={handle_network_real_whatif_result}
+						onWhatIfError={handle_network_real_whatif_error}
 						onStructureLoad={handle_network_real_structure_load}
-						onExploreAssumptions={handle_network_real_explore}
+						onExploreAssumptions={network_kind === 'graphical'
+							? handle_network_real_explore
+							: undefined}
 						exploreLabel="Explore in CUMULUS"
 						exploring={network_real_exploring}
 						exploreError={network_real_explore_error}
@@ -1983,69 +2063,141 @@
 					/>
 				{/if}
 				{#snippet network_real_aside()}
-					<div class="space-y-3 text-sm">
-						<div class="space-y-1">
-							<p class="text-muted-foreground text-xs font-medium">Expected utilities</p>
-							{#if network_real_unpinned.length > 0}
-								<p class="text-muted-foreground text-xs">
-									Pin every decision to see utilities; unpinned: {network_real_unpinned.join(', ')}.
-								</p>
-							{:else if network_real_off_policy_labels.length > 0}
-								<p class="text-muted-foreground text-xs">
-									Your pins moved {network_real_off_policy_labels.join(', ')} off the solution's path;
-									pin
-									{network_real_off_policy_labels.join(', ')} too to see utilities.
-								</p>
-							{:else}
-								{#each network_real_objectives as { node, maximize } (node.id)}
-									{@const mean = network_real_result?.utilities?.[node.id]}
-									<div class="rounded-md border px-2 py-1">
-										<div class="flex items-center gap-1">
-											{#if maximize === true}
-												<IconArrowUp class="size-3 shrink-0" />
-											{:else if maximize === false}
-												<IconArrowDown class="size-3 shrink-0" />
-											{/if}
-											<span class="truncate" title={node.label}>{node.label}</span>
+					{#if network_kind === 'stationary'}
+						{@render network_stationary_aside()}
+					{:else}
+						<div class="space-y-3 text-sm">
+							<div class="space-y-1">
+								<p class="text-muted-foreground text-xs font-medium">Expected utilities</p>
+								{#if network_real_unpinned.length > 0}
+									<p class="text-muted-foreground text-xs">
+										Pin every decision to see utilities; unpinned: {network_real_unpinned.join(
+											', '
+										)}.
+									</p>
+								{:else if network_real_off_policy_labels.length > 0}
+									<p class="text-muted-foreground text-xs">
+										Your pins moved {network_real_off_policy_labels.join(', ')} off the solution's path;
+										pin
+										{network_real_off_policy_labels.join(', ')} too to see utilities.
+									</p>
+								{:else}
+									{#each network_real_objectives as { node, maximize } (node.id)}
+										{@const mean = network_real_result?.utilities?.[node.id]}
+										<div class="rounded-md border px-2 py-1">
+											<div class="flex items-center gap-1">
+												{#if maximize === true}
+													<IconArrowUp class="size-3 shrink-0" />
+												{:else if maximize === false}
+													<IconArrowDown class="size-3 shrink-0" />
+												{/if}
+												<span class="truncate" title={node.label}>{node.label}</span>
+											</div>
+											<div class="text-muted-foreground text-xs tabular-nums">
+												{mean != null
+													? formatUtility(mean, network_real_result?.utilityStdDevs?.[node.id])
+													: '–'}
+											</div>
 										</div>
-										<div class="text-muted-foreground text-xs tabular-nums">
-											{mean != null
-												? formatUtility(mean, network_real_result?.utilityStdDevs?.[node.id])
-												: '–'}
+									{/each}
+								{/if}
+							</div>
+							{#if network_real_decisions.length > 0}
+								<div class="space-y-1">
+									<p class="text-muted-foreground text-xs font-medium">Decisions</p>
+									{#each network_real_decisions as decision (decision.id)}
+										<div class="rounded-md border px-2 py-1">
+											<div class="truncate" title={decision.label}>
+												{decision.label}{decision.state
+													? `: ${decision.state}`
+													: network_real_possible_states[decision.id]
+														? `: ${network_real_possible_states[decision.id]}`
+														: ''}
+											</div>
+											<div class="text-muted-foreground text-xs">
+												{#if decision.source === 'pinned'}
+													pinned
+												{:else if decision.source === 'off-policy'}
+													off the solution's path — pin it
+												{:else if decision.source === 'solution'}
+													from solution {network_real_solution?.name ?? ''}
+												{:else if decision.dependsOn.length > 0}
+													unresolved — depends on {decision.dependsOn.join(', ')}
+												{:else}
+													unresolved
+												{/if}
+											</div>
 										</div>
-									</div>
-								{/each}
+									{/each}
+								</div>
 							{/if}
 						</div>
-						{#if network_real_decisions.length > 0}
+					{/if}
+				{/snippet}
+				{#snippet network_stationary_aside()}
+					{@const stationary = network_real_result?.stationary}
+					<div class="space-y-3 text-sm">
+						{#if network_real_error}
+							<p class="text-destructive text-xs">
+								The last request failed: {network_real_error}{network_real_result_context
+									? '; showing the previous result'
+									: ''}.
+							</p>
+						{/if}
+						<p class="text-muted-foreground text-xs">{network_stationary_policy_label}</p>
+						<div class="space-y-1">
+							<p class="text-muted-foreground text-xs font-medium">
+								{network_stationary_has_solution ? "Solution's" : "Status quo's"} per-step values{stationary
+									? ` (discount ${stationary.discount})`
+									: ''}
+							</p>
+							{#each network_real_objectives as { node, symbol, maximize } (node.id)}
+								{@const value = symbol !== undefined ? stationary?.objectives[symbol] : undefined}
+								<div class="rounded-md border px-2 py-1">
+									<div class="flex items-center gap-1">
+										{#if maximize === true}
+											<IconArrowUp class="size-3 shrink-0" />
+										{:else if maximize === false}
+											<IconArrowDown class="size-3 shrink-0" />
+										{/if}
+										<span class="truncate" title={node.label}>{node.label}</span>
+									</div>
+									<div class="text-muted-foreground text-xs tabular-nums">
+										{value != null ? formatUtility(value) : '–'}
+									</div>
+								</div>
+							{/each}
+						</div>
+						{#if network_real_shares.length > 0}
 							<div class="space-y-1">
 								<p class="text-muted-foreground text-xs font-medium">Decisions</p>
-								{#each network_real_decisions as decision (decision.id)}
+								<p class="text-muted-foreground text-xs">
+									Action shares: {network_stationary_shares_label}.
+								</p>
+								{#each network_real_shares as decision (decision.id)}
 									<div class="rounded-md border px-2 py-1">
-										<div class="truncate" title={decision.label}>
-											{decision.label}{decision.state
-												? `: ${decision.state}`
-												: network_real_possible_states[decision.id]
-													? `: ${network_real_possible_states[decision.id]}`
-													: ''}
+										<div class="truncate" title={decision.label}>{decision.label}</div>
+										<div class="text-muted-foreground text-xs tabular-nums">
+											{decision.shares.length > 0
+												? decision.shares
+														.map((s) => `${s.state} ${formatShare(s.share)}`)
+														.join(' · ')
+												: '–'}
 										</div>
-										<div class="text-muted-foreground text-xs">
-											{#if decision.source === 'pinned'}
-												pinned
-											{:else if decision.source === 'off-policy'}
-												off the solution's path — pin it
-											{:else if decision.source === 'solution'}
-												from solution {network_real_solution?.name ?? ''}
-											{:else if decision.dependsOn.length > 0}
-												unresolved — depends on {decision.dependsOn.join(', ')}
-											{:else}
-												unresolved
-											{/if}
-										</div>
+										{#if decision.arrivalShares}
+											<div class="text-muted-foreground text-xs tabular-nums">
+												Arrival share q: {decision.arrivalShares
+													.map((s) => `${s.state} ${formatShare(s.share)}`)
+													.join(' · ')}
+											</div>
+										{/if}
 									</div>
 								{/each}
 							</div>
 						{/if}
+						<p class="text-muted-foreground text-xs">
+							Pins condition on observed patient-steps; they don't change the policy.
+						</p>
 					</div>
 				{/snippet}
 			</div>

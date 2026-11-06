@@ -10,7 +10,7 @@
 	import IconArrowDown from '@lucide/svelte/icons/arrow-down';
 	import IconInfo from '@lucide/svelte/icons/info';
 	import { NODE_KIND_STYLE } from '../node-style';
-	import { isStatePinned, solutionStateTier } from '../interaction';
+	import { formatShare, isStatePinned, solutionStateTier } from '../interaction';
 	import { BAR_TRANSITION_MS, computeDelta, dominantDeltaIndex, formatUtility } from '../whatif';
 	import type { NetworkNodeData } from '../view-types';
 	import type { NetworkNodeKind } from '../types';
@@ -101,11 +101,10 @@
 	 *  when both are available, so the delta isn't conveyed by color alone. */
 	function stateTitle(state: string, prob: number | undefined, ghost: number | undefined): string {
 		if (prob == null) return state;
-		const pct = Math.round(prob * 100);
-		if (ghost == null) return `${state}: ${pct}%`;
+		if (ghost == null) return `${state}: ${formatShare(prob)}`;
 		const deltaPct = Math.round((prob - ghost) * 100);
 		const sign = deltaPct > 0 ? '+' : '';
-		return `${state}: ${pct}% (baseline ${Math.round(ghost * 100)}%, ${sign}${deltaPct}pp)`;
+		return `${state}: ${formatShare(prob)} (baseline ${formatShare(ghost)}, ${sign}${deltaPct}pp)`;
 	}
 
 	let hexagon = $derived(style.shape === 'hexagon');
@@ -202,7 +201,9 @@
 	{#if kind === 'objective' && nodeData.detail !== 'compact' && nodeData.utility != null}
 		<span
 			class="text-muted-foreground text-[10px] leading-none tabular-nums"
-			title="Expected value ± standard deviation"
+			title={nodeData.utilityStdDev != null
+				? 'Expected value ± standard deviation'
+				: 'Expected value'}
 		>
 			{formatUtility(nodeData.utility, nodeData.utilityStdDev)}
 		</span>
