@@ -9,6 +9,8 @@ Oracles:
 4. **`stationary_value_iteration`** and enumeration, against `compile_stationary_lp`'s LP optimum.
 5. **A propagated population** (`_renewal_oracle`), whose renewed mass restarts from mu0 with fresh
    atemporal draws, against evaluation with renewal.
+6. **An explicit einsum of the step joint** (`_joint_oracle`) over the flattened oracle's occupation,
+   against `stationary_step_posteriors`.
 """
 
 import inspect
@@ -51,6 +53,8 @@ from desdeo.problem.graphical import (
     full_observation_information_set,
     initial_state_distribution,
     read_randomised_policy,
+    stationary_payoff_table,
+    stationary_step_posteriors,
     stationary_value_iteration,
 )
 from desdeo.problem.graphical.index_map import mixed_radix_encode
@@ -264,10 +268,10 @@ def _discounted_values(flat: FlattenedStep, transition: np.ndarray, rewards: dic
     return {symbol: float(x @ reward) for symbol, reward in rewards.items()}
 
 
-def _flat_value(
+def _branch_occupation(
     flat: FlattenedStep, tables: dict[str, np.ndarray], marginals: dict[str, np.ndarray] | None = None
-) -> dict[str, float]:
-    """Oracle: a linear solve over (branch, state) on the flattened kernels.
+) -> tuple[np.ndarray, list[tuple[np.ndarray, dict[str, np.ndarray], np.ndarray]]]:
+    """Oracle: the occupation over (branch, state) by a linear solve on the flattened kernels, and each branch's loop.
 
     Every arrival, initial or renewed, draws its branch from the product of the atemporal marginals
     and its state from mu0.
@@ -284,7 +288,14 @@ def _flat_value(
     transition = block_diag(*(loop[0] for loop in loops))
     transition += np.outer(arrivals, np.concatenate([loop[2] for loop in loops]))
     gamma = flat.discount
-    x = np.linalg.solve(np.eye(len(arrivals)) - gamma * transition, (1.0 - gamma) * arrivals)
+    return np.linalg.solve(np.eye(len(arrivals)) - gamma * transition, (1.0 - gamma) * arrivals), loops
+
+
+def _flat_value(
+    flat: FlattenedStep, tables: dict[str, np.ndarray], marginals: dict[str, np.ndarray] | None = None
+) -> dict[str, float]:
+    """Oracle: per-step averages from `_branch_occupation`."""
+    x, loops = _branch_occupation(flat, tables, marginals)
     return {symbol: float(x @ np.concatenate([loop[1][symbol] for loop in loops])) for symbol in flat.maximize}
 
 
@@ -351,10 +362,12 @@ def _random_policies(
 
 
 def _pinned_network(diagram: StationaryDiagram, policies: dict[str, RandomisedPolicy]) -> DiscreteNetwork:
-    """`diagram.network` with each decision's CPT replaced by its policy."""
+    """`diagram.network` with each decision in `policies` having its CPT replaced by its policy."""
     cardinality = {variable.name: len(variable.labels) for variable in diagram.network.variables}
     network = diagram.network
     for decision in diagram.decisions:
+        if decision.symbol not in policies:
+            continue
         probabilities = policies[decision.symbol].probabilities
         rows = np.array([probabilities[key] for key in range(len(probabilities))])
         shape = [len(decision.states), *(cardinality[name] for name in decision.information_set)]
@@ -1337,6 +1350,218 @@ def test_read_policy_no_mass() -> None:
     """All masses at or below `tol` raise."""
     with pytest.raises(ValueError, match="No branch mass"):
         read_randomised_policy(_two_atemporal_index_map(), _branch_solution(np.full(6, 1e-12)))
+
+
+def _joint_oracle(
+    diagram: StationaryDiagram,
+    flat: FlattenedStep,
+    marginals: dict[str, np.ndarray],
+    tables: dict[str, np.ndarray],
+    policies: dict[str, RandomisedPolicy],
+) -> tuple[list[str], np.ndarray]:
+    """Oracle: the step joint over the atemporal decisions, the state nodes and slice t, by an explicit einsum.
+
+    `_branch_occupation`'s x over (branch, state) times the slice-t CPTs of `_pinned_network`.
+    """
+    x, _ = _branch_occupation(flat, tables, marginals)
+    atemporal = [decision.symbol for decision in flat.atemporal_decisions]
+    x = x.reshape([*(len(decision.states) for decision in flat.atemporal_decisions), *flat.state_cardinalities])
+    network = _pinned_network(diagram, policies)
+    slicet = [variable.name for variable in network.variables if variable.name in diagram.structure.slicet]
+    nodes = [*atemporal, *flat.state_nodes, *slicet]
+    letters = {name: chr(ord("a") + i) for i, name in enumerate(nodes)}
+    subscripts = ["".join(letters[name] for name in [*atemporal, *flat.state_nodes])]
+    operands = [x]
+    for name in slicet:
+        potential = network.potentials[name]
+        subscripts.append("".join(letters[axis] for axis in potential.variables))
+        operands.append(np.array(potential.values))
+    return nodes, np.einsum(f"{','.join(subscripts)}->{''.join(letters.values())}", *operands)
+
+
+def _conditioned(
+    nodes: list[str], joint: np.ndarray, evidence: dict[str, int], objectives: list[ObjectiveNode]
+) -> tuple[dict[str, np.ndarray], dict[str, float], float]:
+    """Oracle: posteriors, conditional expected utilities and evidence probability from a full joint."""
+    for name, index in evidence.items():
+        mask = np.zeros(joint.shape[nodes.index(name)])
+        mask[index] = 1.0
+        joint = joint * mask.reshape([-1 if node == name else 1 for node in nodes])
+    probability = float(joint.sum())
+    posteriors = {
+        name: joint.sum(axis=tuple(i for i in range(len(nodes)) if i != axis)) / probability
+        for axis, name in enumerate(nodes)
+    }
+    letters = {name: chr(ord("a") + i) for i, name in enumerate(nodes)}
+    utilities = {
+        objective.symbol: float(
+            np.einsum(
+                f"{''.join(letters.values())},{''.join(letters[parent] for parent in objective.parents)}->",
+                joint,
+                np.array(objective.utility.values),
+            )
+        )
+        / probability
+        for objective in objectives
+    }
+    return posteriors, utilities, probability
+
+
+def _status_quo_tables(diagram: StationaryDiagram) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+    """Every decision's network CPT as atemporal marginals and chain tables over its information states."""
+    cardinality = {variable.name: len(variable.labels) for variable in diagram.network.variables}
+    marginals, tables = {}, {}
+    for decision in diagram.decisions:
+        potential = diagram.network.potentials[decision.symbol]
+        values = np.array(potential.values)
+        information_set = decision.information_set
+        rows = []
+        for key in itertools.product(*(range(cardinality[name]) for name in information_set)):
+            observed = dict(zip(information_set, key, strict=True))
+            rows.append(values[(slice(None), *(observed[name] for name in potential.variables[1:]))])
+        table = np.array(rows)
+        if decision.symbol in diagram.structure.atemporal:
+            marginals[decision.symbol] = table[0]
+        else:
+            tables[decision.symbol] = table
+    return marginals, tables
+
+
+def _assert_posteriors_match_joint_oracle(
+    diagram: StationaryDiagram,
+    marginals: dict[str, np.ndarray],
+    tables: dict[str, np.ndarray],
+    policies: dict[str, RandomisedPolicy],
+    evidence: dict[str, int],
+) -> None:
+    """`stationary_step_posteriors` under `policies` matches `_joint_oracle` conditioned on `evidence`."""
+    nodes, joint = _joint_oracle(diagram, flatten_stationary_step(diagram), marginals, tables, policies)
+    expected_posteriors, expected_utilities, probability = _conditioned(nodes, joint, evidence, diagram.objectives)
+
+    result = stationary_step_posteriors(diagram, policies, evidence)
+    assert set(result.posteriors) == set(nodes)
+    for node, posterior in expected_posteriors.items():
+        np.testing.assert_allclose(result.posteriors[node], posterior, rtol=0, atol=1e-10)
+    assert result.utilities == pytest.approx(expected_utilities, abs=1e-10)
+    assert result.evidence_probability == pytest.approx(probability, abs=1e-10)
+
+
+@pytest.mark.parametrize("name", ["chain_atemporal", "renewal", "renewal_chain_atemporal"])
+@pytest.mark.parametrize("evidence", [{}, {"Dt": 1}, {"X0": 0, "Yt": 1}], ids=["none", "one", "two"])
+def test_step_posteriors_match_joint_oracle(name: str, evidence: dict[str, int]) -> None:
+    """Posteriors and conditional utilities under random randomised policies match the explicit step joint."""
+    diagram = _SMALL_DIAGRAMS[name]()
+    rng = np.random.default_rng(7)
+    for _ in range(3):
+        marginals, tables, policies = _random_policies(diagram, rng)
+        _assert_posteriors_match_joint_oracle(diagram, marginals, tables, policies, evidence)
+
+
+@pytest.mark.parametrize("name", ["chain_atemporal", "renewal_atemporal", "renewal_chain_atemporal"])
+@pytest.mark.parametrize("g", [0, 1])
+@pytest.mark.parametrize("evidence", ["none", "Dt", "G"])
+def test_step_posteriors_one_hot_atemporal_match_joint_oracle(name: str, g: int, evidence: str) -> None:
+    """A one-hot G, a step factor rather than a state node, matches the explicit step joint."""
+    diagram = _SMALL_DIAGRAMS[name]()
+    marginals, tables, policies = _random_policies(diagram, np.random.default_rng(7))
+    one_hot = np.eye(2)[g]
+    policies = {**policies, "G": policies["G"].model_copy(update={"probabilities": {0: one_hot.tolist()}})}
+    conditions = {"none": {}, "Dt": {"Dt": 1}, "G": {"G": g}}[evidence]
+    _assert_posteriors_match_joint_oracle(diagram, {**marginals, "G": one_hot}, tables, policies, conditions)
+
+
+@pytest.mark.parametrize("name", ["chain", "chain_atemporal", "renewal", "renewal_chain_atemporal"])
+@pytest.mark.parametrize("evidence", [{}, {"Dt": 1}, {"X0": 0, "Yt": 1}], ids=["none", "one", "two"])
+def test_step_posteriors_status_quo_match_joint_oracle(name: str, evidence: dict[str, int]) -> None:
+    """The status quo matches the explicit step joint with every decision at its network CPT."""
+    diagram = _SMALL_DIAGRAMS[name]()
+    marginals, tables = _status_quo_tables(diagram)
+    _assert_posteriors_match_joint_oracle(diagram, marginals, tables, {}, evidence)
+
+
+@pytest.mark.parametrize("name", ["mdp", "same_slice", "chain_atemporal", "renewal_atemporal"])
+def test_step_posteriors_without_evidence_match_evaluation(name: str) -> None:
+    """Without evidence the utilities are the objectives and the state posteriors the occupation's marginals."""
+    diagram = _SMALL_DIAGRAMS[name]()
+    rng = np.random.default_rng(3)
+    for policies in [{}, _random_policies(diagram, rng)[2]]:
+        evaluation = evaluate_stationary_policy(diagram, policies)
+        result = stationary_step_posteriors(diagram, policies)
+        assert result.utilities == pytest.approx(evaluation.objectives, abs=1e-12)
+        assert result.evidence_probability == pytest.approx(1.0, abs=1e-12)
+        occupation = np.array(evaluation.occupation.values)
+        state_nodes = evaluation.occupation.variables
+        for axis, node in enumerate(state_nodes):
+            marginal = occupation.sum(axis=tuple(i for i in range(len(state_nodes)) if i != axis))
+            np.testing.assert_allclose(result.posteriors[node], marginal, rtol=0, atol=1e-12)
+
+
+def test_step_posteriors_point_mass_policy_on_mdp() -> None:
+    """A deterministic Dt's posterior is the occupation-weighted share of its choices."""
+    diagram = _mdp_diagram()
+    policy = DecisionPolicy(symbol="Dt", information_set=["X0"], states=["lo", "mid", "hi"], policy={0: 2, 1: 0})
+    x0 = evaluate_stationary_policy(diagram, {"Dt": policy}).occupation.values
+    result = stationary_step_posteriors(diagram, {"Dt": policy})
+    np.testing.assert_allclose(result.posteriors["Dt"], [x0[1], 0.0, x0[0]], rtol=0, atol=1e-12)
+    conditioned = stationary_step_posteriors(diagram, {"Dt": policy}, {"X0": 1})
+    np.testing.assert_allclose(conditioned.posteriors["Dt"], [1.0, 0.0, 0.0], rtol=0, atol=1e-12)
+    assert conditioned.evidence_probability == pytest.approx(x0[1], abs=1e-12)
+
+
+@pytest.mark.parametrize(
+    ("evidence", "match"),
+    [
+        ({"Q": 0}, "aren't in the step joint"),
+        ({"D0": 0}, "aren't in the step joint"),
+        ({"Dt": 2}, "isn't an integer in range"),
+        ({"Yt": -1}, "isn't an integer in range"),
+        ({"Dt": 1.0}, "isn't an integer in range"),
+        ({"Dt": True}, "isn't an integer in range"),
+        ({"X0": 0, "Zt": 1}, "probability 0"),
+    ],
+)
+def test_step_posteriors_invalid_evidence_raises(evidence: dict[str, int], match: str) -> None:
+    """Unknown evidence nodes, non-integer or out-of-range states and impossible evidence raise."""
+    with pytest.raises(ValueError, match=match):
+        stationary_step_posteriors(_chain_diagram(), {}, evidence)
+
+
+def test_step_posteriors_mixed_atemporal_draws_raise() -> None:
+    """A randomised atemporal policy with initial_distribution raises, as its evaluation mixes draws."""
+    diagram = _chain_diagram(atemporal=True)
+    mu = initial_state_distribution(diagram)
+    explicit = StationaryDiagram(
+        **{
+            **dict(diagram),
+            "initial_distribution": Potential(
+                variables=diagram.structure.state_nodes, shape=list(mu.shape), values=mu.tolist()
+            ),
+        }
+    )
+    _, _, policies = _random_policies(diagram, np.random.default_rng(4))
+    with pytest.raises(NotImplementedError, match="initial_distribution"):
+        stationary_step_posteriors(explicit, policies)
+
+
+@pytest.mark.parametrize("name", list(_SMALL_DIAGRAMS))
+def test_payoff_table_matches_brute_force(name: str) -> None:
+    """The ideal and nadir match the payoff table of the best enumerated deterministic policy per objective."""
+    diagram = _SMALL_DIAGRAMS[name]()
+    flat = flatten_stationary_step(diagram)
+    values = [
+        evaluate_stationary_policy(diagram, policies).objectives
+        for _, _, policies in _deterministic_combinations(diagram, flat)
+    ]
+    rows = {
+        symbol: (max if maximize else min)(values, key=lambda value, symbol=symbol: value[symbol])
+        for symbol, maximize in flat.maximize.items()
+    }
+    ideal, nadir = stationary_payoff_table(diagram)
+    for symbol, maximize in flat.maximize.items():
+        assert ideal[symbol] == pytest.approx(rows[symbol][symbol], abs=1e-10)
+        worst = (min if maximize else max)(row[symbol] for row in rows.values())
+        assert nadir[symbol] == pytest.approx(worst, abs=1e-10)
+        assert (ideal[symbol] >= nadir[symbol]) if maximize else (ideal[symbol] <= nadir[symbol])
 
 
 _CI_SOLVER_OPTIONS = {

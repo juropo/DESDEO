@@ -11,7 +11,7 @@ import itertools
 from collections.abc import Hashable, Sequence
 from functools import reduce
 from math import prod
-from typing import Literal, Self
+from typing import Literal, NamedTuple, Self
 
 import numpy as np
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -47,6 +47,9 @@ _PROBABILITY_SUM_TOLERANCE = 1e-9
 
 _MAX_ATEMPORAL_DRAWS = 1024
 """The most deterministic draws `_mix_atemporal_draws` evaluates."""
+
+_ZERO_EVIDENCE = 1e-12
+"""Evidence probabilities at or below this count as 0 in `stationary_step_posteriors`."""
 
 
 def _check_known_decisions(symbols: set[str], node_names: set[str]) -> None:
@@ -642,30 +645,29 @@ def _mix_atemporal_draws(
     )
 
 
-def evaluate_stationary_policy(
+class _StepJoint(NamedTuple):
+    """The occupation over a policy's internal state and the step factors that extend it."""
+
+    state: list[str]
+    """Atemporal then slice-0 nodes, each in topological order; a superset of `TwoSliceStructure.state_nodes`."""
+    x: np.ndarray
+    """The occupation measure over `state`, one axis per node."""
+    factors: dict[str, Factor]
+    """Every node's CPT, with the policies substituted."""
+    parents: dict[str, Sequence[str]]
+    """Node -> its parents in `factors`."""
+    step: set[str]
+    """The nodes drawn at every step: slice t and the decided atemporal nodes."""
+
+
+def _policy_factors(
     diagram: StationaryDiagram, policies: dict[str, DecisionPolicy | RandomisedPolicy | None]
-) -> StationaryEvaluation:
-    """Objective values and occupation measure of `diagram` under `policies`.
+) -> tuple[dict[str, Factor], set[str], dict[str, Factor]]:
+    """The network's factors with `policies` substituted, the decided nodes and the drawn atemporal policies.
 
-    A randomised atemporal policy is drawn once per patient, not at every step. Without
-    `diagram.initial_distribution`, every atemporal policy is then a state node's CPT, like a
-    status-quo atemporal node's. With it, the objectives and the occupation are the
-    probability-weighted mix of those of the deterministic draws. A renewal draws the next state,
-    atemporal nodes included, from the initial distribution, so a new patient gets a fresh draw.
-
-    Args:
-        diagram: the stationary diagram.
-        policies: decision symbol -> deterministic or randomised policy, keyed as
-            `read_policy_from_solution` produces them. `None` or a missing key uses the node's
-            status-quo CPT from `diagram.network`.
-
-    Raises:
-        ValueError: a policy doesn't match its decision, status-quo decisions need state nodes
-            outside `diagram.initial_distribution`'s, or there are too many draws to mix.
-        NotImplementedError: a randomised atemporal policy with both `diagram.initial_distribution`
-            and `diagram.renewal`.
+    Drawn policies are the randomised atemporal ones. With drawn policies and no
+    `initial_distribution`, no atemporal node counts as decided.
     """
-    network = diagram.network
     structure = diagram.structure
     decisions = {decision.symbol: decision for decision in diagram.decisions}
     unknown = sorted(set(policies) - set(decisions))
@@ -673,8 +675,8 @@ def evaluate_stationary_policy(
         msg = f"Policies given for unknown decisions {unknown}."
         raise ValueError(msg)
 
-    cardinality = {variable.name: len(variable.labels) for variable in network.variables}
-    factors = _network_factors(network)
+    cardinality = {variable.name: len(variable.labels) for variable in diagram.network.variables}
+    factors = _network_factors(diagram.network)
     decided: set[str] = set()
     for symbol, policy in policies.items():
         if policy is not None:
@@ -685,11 +687,17 @@ def evaluate_stationary_policy(
         for symbol in policies
         if symbol in decided & structure.atemporal and not np.isin(factors[symbol][1], (0.0, 1.0)).all()
     }
-    if drawn:
-        if diagram.initial_distribution is not None:
-            return _mix_atemporal_draws(diagram, policies, drawn)
+    if drawn and diagram.initial_distribution is None:
         # Undecided atemporal nodes are state nodes, drawn once from their CPTs.
         decided -= structure.atemporal
+    return factors, decided, drawn
+
+
+def _step_joint(diagram: StationaryDiagram, factors: dict[str, Factor], decided: set[str]) -> _StepJoint:
+    """The occupation measure over the internal state of the policy whose factors are `factors`."""
+    network = diagram.network
+    structure = diagram.structure
+    cardinality = {variable.name: len(variable.labels) for variable in network.variables}
     parents = {name: axes[1:] for name, (axes, _) in factors.items()}
 
     # Status-quo decisions are chance nodes here, so the state may need more nodes than the diagram's.
@@ -743,6 +751,36 @@ def evaluate_stationary_policy(
     gamma = diagram.discount
     x = np.linalg.solve(np.eye(size) - gamma * kernel.T, (1 - gamma) * mu.reshape(size))
     x = x.reshape([cardinality[name] for name in state])
+    return _StepJoint(state=state, x=x, factors=factors, parents=parents, step=step)
+
+
+def evaluate_stationary_policy(
+    diagram: StationaryDiagram, policies: dict[str, DecisionPolicy | RandomisedPolicy | None]
+) -> StationaryEvaluation:
+    """Objective values and occupation measure of `diagram` under `policies`.
+
+    A randomised atemporal policy is drawn once per patient, not at every step. Without
+    `diagram.initial_distribution`, every atemporal policy is then a state node's CPT, like a
+    status-quo atemporal node's. With it, the objectives and the occupation are the
+    probability-weighted mix of those of the deterministic draws. A renewal draws the next state,
+    atemporal nodes included, from the initial distribution, so a new patient gets a fresh draw.
+
+    Args:
+        diagram: the stationary diagram.
+        policies: decision symbol -> deterministic or randomised policy, keyed as
+            `read_policy_from_solution` produces them. `None` or a missing key uses the node's
+            status-quo CPT from `diagram.network`.
+
+    Raises:
+        ValueError: a policy doesn't match its decision, status-quo decisions need state nodes
+            outside `diagram.initial_distribution`'s, or there are too many draws to mix.
+        NotImplementedError: a randomised atemporal policy with both `diagram.initial_distribution`
+            and `diagram.renewal`.
+    """
+    factors, decided, drawn = _policy_factors(diagram, policies)
+    if drawn and diagram.initial_distribution is not None:
+        return _mix_atemporal_draws(diagram, policies, drawn)
+    state, x, factors, parents, step = _step_joint(diagram, factors, decided)
 
     values = {}
     for objective in diagram.objectives:
@@ -750,11 +788,94 @@ def evaluate_stationary_policy(
         utility = (objective.parents, np.array(objective.utility.values, dtype=float))
         values[objective.symbol] = float(_contract([(state, x), *objective_factors, utility], []))
 
-    occupation = _contract([(state, x)], structure.state_nodes)
+    state_nodes = diagram.structure.state_nodes
+    occupation = _contract([(state, x)], state_nodes)
     return StationaryEvaluation(
         objectives=values,
-        occupation=Potential(variables=structure.state_nodes, shape=list(occupation.shape), values=occupation.tolist()),
+        occupation=Potential(variables=state_nodes, shape=list(occupation.shape), values=occupation.tolist()),
     )
+
+
+class StationaryPosteriors(BaseModel):
+    """Distributions under the normalised discounted occupation of steps, conditioned on evidence."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    posteriors: dict[str, list[float]]
+    """Node -> P(node | evidence), for the internal state nodes and the step nodes, decisions included."""
+    utilities: dict[str, float]
+    """Objective symbol -> its per-step expected utility given the evidence."""
+    evidence_probability: float
+    """The occupation mass of the evidence."""
+
+
+def stationary_step_posteriors(
+    diagram: StationaryDiagram,
+    policies: dict[str, DecisionPolicy | RandomisedPolicy | None],
+    evidence: dict[str, int] | None = None,
+) -> StationaryPosteriors:
+    """Node posteriors and expected utilities of one step, drawn from the occupation measure of `policies`.
+
+    The joint is the occupation measure x over the internal state, times the step's CPTs with the
+    policies substituted. Evidence conditions it as hard evidence on state indices, decisions
+    included: it selects the steps where it holds and doesn't change the policy. The posteriors
+    cover the internal state nodes (the diagram's state nodes plus the atemporal nodes and
+    status-quo decisions the policies need) and the step nodes: slice t, renewal nodes included,
+    and the decided atemporal nodes.
+
+    Args:
+        diagram: the stationary diagram.
+        policies: as in `evaluate_stationary_policy`.
+        evidence: node -> its observed state index.
+
+    Raises:
+        ValueError: a policy doesn't match its decision, an evidence node isn't in the joint, an
+            evidence state isn't an integer or is out of range, or the evidence has probability 0.
+        NotImplementedError: a randomised atemporal policy with `diagram.initial_distribution`.
+    """
+    factors, decided, drawn = _policy_factors(diagram, policies)
+    if drawn and diagram.initial_distribution is not None:
+        msg = (
+            f"Posteriors for randomised atemporal policies {sorted(drawn)} with initial_distribution set aren't "
+            "supported: the evaluation mixes their deterministic draws."
+        )
+        raise NotImplementedError(msg)
+    state, x, factors, parents, step = _step_joint(diagram, factors, decided)
+
+    cardinality = {variable.name: len(variable.labels) for variable in diagram.network.variables}
+    nodes = [*state, *(variable.name for variable in diagram.network.variables if variable.name in step)]
+    evidence = evidence or {}
+    unknown = sorted(set(evidence) - set(nodes))
+    if unknown:
+        msg = f"Evidence nodes {unknown} aren't in the step joint, whose nodes are {nodes}."
+        raise ValueError(msg)
+    for name, index in evidence.items():
+        if isinstance(index, bool) or not isinstance(index, int | np.integer) or not 0 <= index < cardinality[name]:
+            msg = f"Evidence state {index!r} for '{name}' isn't an integer in range({cardinality[name]})."
+            raise ValueError(msg)
+    indicators = [([name], np.eye(cardinality[name])[index]) for name, index in evidence.items()]
+
+    def joint(targets: Sequence[str]) -> list[Factor]:
+        """The factors of the joint over `targets` and the evidence; the step's other nodes sum out to 1."""
+        names = sorted(_ancestors([*targets, *evidence], parents, step))
+        return [(state, x), *(factors[name] for name in names), *indicators]
+
+    probability = float(_contract(joint([]), []))
+    if probability <= _ZERO_EVIDENCE:
+        msg = f"Evidence {evidence} has probability 0 under the occupation measure."
+        raise ValueError(msg)
+
+    posteriors = {name: (_contract(joint([name]), [name]) / probability).tolist() for name in nodes}
+    utilities = {
+        objective.symbol: float(
+            _contract(
+                [*joint(objective.parents), (objective.parents, np.array(objective.utility.values, dtype=float))], []
+            )
+            / probability
+        )
+        for objective in diagram.objectives
+    }
+    return StationaryPosteriors(posteriors=posteriors, utilities=utilities, evidence_probability=probability)
 
 
 class StationaryIndexMap(BaseModel):

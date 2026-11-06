@@ -31,12 +31,14 @@ from .dynamic import (
     StationaryDiagram,
     StationaryEvaluation,
     StationaryIndexMap,
+    StationaryPosteriors,
     TwoSliceStructure,
     classify_2tbn,
     compile_stationary_diagram,
     evaluate_stationary_policy,
     initial_state_distribution,
     promote_to_decisions,
+    stationary_step_posteriors,
 )
 from .network import DiscreteNetwork, DiscreteVariable, DiscreteVariableKind, Potential
 from .rooted_junction_tree import (
@@ -66,6 +68,7 @@ from .stationary_lp import (
     flatten_stationary_step,
     full_observation_information_set,
     read_randomised_policy,
+    stationary_payoff_table,
     stationary_value_iteration,
 )
 
@@ -99,6 +102,7 @@ __all__ = [
     "StationaryIndexMap",
     "StationaryLPBranch",
     "StationaryLPIndexMap",
+    "StationaryPosteriors",
     "TwoSliceStructure",
     "build_outcome_distributions",
     "build_rooted_junction_tree",
@@ -118,6 +122,8 @@ __all__ = [
     "promote_to_decisions",
     "read_policy_from_solution",
     "read_randomised_policy",
+    "stationary_payoff_table",
+    "stationary_step_posteriors",
     "stationary_value_iteration",
     "validate_assumptions",
 ]

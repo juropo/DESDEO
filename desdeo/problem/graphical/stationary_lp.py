@@ -45,6 +45,7 @@ from .dynamic import (
     _contract,
     _network_factors,
     _renewal_factors,
+    evaluate_stationary_policy,
     initial_state_distribution,
 )
 from .schema import DecisionNode
@@ -570,6 +571,32 @@ def stationary_value_iteration(
             symbol=atemporal.symbol, information_set=[], states=atemporal.states, probabilities={0: point_mass.tolist()}
         )
     return float(sign * best_value), policies
+
+
+def stationary_payoff_table(diagram: StationaryDiagram) -> tuple[dict[str, float], dict[str, float]]:
+    """The ideal and nadir from the payoff table of the full-observation optima.
+
+    Each objective's `stationary_value_iteration` policies are evaluated on every objective with
+    `evaluate_stationary_policy`, giving one row per objective.
+
+    Returns:
+        tuple[dict[str, float], dict[str, float]]: objective symbol -> its value in its own row
+            (ideal), and its worst value over the rows (nadir), respecting `maximize`.
+
+    Raises:
+        ValueError: `flatten_stationary_step` rejects the diagram.
+    """
+    flat = flatten_stationary_step(diagram)
+    rows = {
+        symbol: evaluate_stationary_policy(diagram, stationary_value_iteration(flat, symbol)[1]).objectives
+        for symbol in flat.maximize
+    }
+    ideal = {symbol: row[symbol] for symbol, row in rows.items()}
+    nadir = {
+        symbol: (min if maximize else max)(row[symbol] for row in rows.values())
+        for symbol, maximize in flat.maximize.items()
+    }
+    return ideal, nadir
 
 
 _PREFIX = "slp_"
