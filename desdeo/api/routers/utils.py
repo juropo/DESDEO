@@ -3,11 +3,16 @@
 NOTE: No routers should be defined in this file!
 """
 
+import hashlib
+import json
+import threading
+from collections import OrderedDict
 from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Annotated, Any
 
+import sqlalchemy
 from fastapi import Depends, HTTPException, status
 from numpy import allclose
 from sqlmodel import Session, func, select
@@ -24,6 +29,7 @@ from desdeo.api.models import (
     SavedSolutionReference,
     ScenarioModelDB,
     SolutionReference,
+    SparseTensorConstantDB,
     StateDB,
     User,
     UserRole,
@@ -39,6 +45,7 @@ from desdeo.api.models.problem import (
     SiteSelectionMetaData,
     SolutionDescriptionMetaData,
     SolverSelectionMetadata,
+    StationaryModelMetaData,
 )
 from desdeo.api.models.session import CreateSessionRequest
 from desdeo.api.routers.user_authentication import get_current_user
@@ -93,6 +100,78 @@ def get_solver_results_at(actual_state, index: int) -> SolverResults:
         )
     results = actual_state.solver_results
     return results[index] if isinstance(results, list) else results
+
+
+_PROBLEM_CACHE_SIZE = 3
+# Digest -> (problem id, loaded problem).
+_problem_cache: OrderedDict[str, tuple[int, Problem]] = OrderedDict()
+_problem_cache_lock = threading.Lock()
+
+
+@sqlalchemy.event.listens_for(ProblemDB, "after_delete")
+def _evict_deleted_problem(mapper, connection, target: ProblemDB) -> None:
+    """Drop a deleted problem's cache entries, since SQLite may reuse its ids for a different problem."""
+    with _problem_cache_lock:
+        for key in [key for key, (problem_id, _) in _problem_cache.items() if problem_id == target.id]:
+            del _problem_cache[key]
+
+
+def _problem_cache_key(problem_db: ProblemDB, sparse_constants: list) -> str:
+    """A digest of the columns of `problem_db`'s rows, with only the ids, symbols and shapes of its sparse constants.
+
+    Objective ideals and nadirs are updated in place, so the key covers the row contents rather than just the id.
+    """
+    rows = [
+        problem_db,
+        *problem_db.constants,
+        *problem_db.tensor_constants,
+        *problem_db.variables,
+        *problem_db.tensor_variables,
+        *problem_db.objectives,
+        *problem_db.constraints,
+        *problem_db.scalarization_funcs,
+        *problem_db.extra_funcs,
+        *problem_db.simulators,
+        *([problem_db.discrete_representation] if problem_db.discrete_representation is not None else []),
+    ]
+    digest = hashlib.sha256()
+    for row in rows:
+        # `getattr` loads expired attributes.
+        columns = {attr.key: getattr(row, attr.key) for attr in sqlalchemy.inspect(row).mapper.column_attrs}
+        digest.update(json.dumps(columns, sort_keys=True, default=str).encode())
+    digest.update(json.dumps(sparse_constants).encode())
+    return digest.hexdigest()
+
+
+def load_problem(problem_db: ProblemDB) -> Problem:
+    """`Problem.from_problemdb`, cached in-process for problems with sparse tensor constants.
+
+    Those problems can take seconds to load, so the last `_PROBLEM_CACHE_SIZE` of them are kept.
+    """
+    session = Session.object_session(problem_db)
+    sparse_constants = (
+        session.exec(
+            select(SparseTensorConstantDB.id, SparseTensorConstantDB.symbol, SparseTensorConstantDB.shape)
+            .where(SparseTensorConstantDB.problem_id == problem_db.id)
+            .order_by(SparseTensorConstantDB.id)
+        ).all()
+        if session is not None
+        else []
+    )
+    if not sparse_constants:
+        return Problem.from_problemdb(problem_db)
+
+    key = _problem_cache_key(problem_db, [list(row) for row in sparse_constants])
+    with _problem_cache_lock:
+        if key in _problem_cache:
+            _problem_cache.move_to_end(key)
+            return _problem_cache[key][1]
+    problem = Problem.from_problemdb(problem_db)
+    with _problem_cache_lock:
+        _problem_cache[key] = (problem_db.id, problem)
+        while len(_problem_cache) > _PROBLEM_CACHE_SIZE:
+            _problem_cache.popitem(last=False)
+    return problem
 
 
 def copy_problem_metadata(source_problem_db: ProblemDB, target_problem_db: ProblemDB, db_session: Session) -> None:
@@ -176,6 +255,14 @@ def copy_problem_metadata(source_problem_db: ProblemDB, target_problem_db: Probl
                 assumptions_json=item.assumptions_json,
             )
         )
+    for item in source_meta.stationary_model_metadata or []:
+        db_session.add(
+            StationaryModelMetaData(
+                metadata_id=new_meta.id,
+                diagram_json=item.diagram_json,
+                index_map_json=item.index_map_json,
+            )
+        )
 
 
 def find_graphical_metadata(problem_id: int, db_session: Session) -> GraphicalModelMetaData | None:
@@ -188,6 +275,16 @@ def find_graphical_metadata(problem_id: int, db_session: Session) -> GraphicalMo
         .join(ProblemMetaDataDB, GraphicalModelMetaData.metadata_id == ProblemMetaDataDB.id)
         .where(ProblemMetaDataDB.problem_id == problem_id)
         .order_by(GraphicalModelMetaData.id.desc())
+    ).first()
+
+
+def find_stationary_metadata(problem_id: int, db_session: Session) -> StationaryModelMetaData | None:
+    """The most recently added `StationaryModelMetaData` row for `problem_id`, if any."""
+    return db_session.exec(
+        select(StationaryModelMetaData)
+        .join(ProblemMetaDataDB, StationaryModelMetaData.metadata_id == ProblemMetaDataDB.id)
+        .where(ProblemMetaDataDB.problem_id == problem_id)
+        .order_by(StationaryModelMetaData.id.desc())
     ).first()
 
 

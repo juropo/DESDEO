@@ -399,6 +399,27 @@ class GraphicalModelMetaData(SQLModel, table=True):
     metadata_instance: "ProblemMetaDataDB" = Relationship(back_populates="graphical_model_metadata")
 
 
+class StationaryModelMetaData(SQLModel, table=True):
+    """Metadata for a `Problem` compiled from a stationary 2TBN diagram with `compile_stationary_lp`."""
+
+    id: int | None = Field(primary_key=True, default=None)
+    metadata_id: int | None = Field(foreign_key="problemmetadatadb.id", default=None)
+
+    metadata_type: str = "stationary_model_metadata"
+
+    diagram_json: str = Field(description="JSON-serialised `desdeo.problem.graphical.StationaryDiagram`")
+    index_map_json: str = Field(description="JSON-serialised `desdeo.problem.graphical.StationaryLPIndexMap`")
+
+    metadata_instance: "ProblemMetaDataDB" = Relationship(back_populates="stationary_model_metadata")
+
+
+class StationaryModelMetaDataPublic(SQLModel):
+    """Response model for `StationaryModelMetaData`, without the diagram and index map."""
+
+    id: int | None
+    metadata_type: str
+
+
 class DescriptionPart(BaseModel):
     """A single part of a solution description template.
 
@@ -457,6 +478,9 @@ class ProblemMetaDataDB(SQLModel, table=True):
     graphical_model_metadata: list[GraphicalModelMetaData] = Relationship(
         back_populates="metadata_instance", cascade_delete=True
     )
+    stationary_model_metadata: list[StationaryModelMetaData] = Relationship(
+        back_populates="metadata_instance", cascade_delete=True
+    )
     problem: ProblemDB = Relationship(back_populates="problem_metadata")
 
     @property
@@ -469,6 +493,7 @@ class ProblemMetaDataDB(SQLModel, table=True):
         | SiteSelectionMetaData
         | SolutionDescriptionMetaData
         | GraphicalModelMetaData
+        | StationaryModelMetaData
     ]:
         """Return all metadata in one list."""
         return (
@@ -478,6 +503,7 @@ class ProblemMetaDataDB(SQLModel, table=True):
             + (self.site_selection_metadata or [])
             + (self.solution_description_metadata or [])
             + (self.graphical_model_metadata or [])
+            + (self.stationary_model_metadata or [])
         )
 
 
@@ -491,6 +517,7 @@ class ProblemMetaDataPublic(SQLModel):
     site_selection_metadata: list[SiteSelectionMetaData] | None
     solution_description_metadata: list[SolutionDescriptionMetaData] | None
     graphical_model_metadata: list[GraphicalModelMetaData] | None
+    stationary_model_metadata: list[StationaryModelMetaDataPublic] | None
 
 
 class ProblemMetaDataGetRequest(SQLModel):

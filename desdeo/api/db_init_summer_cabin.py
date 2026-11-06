@@ -8,12 +8,15 @@ Includes everything from db_init.py and adds:
   (for testing scenario detection in CUMULUS)
 - an Oil Wildcatter problem compiled from an influence diagram
   (`desdeo.problem.graphical.demo.build_oil_wildcatter_demo`)
+- a ci-healthcare problem compiled from a stationary 2TBN into an occupation-measure LP
+  (`desdeo.problem.testproblems.ci_healthcare_problem.ci_healthcare_lp_diagram`)
 
 Run from desdeo/api/:
     python db_init_summer_cabin.py
 """
 # ruff: noqa: T201
 
+import time
 import warnings
 
 from sqlalchemy_utils import database_exists
@@ -30,10 +33,12 @@ from desdeo.api.models.problem import (
 )
 from desdeo.api.models.scenario import ScenarioModelDB
 from desdeo.api.routers.user_authentication import get_password_hash
+from desdeo.api.utils.stationary import add_stationary_lp_problem
 from desdeo.problem.graphical import build_rooted_junction_tree, compile_diagram
 from desdeo.problem.graphical.demo import build_oil_wildcatter_demo
 from desdeo.problem.schema import ExtraFunction, Objective
 from desdeo.problem.testproblems import dtlz2, river_pollution_problem, simple_knapsack
+from desdeo.problem.testproblems.ci_healthcare_problem import ci_healthcare_lp_diagram
 from desdeo.problem.testproblems.summer_cabin_electricity import (
     summer_cabin_battery_problem_split_scenario,
     summer_cabin_battery_robust_ev_problem,
@@ -309,6 +314,23 @@ if __name__ == "__main__":
             session.commit()
             session.refresh(graphical_db)
             print(f"Oil Wildcatter graphical model problem added (id={graphical_db.id}).")
+
+            print("Building ci-healthcare stationary LP (this may take a while)...")
+            start = time.perf_counter()
+            ci_db = add_stationary_lp_problem(
+                session,
+                user_analyst,
+                ci_healthcare_lp_diagram(),
+                name="ci-healthcare (stationary LP)",
+                description=(
+                    "A cross-impact healthcare 2TBN of how a patient's illnesses and care evolve, as an "
+                    "occupation-measure LP over randomised stationary policies. Decisions: acute care and "
+                    "the geriatric emergency team every step, and the own doctor once per patient; a patient "
+                    "who dies is replaced by a new one. Objectives are per-step averages."
+                ),
+                solver="gurobipy",
+            )
+            print(f"ci-healthcare stationary LP problem added (id={ci_db.id}) in {time.perf_counter() - start:.1f} s.")
 
         print("Done.")
 

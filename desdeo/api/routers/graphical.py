@@ -50,8 +50,8 @@ from desdeo.api.routers.utils import (
     fetch_problem_with_role_check,
     find_graphical_metadata,
     get_solver_results_at,
+    load_problem,
 )
-from desdeo.problem import Problem
 from desdeo.problem.graphical import (
     DecisionAnnotation,
     DecisionPolicy,
@@ -1721,7 +1721,7 @@ def solve_graphical_model(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Problem with id={problem_id} not found.")
     _fetch_graphical_metadata(problem_id, db_session)
 
-    problem = Problem.from_problemdb(problem_db)
+    problem = load_problem(problem_db)
     if request.objective_symbol not in {objective.symbol for objective in problem.objectives}:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

@@ -96,10 +96,12 @@ from .utils import (
     copy_problem_metadata,
     determine_unstated_constraint_properties,
     find_graphical_metadata,
+    find_stationary_metadata,
     get_solver_results_at,
     graphical_outcome_distributions,
     iter_states_of_kinds,
     leaves_properties_unstated,
+    load_problem,
 )
 
 logger = logging.getLogger(__name__)
@@ -193,7 +195,7 @@ def _resolve_uncertainty_source(
         # Rebuilt distributions have the stored ones' symbols, so none of the objectives can match.
         if meta is not None and (not stored or not stored.keys().isdisjoint(o.symbol for o in current.objectives)):
             try:
-                _, distributions = graphical_outcome_distributions(Problem.from_problemdb(current), meta)
+                _, distributions = graphical_outcome_distributions(load_problem(current), meta)
             except ValueError as e:
                 if strict and current is problem_db:
                     raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
@@ -312,7 +314,7 @@ def _build_combined_problem_and_initialize(
     user = context.user
     interactive_session = context.interactive_session
 
-    problem = Problem.from_problemdb(base_problem_db)
+    problem = load_problem(base_problem_db)
     mods = ProblemModification(uncertainty_measures=request.uncertainty_measures)
     graphical_meta = find_graphical_metadata(base_problem_db.id, db_session)
     try:
@@ -381,7 +383,7 @@ def _load_scenario_model(
     sm_db = db_session.get(ScenarioModelDB, scenario_model_id)
     if sm_db is None or sm_db.base_problem is None:
         return None
-    return sm_db.to_scenario_model(base_problem=Problem.from_problemdb(sm_db.base_problem))
+    return sm_db.to_scenario_model(base_problem=load_problem(sm_db.base_problem))
 
 
 def _get_objective_constraint_ids(
@@ -409,7 +411,7 @@ def solve_solutions(
     parent_state = context.parent_state
 
     solver = check_solver(problem_db=problem_db)
-    problem = Problem.from_problemdb(problem_db)
+    problem = load_problem(problem_db)
 
     try:
         scalarizations = [CumulusScalarization(s) for s in request.scalarizations]
@@ -534,7 +536,7 @@ def initialize(
     parent_state = context.parent_state
 
     solver = check_solver(problem_db=problem_db)
-    problem = Problem.from_problemdb(problem_db)
+    problem = load_problem(problem_db)
 
     # Tracked per field, so the fallback below never overwrites a value that is already set.
     missing_ideal = {symbol for symbol, value in problem.get_ideal_point().items() if value is None}
@@ -721,6 +723,20 @@ def save(
     return CumulusSaveResponse(state_id=state.id)
 
 
+def _final_solution_response(
+    solution_index: int, state_id: int, solver_results: SolverResults, problem_id: int, db_session: Session
+) -> SolutionReferenceResponse:
+    """The finalized solution, without variable values for problems with stationary metadata."""
+    # A stationary LP's variables are occupation vectors of hundreds of thousands of entries.
+    is_stationary = find_stationary_metadata(problem_id, db_session) is not None
+    return SolutionReferenceResponse(
+        solution_index=solution_index,
+        state_id=state_id,
+        objective_values=solver_results.optimal_objectives,
+        variable_values=None if is_stationary else solver_results.optimal_variables,
+    )
+
+
 @router.post("/get-or-initialize")
 def get_or_initialize(
     request: CumulusInitializationRequest,
@@ -787,11 +803,8 @@ def get_or_initialize(
             solution_index = latest_state.state.solution_result_index
             origin_state_id = latest_state.state.solution_origin_state_id
 
-            final_solution_ref_res = SolutionReferenceResponse(
-                solution_index=solution_index,
-                state_id=origin_state_id,
-                objective_values=latest_state.state.solver_results.optimal_objectives,
-                variable_values=latest_state.state.solver_results.optimal_variables,
+            final_solution_ref_res = _final_solution_response(
+                solution_index, origin_state_id, latest_state.state.solver_results, request.problem_id, db_session
             )
 
             return CumulusFinalizeResponse(
@@ -937,11 +950,8 @@ def finalize(
     db_session.commit()
     db_session.refresh(state)
 
-    solution_reference_response = SolutionReferenceResponse(
-        solution_index=solution_index,
-        state_id=solution_state_id,
-        objective_values=final_state.solver_results.optimal_objectives,
-        variable_values=final_state.solver_results.optimal_variables,
+    solution_reference_response = _final_solution_response(
+        solution_index, solution_state_id, final_state.solver_results, problem_db.id, db_session
     )
 
     return CumulusFinalizeResponse(
@@ -1000,7 +1010,7 @@ def solve_intermediate(
 
         var_and_obj_values_of_references.append((var_values, obj_values))
 
-    problem = Problem.from_problemdb(problem_db)
+    problem = load_problem(problem_db)
     solver = check_solver(problem_db=problem_db)
 
     solver_results: list[SolverResults] = rpm_intermediate_solutions(
@@ -1109,7 +1119,7 @@ def _fill_in_soft_constraint_properties(
     if not pending:
         return
 
-    problem = Problem.from_problemdb(problem_db)
+    problem = load_problem(problem_db)
     # `from_attributes` reads just the fields `Constraint` declares, leaving the columns that
     # only exist on the DB row (which `Constraint` forbids) behind.
     attached = [Constraint.model_validate(constraint_db, from_attributes=True) for constraint_db in pending]
@@ -1437,7 +1447,7 @@ def _run_modification_checks_background(
                 session.delete(problem_db)
                 session.commit()
 
-            problem = Problem.from_problemdb(problem_db)
+            problem = load_problem(problem_db)
             effective_solver = solver_class if solver_class is not None else guess_best_solver(problem)
 
             if probe_constraint_symbols and not feasibility_witnessed:
@@ -1502,7 +1512,7 @@ def modify_problem(
     interactive_session = context.interactive_session
     parent_state = context.parent_state
 
-    problem = Problem.from_problemdb(problem_db)
+    problem = load_problem(problem_db)
     graphical_meta = find_graphical_metadata(problem_db.id, db_session)
     modified_problem = apply_problem_modifications(problem, request.modifications, db_session, graphical_meta)
 
