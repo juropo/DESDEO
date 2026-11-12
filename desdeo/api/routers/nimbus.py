@@ -33,7 +33,7 @@ from desdeo.api.models.generic_states import StateKind
 from desdeo.api.models.nimbus import NIMBUSMultiplierRequest, NIMBUSMultiplierResponse
 from desdeo.api.models.state import IntermediateSolutionState
 from desdeo.api.routers.generic import solve_intermediate
-from desdeo.api.routers.problem import check_solver
+from desdeo.api.routers.problem import check_solver, effective_solver_options
 from desdeo.explanations.lagrange import (
     compute_tradeoffs,
     determine_active_objectives,
@@ -78,7 +78,7 @@ def solve_solutions(
         num_desired=request.num_desired,
         scalarization_options=request.scalarization_options,
         solver=solver,
-        solver_options=request.solver_options,
+        solver_options=effective_solver_options(problem_db, request.solver_options),
     )
 
     nimbus_state = NIMBUSClassificationState(
@@ -161,7 +161,7 @@ def initialize(
         reference_point=starting_point,
         scalarization_options=request.scalarization_options,
         solver=solver,
-        solver_options=request.solver_options,
+        solver_options=effective_solver_options(problem_db, request.solver_options),
     )
 
     initialization_state = NIMBUSInitializationState(

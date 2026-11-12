@@ -13,6 +13,8 @@ from desdeo.problem.schema import (
     ObjectiveTypeEnum,
     Problem,
     ScalarizationFunction,
+    TensorConstant,
+    TensorVariable,
     Variable,
     VariableTypeEnum,
 )
@@ -517,3 +519,64 @@ def test_cvxpy_solver_one_sided_variable_bounds(lowerbound, upperbound, maximize
     assert results.success
     assert np.isclose(results.optimal_variables["x"], expected, atol=1e-6)
     assert np.isclose(results.optimal_objectives["f_1"], expected, atol=1e-6)
+
+
+@pytest.mark.cvxpy
+def test_cvxpy_solver_vector_constraint_values_serialise():
+    """A vector-valued constraint's value is a list, a scalar one's a float, and the results serialise to JSON."""
+    problem = Problem(
+        name="Vector constraint",
+        description="x = A y with x, y on two coordinates each.",
+        constants=[TensorConstant(name="A", symbol="A", shape=[2, 2], values=[[1.0, 2.0], [0.0, 1.0]])],
+        variables=[
+            TensorVariable(
+                name=symbol,
+                symbol=symbol,
+                variable_type=VariableTypeEnum.real,
+                shape=[2],
+                lowerbounds=[0.0, 0.0],
+                upperbounds=[5.0, 5.0],
+            )
+            for symbol in ("x", "y")
+        ],
+        objectives=[
+            Objective(
+                name="f_1",
+                symbol="f_1",
+                func=["Sum", "x"],
+                maximize=True,
+                is_linear=True,
+                is_convex=True,
+                is_twice_differentiable=True,
+            )
+        ],
+        constraints=[
+            Constraint(
+                name="link",
+                symbol="link",
+                cons_type=ConstraintTypeEnum.EQ,
+                func=["Subtract", "x", ["MatMul", "A", "y"]],
+                is_linear=True,
+                is_convex=True,
+                is_twice_differentiable=True,
+            ),
+            Constraint(
+                name="budget",
+                symbol="budget",
+                cons_type=ConstraintTypeEnum.LTE,
+                func=["Subtract", ["Sum", "y"], 1],
+                is_linear=True,
+                is_convex=True,
+                is_twice_differentiable=True,
+            ),
+        ],
+    )
+
+    results = CVXPYSolver(problem, CVXPYSolverOptions(solver="HIGHS")).solve("f_1")
+
+    assert results.success
+    assert np.isclose(results.optimal_objectives["f_1"], 3.0, atol=1e-8)
+    assert isinstance(results.constraint_values["link"], list)
+    np.testing.assert_allclose(results.constraint_values["link"], [0.0, 0.0], atol=1e-8)
+    assert isinstance(results.constraint_values["budget"], float)
+    results.model_dump_json()

@@ -367,19 +367,26 @@ def test_cumulus_scenario_aug_weights_structure(robust_ev_problem, scenario_mode
     """_scenario_aug_weights zeros aggregation objectives and assigns |nadir-ideal| to per-scenario ones."""
     _, symbol_maps = build_combined_scenario_problem(scenario_model)
 
-    # Reference point over the EV (aggregation) objectives as a DM would use.
-    reference_point = {"E_f_1": 5.0, "E_f_2": 5.0, "E_f_3": 0.5}
+    # Reference point over the EV (aggregation) objectives as a DM would use. f_2 (investment
+    # cost) has no separate aggregation symbol -- it doesn't vary by scenario, so the DM
+    # references it directly, and it is simultaneously a per-scenario/shared objective below.
+    reference_point = {"E_f_1": 5.0, "f_2": 5.0, "E_f_3": 0.5}
 
     weights_aug = _scenario_aug_weights(robust_ev_problem, reference_point, symbol_maps)
 
-    # Aggregation objectives in reference_point must have weight 0.
-    for sym in reference_point:
-        assert weights_aug[sym] == pytest.approx(0.0), f"{sym} (aggregation) should have weight 0"
-
-    # Every per-scenario / shared objective must appear with its real |nadir - ideal|.
     per_scenario_syms = {
         combined_sym for leaf_map in symbol_maps.get("objectives", {}).values() for combined_sym in leaf_map.values()
     }
+
+    # Pure aggregation objectives in reference_point (not also per-scenario/shared) must have
+    # weight 0. f_2 is excluded here: its per-scenario weight below takes precedence, per
+    # _scenario_aug_weights' own docstring.
+    for sym in reference_point:
+        if sym in per_scenario_syms:
+            continue
+        assert weights_aug[sym] == pytest.approx(0.0), f"{sym} (aggregation) should have weight 0"
+
+    # Every per-scenario / shared objective must appear with its real |nadir - ideal|.
     obj_by_sym = {obj.symbol: obj for obj in robust_ev_problem.objectives}
     for sym in per_scenario_syms:
         obj = obj_by_sym.get(sym)

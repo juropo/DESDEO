@@ -26,7 +26,8 @@ export const GetDmUsersUsersDmsGetResponseItem = zod
 		username: zod.string(),
 		id: zod.number(),
 		role: zod.enum(['guest', 'dm', 'analyst', 'admin']).describe('Possible user roles.'),
-		group_ids: zod.union([zod.array(zod.number()), zod.null()])
+		group_ids: zod.union([zod.array(zod.number()), zod.null()]),
+		active_session_id: zod.union([zod.number(), zod.null()]).optional()
 	})
 	.describe('The object to handle public user information.');
 export const GetDmUsersUsersDmsGetResponse = zod.array(GetDmUsersUsersDmsGetResponseItem);
@@ -46,7 +47,8 @@ export const GetCurrentUserInfoUserInfoGetResponse = zod
 		username: zod.string(),
 		id: zod.number(),
 		role: zod.enum(['guest', 'dm', 'analyst', 'admin']).describe('Possible user roles.'),
-		group_ids: zod.union([zod.array(zod.number()), zod.null()])
+		group_ids: zod.union([zod.array(zod.number()), zod.null()]),
+		active_session_id: zod.union([zod.number(), zod.null()]).optional()
 	})
 	.describe('The object to handle public user information.');
 
@@ -156,6 +158,7 @@ export const getProblemsProblemAllGetResponseProblemMetadataOneSiteSelectionMeta
 export const getProblemsProblemAllGetResponseProblemMetadataOneSiteSelectionMetadataOneItemCoverageThresholdDefault = 15;
 export const getProblemsProblemAllGetResponseProblemMetadataOneSolutionDescriptionMetadataOneItemMetadataTypeDefault = `solution_description_metadata`;
 export const getProblemsProblemAllGetResponseProblemMetadataOneSolutionDescriptionMetadataOneItemSeparatorDefault = `\n`;
+export const getProblemsProblemAllGetResponseProblemMetadataOneGraphicalModelMetadataOneItemMetadataTypeDefault = `graphical_model_metadata`;
 
 export const GetProblemsProblemAllGetResponseItem = zod
 	.object({
@@ -308,6 +311,48 @@ export const GetProblemsProblemAllGetResponseItem = zod
 								.describe('Metadata for generating a human-readable description of a solution.')
 						),
 						zod.null()
+					]),
+					graphical_model_metadata: zod.union([
+						zod.array(
+							zod
+								.object({
+									id: zod.union([zod.number(), zod.null()]).optional(),
+									metadata_id: zod.union([zod.number(), zod.null()]).optional(),
+									metadata_type: zod
+										.string()
+										.default(
+											getProblemsProblemAllGetResponseProblemMetadataOneGraphicalModelMetadataOneItemMetadataTypeDefault
+										),
+									network_json: zod
+										.string()
+										.describe('JSON-serialised `desdeo.problem.graphical.DiscreteNetwork`'),
+									annotation_json: zod
+										.string()
+										.describe('JSON-serialised `desdeo.problem.graphical.DecisionAnnotation`'),
+									rjt_json: zod
+										.union([zod.string(), zod.null()])
+										.optional()
+										.describe(
+											'JSON-serialised `desdeo.problem.graphical.RootedJunctionTree`, once built'
+										),
+									index_map_json: zod
+										.union([zod.string(), zod.null()])
+										.optional()
+										.describe(
+											'JSON-serialised `IndexMap` (Phase 4), once the diagram has been compiled'
+										),
+									assumptions_json: zod
+										.union([zod.string(), zod.null()])
+										.optional()
+										.describe(
+											'JSON-serialised `desdeo.problem.graphical.DiagramAssumptions` of a hypothetical problem; `network_json` is then already conditioned on them'
+										)
+								})
+								.describe(
+									"Metadata for a graphical model (Bayesian network \/ influence diagram) compiled `Problem`.\n\nMirrors `SiteSelectionMetaData`'s JSON-blob-column pattern rather than `ScenarioModelDB`'s\nrelational one: see `.claude\/desdeo-graphical-models-plan.md`'s Phase 3 checklist item and\ndesign decisions table (\"Compiled-model metadata ... persists via the API's\n`ProblemMetaDataDB` side-table pattern, not a field on core `Problem`\"). Nothing in the\ncurrent API queries \*into\* a stored problem's substructure at the SQL level (unlike\n`ScenarioModelDB`, whose relational mapping exists specifically for its polymorphic pools\nand per-leaf scenario dispatch) -- a JSON blob per document is sufficient here, same as\n`SiteSelectionMetaData`'s `sites_json`\/`nodes_json`\/`travel_time_matrix_json`.\n\nEach JSON column round-trips one `problem\/graphical` pydantic model via `.model_dump_json()`\/\n`.model_validate_json()`: `network_json` <-> `DiscreteNetwork`, `annotation_json` <->\n`DecisionAnnotation`, `rjt_json` <-> `RootedJunctionTree` (Phase 3). `index_map_json` is\nPhase 4's `IndexMap`, returned alongside the compiled `Problem` by `compile_diagram` -- it\nstays `None` until a Phase 4\/7 compile step populates it, since nothing before that point has\nan `IndexMap` to store."
+								)
+						),
+						zod.null()
 					])
 				})
 				.describe('Response model for ProblemMetaData.'),
@@ -349,6 +394,7 @@ export const getProblemsInfoProblemAllInfoGetResponseProblemMetadataOneSiteSelec
 export const getProblemsInfoProblemAllInfoGetResponseProblemMetadataOneSiteSelectionMetadataOneItemCoverageThresholdDefault = 15;
 export const getProblemsInfoProblemAllInfoGetResponseProblemMetadataOneSolutionDescriptionMetadataOneItemMetadataTypeDefault = `solution_description_metadata`;
 export const getProblemsInfoProblemAllInfoGetResponseProblemMetadataOneSolutionDescriptionMetadataOneItemSeparatorDefault = `\n`;
+export const getProblemsInfoProblemAllInfoGetResponseProblemMetadataOneGraphicalModelMetadataOneItemMetadataTypeDefault = `graphical_model_metadata`;
 
 export const GetProblemsInfoProblemAllInfoGetResponseItem = zod
 	.object({
@@ -984,6 +1030,48 @@ export const GetProblemsInfoProblemAllInfoGetResponseItem = zod
 								.describe('Metadata for generating a human-readable description of a solution.')
 						),
 						zod.null()
+					]),
+					graphical_model_metadata: zod.union([
+						zod.array(
+							zod
+								.object({
+									id: zod.union([zod.number(), zod.null()]).optional(),
+									metadata_id: zod.union([zod.number(), zod.null()]).optional(),
+									metadata_type: zod
+										.string()
+										.default(
+											getProblemsInfoProblemAllInfoGetResponseProblemMetadataOneGraphicalModelMetadataOneItemMetadataTypeDefault
+										),
+									network_json: zod
+										.string()
+										.describe('JSON-serialised `desdeo.problem.graphical.DiscreteNetwork`'),
+									annotation_json: zod
+										.string()
+										.describe('JSON-serialised `desdeo.problem.graphical.DecisionAnnotation`'),
+									rjt_json: zod
+										.union([zod.string(), zod.null()])
+										.optional()
+										.describe(
+											'JSON-serialised `desdeo.problem.graphical.RootedJunctionTree`, once built'
+										),
+									index_map_json: zod
+										.union([zod.string(), zod.null()])
+										.optional()
+										.describe(
+											'JSON-serialised `IndexMap` (Phase 4), once the diagram has been compiled'
+										),
+									assumptions_json: zod
+										.union([zod.string(), zod.null()])
+										.optional()
+										.describe(
+											'JSON-serialised `desdeo.problem.graphical.DiagramAssumptions` of a hypothetical problem; `network_json` is then already conditioned on them'
+										)
+								})
+								.describe(
+									"Metadata for a graphical model (Bayesian network \/ influence diagram) compiled `Problem`.\n\nMirrors `SiteSelectionMetaData`'s JSON-blob-column pattern rather than `ScenarioModelDB`'s\nrelational one: see `.claude\/desdeo-graphical-models-plan.md`'s Phase 3 checklist item and\ndesign decisions table (\"Compiled-model metadata ... persists via the API's\n`ProblemMetaDataDB` side-table pattern, not a field on core `Problem`\"). Nothing in the\ncurrent API queries \*into\* a stored problem's substructure at the SQL level (unlike\n`ScenarioModelDB`, whose relational mapping exists specifically for its polymorphic pools\nand per-leaf scenario dispatch) -- a JSON blob per document is sufficient here, same as\n`SiteSelectionMetaData`'s `sites_json`\/`nodes_json`\/`travel_time_matrix_json`.\n\nEach JSON column round-trips one `problem\/graphical` pydantic model via `.model_dump_json()`\/\n`.model_validate_json()`: `network_json` <-> `DiscreteNetwork`, `annotation_json` <->\n`DecisionAnnotation`, `rjt_json` <-> `RootedJunctionTree` (Phase 3). `index_map_json` is\nPhase 4's `IndexMap`, returned alongside the compiled `Problem` by `compile_diagram` -- it\nstays `None` until a Phase 4\/7 compile step populates it, since nothing before that point has\nan `IndexMap` to store."
+								)
+						),
+						zod.null()
 					])
 				})
 				.describe('Response model for ProblemMetaData.'),
@@ -1038,6 +1126,7 @@ export const getProblemProblemProblemIdGetResponseProblemMetadataOneSiteSelectio
 export const getProblemProblemProblemIdGetResponseProblemMetadataOneSiteSelectionMetadataOneItemCoverageThresholdDefault = 15;
 export const getProblemProblemProblemIdGetResponseProblemMetadataOneSolutionDescriptionMetadataOneItemMetadataTypeDefault = `solution_description_metadata`;
 export const getProblemProblemProblemIdGetResponseProblemMetadataOneSolutionDescriptionMetadataOneItemSeparatorDefault = `\n`;
+export const getProblemProblemProblemIdGetResponseProblemMetadataOneGraphicalModelMetadataOneItemMetadataTypeDefault = `graphical_model_metadata`;
 
 export const GetProblemProblemProblemIdGetResponse = zod
 	.object({
@@ -1673,6 +1762,48 @@ export const GetProblemProblemProblemIdGetResponse = zod
 								.describe('Metadata for generating a human-readable description of a solution.')
 						),
 						zod.null()
+					]),
+					graphical_model_metadata: zod.union([
+						zod.array(
+							zod
+								.object({
+									id: zod.union([zod.number(), zod.null()]).optional(),
+									metadata_id: zod.union([zod.number(), zod.null()]).optional(),
+									metadata_type: zod
+										.string()
+										.default(
+											getProblemProblemProblemIdGetResponseProblemMetadataOneGraphicalModelMetadataOneItemMetadataTypeDefault
+										),
+									network_json: zod
+										.string()
+										.describe('JSON-serialised `desdeo.problem.graphical.DiscreteNetwork`'),
+									annotation_json: zod
+										.string()
+										.describe('JSON-serialised `desdeo.problem.graphical.DecisionAnnotation`'),
+									rjt_json: zod
+										.union([zod.string(), zod.null()])
+										.optional()
+										.describe(
+											'JSON-serialised `desdeo.problem.graphical.RootedJunctionTree`, once built'
+										),
+									index_map_json: zod
+										.union([zod.string(), zod.null()])
+										.optional()
+										.describe(
+											'JSON-serialised `IndexMap` (Phase 4), once the diagram has been compiled'
+										),
+									assumptions_json: zod
+										.union([zod.string(), zod.null()])
+										.optional()
+										.describe(
+											'JSON-serialised `desdeo.problem.graphical.DiagramAssumptions` of a hypothetical problem; `network_json` is then already conditioned on them'
+										)
+								})
+								.describe(
+									"Metadata for a graphical model (Bayesian network \/ influence diagram) compiled `Problem`.\n\nMirrors `SiteSelectionMetaData`'s JSON-blob-column pattern rather than `ScenarioModelDB`'s\nrelational one: see `.claude\/desdeo-graphical-models-plan.md`'s Phase 3 checklist item and\ndesign decisions table (\"Compiled-model metadata ... persists via the API's\n`ProblemMetaDataDB` side-table pattern, not a field on core `Problem`\"). Nothing in the\ncurrent API queries \*into\* a stored problem's substructure at the SQL level (unlike\n`ScenarioModelDB`, whose relational mapping exists specifically for its polymorphic pools\nand per-leaf scenario dispatch) -- a JSON blob per document is sufficient here, same as\n`SiteSelectionMetaData`'s `sites_json`\/`nodes_json`\/`travel_time_matrix_json`.\n\nEach JSON column round-trips one `problem\/graphical` pydantic model via `.model_dump_json()`\/\n`.model_validate_json()`: `network_json` <-> `DiscreteNetwork`, `annotation_json` <->\n`DecisionAnnotation`, `rjt_json` <-> `RootedJunctionTree` (Phase 3). `index_map_json` is\nPhase 4's `IndexMap`, returned alongside the compiled `Problem` by `compile_diagram` -- it\nstays `None` until a Phase 4\/7 compile step populates it, since nothing before that point has\nan `IndexMap` to store."
+								)
+						),
+						zod.null()
 					])
 				})
 				.describe('Response model for ProblemMetaData.'),
@@ -1839,6 +1970,7 @@ export const addProblemProblemAddPostResponseProblemMetadataOneSiteSelectionMeta
 export const addProblemProblemAddPostResponseProblemMetadataOneSiteSelectionMetadataOneItemCoverageThresholdDefault = 15;
 export const addProblemProblemAddPostResponseProblemMetadataOneSolutionDescriptionMetadataOneItemMetadataTypeDefault = `solution_description_metadata`;
 export const addProblemProblemAddPostResponseProblemMetadataOneSolutionDescriptionMetadataOneItemSeparatorDefault = `\n`;
+export const addProblemProblemAddPostResponseProblemMetadataOneGraphicalModelMetadataOneItemMetadataTypeDefault = `graphical_model_metadata`;
 
 export const AddProblemProblemAddPostResponse = zod
 	.object({
@@ -2466,6 +2598,48 @@ export const AddProblemProblemAddPostResponse = zod
 								.describe('Metadata for generating a human-readable description of a solution.')
 						),
 						zod.null()
+					]),
+					graphical_model_metadata: zod.union([
+						zod.array(
+							zod
+								.object({
+									id: zod.union([zod.number(), zod.null()]).optional(),
+									metadata_id: zod.union([zod.number(), zod.null()]).optional(),
+									metadata_type: zod
+										.string()
+										.default(
+											addProblemProblemAddPostResponseProblemMetadataOneGraphicalModelMetadataOneItemMetadataTypeDefault
+										),
+									network_json: zod
+										.string()
+										.describe('JSON-serialised `desdeo.problem.graphical.DiscreteNetwork`'),
+									annotation_json: zod
+										.string()
+										.describe('JSON-serialised `desdeo.problem.graphical.DecisionAnnotation`'),
+									rjt_json: zod
+										.union([zod.string(), zod.null()])
+										.optional()
+										.describe(
+											'JSON-serialised `desdeo.problem.graphical.RootedJunctionTree`, once built'
+										),
+									index_map_json: zod
+										.union([zod.string(), zod.null()])
+										.optional()
+										.describe(
+											'JSON-serialised `IndexMap` (Phase 4), once the diagram has been compiled'
+										),
+									assumptions_json: zod
+										.union([zod.string(), zod.null()])
+										.optional()
+										.describe(
+											'JSON-serialised `desdeo.problem.graphical.DiagramAssumptions` of a hypothetical problem; `network_json` is then already conditioned on them'
+										)
+								})
+								.describe(
+									"Metadata for a graphical model (Bayesian network \/ influence diagram) compiled `Problem`.\n\nMirrors `SiteSelectionMetaData`'s JSON-blob-column pattern rather than `ScenarioModelDB`'s\nrelational one: see `.claude\/desdeo-graphical-models-plan.md`'s Phase 3 checklist item and\ndesign decisions table (\"Compiled-model metadata ... persists via the API's\n`ProblemMetaDataDB` side-table pattern, not a field on core `Problem`\"). Nothing in the\ncurrent API queries \*into\* a stored problem's substructure at the SQL level (unlike\n`ScenarioModelDB`, whose relational mapping exists specifically for its polymorphic pools\nand per-leaf scenario dispatch) -- a JSON blob per document is sufficient here, same as\n`SiteSelectionMetaData`'s `sites_json`\/`nodes_json`\/`travel_time_matrix_json`.\n\nEach JSON column round-trips one `problem\/graphical` pydantic model via `.model_dump_json()`\/\n`.model_validate_json()`: `network_json` <-> `DiscreteNetwork`, `annotation_json` <->\n`DecisionAnnotation`, `rjt_json` <-> `RootedJunctionTree` (Phase 3). `index_map_json` is\nPhase 4's `IndexMap`, returned alongside the compiled `Problem` by `compile_diagram` -- it\nstays `None` until a Phase 4\/7 compile step populates it, since nothing before that point has\nan `IndexMap` to store."
+								)
+						),
+						zod.null()
 					])
 				})
 				.describe('Response model for ProblemMetaData.'),
@@ -2620,6 +2794,7 @@ export const addProblemJsonProblemAddJsonPostResponseProblemMetadataOneSiteSelec
 export const addProblemJsonProblemAddJsonPostResponseProblemMetadataOneSiteSelectionMetadataOneItemCoverageThresholdDefault = 15;
 export const addProblemJsonProblemAddJsonPostResponseProblemMetadataOneSolutionDescriptionMetadataOneItemMetadataTypeDefault = `solution_description_metadata`;
 export const addProblemJsonProblemAddJsonPostResponseProblemMetadataOneSolutionDescriptionMetadataOneItemSeparatorDefault = `\n`;
+export const addProblemJsonProblemAddJsonPostResponseProblemMetadataOneGraphicalModelMetadataOneItemMetadataTypeDefault = `graphical_model_metadata`;
 
 export const AddProblemJsonProblemAddJsonPostResponse = zod
 	.object({
@@ -3255,6 +3430,48 @@ export const AddProblemJsonProblemAddJsonPostResponse = zod
 								.describe('Metadata for generating a human-readable description of a solution.')
 						),
 						zod.null()
+					]),
+					graphical_model_metadata: zod.union([
+						zod.array(
+							zod
+								.object({
+									id: zod.union([zod.number(), zod.null()]).optional(),
+									metadata_id: zod.union([zod.number(), zod.null()]).optional(),
+									metadata_type: zod
+										.string()
+										.default(
+											addProblemJsonProblemAddJsonPostResponseProblemMetadataOneGraphicalModelMetadataOneItemMetadataTypeDefault
+										),
+									network_json: zod
+										.string()
+										.describe('JSON-serialised `desdeo.problem.graphical.DiscreteNetwork`'),
+									annotation_json: zod
+										.string()
+										.describe('JSON-serialised `desdeo.problem.graphical.DecisionAnnotation`'),
+									rjt_json: zod
+										.union([zod.string(), zod.null()])
+										.optional()
+										.describe(
+											'JSON-serialised `desdeo.problem.graphical.RootedJunctionTree`, once built'
+										),
+									index_map_json: zod
+										.union([zod.string(), zod.null()])
+										.optional()
+										.describe(
+											'JSON-serialised `IndexMap` (Phase 4), once the diagram has been compiled'
+										),
+									assumptions_json: zod
+										.union([zod.string(), zod.null()])
+										.optional()
+										.describe(
+											'JSON-serialised `desdeo.problem.graphical.DiagramAssumptions` of a hypothetical problem; `network_json` is then already conditioned on them'
+										)
+								})
+								.describe(
+									"Metadata for a graphical model (Bayesian network \/ influence diagram) compiled `Problem`.\n\nMirrors `SiteSelectionMetaData`'s JSON-blob-column pattern rather than `ScenarioModelDB`'s\nrelational one: see `.claude\/desdeo-graphical-models-plan.md`'s Phase 3 checklist item and\ndesign decisions table (\"Compiled-model metadata ... persists via the API's\n`ProblemMetaDataDB` side-table pattern, not a field on core `Problem`\"). Nothing in the\ncurrent API queries \*into\* a stored problem's substructure at the SQL level (unlike\n`ScenarioModelDB`, whose relational mapping exists specifically for its polymorphic pools\nand per-leaf scenario dispatch) -- a JSON blob per document is sufficient here, same as\n`SiteSelectionMetaData`'s `sites_json`\/`nodes_json`\/`travel_time_matrix_json`.\n\nEach JSON column round-trips one `problem\/graphical` pydantic model via `.model_dump_json()`\/\n`.model_validate_json()`: `network_json` <-> `DiscreteNetwork`, `annotation_json` <->\n`DecisionAnnotation`, `rjt_json` <-> `RootedJunctionTree` (Phase 3). `index_map_json` is\nPhase 4's `IndexMap`, returned alongside the compiled `Problem` by `compile_diagram` -- it\nstays `None` until a Phase 4\/7 compile step populates it, since nothing before that point has\nan `IndexMap` to store."
+								)
+						),
+						zod.null()
 					])
 				})
 				.describe('Response model for ProblemMetaData.'),
@@ -3598,6 +3815,33 @@ export const CreateNewSessionSessionNewPostResponse = zod
 		info: zod.union([zod.string(), zod.null()])
 	})
 	.describe('The base model for representing interactive sessions.');
+
+/**
+ * Make one of the user's own sessions the active one, or clear it with `session_id=None`.
+ *
+ * Methods resume and record their states in the active session. Analysts and admins can see
+ * other users' sessions but not activate them, so their own work never lands in someone else's.
+ * @summary Activate Session
+ */
+export const ActivateSessionSessionActivatePostBody = zod
+	.object({
+		session_id: zod
+			.union([zod.number(), zod.null()])
+			.optional()
+			.describe("One of the user's own sessions, or None for none.")
+	})
+	.describe("Model of the request to change the user's active session.");
+
+export const ActivateSessionSessionActivatePostResponse = zod.union([
+	zod
+		.object({
+			id: zod.union([zod.number(), zod.null()]),
+			user_id: zod.union([zod.number(), zod.null()]),
+			info: zod.union([zod.string(), zod.null()])
+		})
+		.describe('The base model for representing interactive sessions.'),
+	zod.null()
+]);
 
 /**
  * Return an interactive session. Analysts and admins may access any session.
@@ -6507,6 +6751,8 @@ export const InitializeMethodCumulusInitializePostQueryParams = zod.object({
 });
 
 export const initializeMethodCumulusInitializePostBodyStartingPointOnePreferenceTypeDefault = `reference_point`;
+export const initializeMethodCumulusInitializePostBodyUncertaintyMeasuresOneItemAlphaOneExclusiveMin = 0;
+export const initializeMethodCumulusInitializePostBodyUncertaintyMeasuresOneItemAlphaOneExclusiveMax = 1;
 
 export const InitializeMethodCumulusInitializePostBody = zod
 	.object({
@@ -6572,28 +6818,44 @@ export const InitializeMethodCumulusInitializePostBody = zod
 								])
 								.describe('Which uncertainty aggregate to apply.'),
 							scenario_model_id: zod
-								.number()
-								.describe('DB id of the ScenarioModelDB that defines the scenario structure.'),
+								.union([zod.number(), zod.null()])
+								.optional()
+								.describe(
+									"DB id of the ScenarioModelDB that defines the scenario structure, or None to aggregate over the problem's graphical model."
+								),
 							symbols: zod
 								.array(zod.string())
+								.min(1)
 								.describe('Symbols of objectives or functions to aggregate.'),
 							prefix: zod
 								.union([zod.string(), zod.null()])
 								.optional()
 								.describe('Prefix for the new aggregate symbols. Defaults vary by measure_type.'),
 							alpha: zod
-								.union([zod.number(), zod.null()])
+								.union([
+									zod
+										.number()
+										.gt(
+											initializeMethodCumulusInitializePostBodyUncertaintyMeasuresOneItemAlphaOneExclusiveMin
+										)
+										.lt(
+											initializeMethodCumulusInitializePostBodyUncertaintyMeasuresOneItemAlphaOneExclusiveMax
+										),
+									zod.null()
+								])
 								.optional()
 								.describe(
-									'Confidence level for CVaR, e.g. 0.95. Required for conditional_value_at_risk.'
+									"Probability mass of the averaged tail of worst outcomes in the element's own direction, e.g. 0.05 for the worst 5 % (often called CVaR 95 %). Required for conditional_value_at_risk."
 								),
 							leaf_weights: zod
 								.union([zod.record(zod.string(), zod.number()), zod.null()])
 								.optional()
-								.describe('Leaf-name → weight mapping. Required for weighted_scenarios.')
+								.describe(
+									'Leaf-name → weight mapping. Required for weighted_scenarios; not available for a graphical model.'
+								)
 						})
 						.describe(
-							'Specification for adding a scenario-based uncertainty aggregate to the problem.\n\nAll measures in a single request must reference the same ``scenario_model_id``.\nThe resulting combined (multi-scenario) problem replaces the current problem.'
+							"Specification for adding an uncertainty aggregate to the problem.\n\nThe aggregate is taken over either a scenario model (``scenario_model_id`` set) or, when\n``scenario_model_id`` is None, the outcome distributions of the problem's graphical model.\nAll measures in a single request must reference the same source. With a scenario model, the\nresulting combined (multi-scenario) problem replaces the current problem. With a graphical\nmodel, the aggregates replace the problem's objectives."
 						)
 				),
 				zod.null()
@@ -6710,10 +6972,11 @@ export const SaveMethodCumulusSavePostResponse = zod
 /**
  * Get the latest CUMULUS state if it exists, or initialize a new one if it doesn't.
  *
- * If the problem has associated scenarios and no uncertainty measures have been specified, a
+ * If the problem has associated scenarios (a scenario model, or a graphical model whose
+ * objectives are not yet aggregated) and no uncertainty measures have been specified, a
  * ``CumulusScenarioSetupResponse`` is returned so the frontend can ask the decision maker which
  * aggregates to include.  When the frontend re-calls with ``uncertainty_measures`` populated, a
- * combined multi-scenario problem is built, saved to the database, and used for initialization.
+ * combined problem is built, saved to the database, and used for initialization.
  * @summary Get Or Initialize
  */
 export const GetOrInitializeMethodCumulusGetOrInitializePostQueryParams = zod.object({
@@ -6721,6 +6984,8 @@ export const GetOrInitializeMethodCumulusGetOrInitializePostQueryParams = zod.ob
 });
 
 export const getOrInitializeMethodCumulusGetOrInitializePostBodyStartingPointOnePreferenceTypeDefault = `reference_point`;
+export const getOrInitializeMethodCumulusGetOrInitializePostBodyUncertaintyMeasuresOneItemAlphaOneExclusiveMin = 0;
+export const getOrInitializeMethodCumulusGetOrInitializePostBodyUncertaintyMeasuresOneItemAlphaOneExclusiveMax = 1;
 
 export const GetOrInitializeMethodCumulusGetOrInitializePostBody = zod
 	.object({
@@ -6786,28 +7051,44 @@ export const GetOrInitializeMethodCumulusGetOrInitializePostBody = zod
 								])
 								.describe('Which uncertainty aggregate to apply.'),
 							scenario_model_id: zod
-								.number()
-								.describe('DB id of the ScenarioModelDB that defines the scenario structure.'),
+								.union([zod.number(), zod.null()])
+								.optional()
+								.describe(
+									"DB id of the ScenarioModelDB that defines the scenario structure, or None to aggregate over the problem's graphical model."
+								),
 							symbols: zod
 								.array(zod.string())
+								.min(1)
 								.describe('Symbols of objectives or functions to aggregate.'),
 							prefix: zod
 								.union([zod.string(), zod.null()])
 								.optional()
 								.describe('Prefix for the new aggregate symbols. Defaults vary by measure_type.'),
 							alpha: zod
-								.union([zod.number(), zod.null()])
+								.union([
+									zod
+										.number()
+										.gt(
+											getOrInitializeMethodCumulusGetOrInitializePostBodyUncertaintyMeasuresOneItemAlphaOneExclusiveMin
+										)
+										.lt(
+											getOrInitializeMethodCumulusGetOrInitializePostBodyUncertaintyMeasuresOneItemAlphaOneExclusiveMax
+										),
+									zod.null()
+								])
 								.optional()
 								.describe(
-									'Confidence level for CVaR, e.g. 0.95. Required for conditional_value_at_risk.'
+									"Probability mass of the averaged tail of worst outcomes in the element's own direction, e.g. 0.05 for the worst 5 % (often called CVaR 95 %). Required for conditional_value_at_risk."
 								),
 							leaf_weights: zod
 								.union([zod.record(zod.string(), zod.number()), zod.null()])
 								.optional()
-								.describe('Leaf-name → weight mapping. Required for weighted_scenarios.')
+								.describe(
+									'Leaf-name → weight mapping. Required for weighted_scenarios; not available for a graphical model.'
+								)
 						})
 						.describe(
-							'Specification for adding a scenario-based uncertainty aggregate to the problem.\n\nAll measures in a single request must reference the same ``scenario_model_id``.\nThe resulting combined (multi-scenario) problem replaces the current problem.'
+							"Specification for adding an uncertainty aggregate to the problem.\n\nThe aggregate is taken over either a scenario model (``scenario_model_id`` set) or, when\n``scenario_model_id`` is None, the outcome distributions of the problem's graphical model.\nAll measures in a single request must reference the same source. With a scenario model, the\nresulting combined (multi-scenario) problem replaces the current problem. With a graphical\nmodel, the aggregates replace the problem's objectives."
 						)
 				),
 				zod.null()
@@ -6821,6 +7102,7 @@ export const getOrInitializeMethodCumulusGetOrInitializePostResponseTwoResponseT
 export const getOrInitializeMethodCumulusGetOrInitializePostResponseTwoPreviousPreferencePreferenceTypeDefault = `reference_point`;
 export const getOrInitializeMethodCumulusGetOrInitializePostResponseThreeResponseTypeDefault = `cumulus.finalize`;
 export const getOrInitializeMethodCumulusGetOrInitializePostResponseFourResponseTypeDefault = `cumulus.scenario_setup`;
+export const getOrInitializeMethodCumulusGetOrInitializePostResponseFourSourceDefault = `scenario_model`;
 
 export const GetOrInitializeMethodCumulusGetOrInitializePostResponse = zod.union([
 	zod
@@ -7027,22 +7309,40 @@ export const GetOrInitializeMethodCumulusGetOrInitializePostResponse = zod.union
 			response_type: zod
 				.literal('cumulus.scenario_setup')
 				.default(getOrInitializeMethodCumulusGetOrInitializePostResponseFourResponseTypeDefault),
+			source: zod
+				.enum(['scenario_model', 'graphical'])
+				.default(getOrInitializeMethodCumulusGetOrInitializePostResponseFourSourceDefault)
+				.describe('Where the scenarios come from.'),
 			scenario_model_id: zod
-				.number()
-				.describe('DB id of the ScenarioModelDB associated with this problem.'),
+				.union([zod.number(), zod.null()])
+				.optional()
+				.describe(
+					"DB id of the ScenarioModelDB associated with this problem; None for 'graphical'."
+				),
 			objective_symbols: zod
 				.array(zod.string())
-				.describe('Symbols of the objectives available for aggregation.')
+				.describe('Symbols of the objectives available for aggregation.'),
+			measure_types: zod
+				.array(
+					zod.enum([
+						'expected_value',
+						'worst_case_robust',
+						'conditional_value_at_risk',
+						'weighted_scenarios'
+					])
+				)
+				.optional()
+				.describe('The uncertainty measure types available for this source.')
 		})
 		.describe(
-			'Response when the problem has scenarios but no uncertainty measures have been chosen yet.\n\nThe frontend should present this to the decision maker and let them choose which\nuncertainty aggregates to include, then re-call get-or-initialize with the chosen measures.'
+			"Response when the problem has scenarios but no uncertainty measures have been chosen yet.\n\nThe scenarios come from a scenario model or from the problem's graphical model. The frontend\nshould present this to the decision maker and let them choose which uncertainty aggregates to\ninclude, then re-call get-or-initialize with the chosen measures."
 		)
 ]);
 
 /**
  * Report whether uncertainty measures can be added to (or changed on) a problem.
  *
- * Looks past any combined scenario problem already built from it (via `parent_problem_id`),
+ * Looks past any combined problem already built from it (via `parent_problem_id`),
  * so this stays accurate whether `problem_id` is the original problem or one already combined
  * from it. Used to decide whether to show the "Add uncertainty measures" UI action at all.
  * @summary Get Scenario Availability
@@ -7054,12 +7354,18 @@ export const GetScenarioAvailabilityMethodCumulusScenarioAvailabilityGetQueryPar
 
 export const GetScenarioAvailabilityMethodCumulusScenarioAvailabilityGetResponse = zod
 	.object({
-		available: zod.boolean().describe('Whether the problem has an associated scenario model.'),
+		available: zod
+			.boolean()
+			.describe('Whether the problem has an associated scenario model or graphical model.'),
+		source: zod
+			.union([zod.enum(['scenario_model', 'graphical']), zod.null()])
+			.optional()
+			.describe('Where the scenarios come from, if available.'),
 		base_problem_id: zod
 			.union([zod.number(), zod.null()])
 			.optional()
 			.describe(
-				'Id of the problem actually carrying the scenario model, found by walking parent_problem_id.'
+				'Id of the problem the measures are applied to, found by walking parent_problem_id: the one carrying the scenario model, or the nearest one whose objectives are not yet aggregated.'
 			),
 		scenario_model_id: zod
 			.union([zod.number(), zod.null()])
@@ -7074,7 +7380,18 @@ export const GetScenarioAvailabilityMethodCumulusScenarioAvailabilityGetResponse
 			.optional()
 			.describe(
 				"Measure types already present on the current problem's objectives, detected by symbol prefix."
+			),
+		measure_types: zod
+			.array(
+				zod.enum([
+					'expected_value',
+					'worst_case_robust',
+					'conditional_value_at_risk',
+					'weighted_scenarios'
+				])
 			)
+			.optional()
+			.describe('The uncertainty measure types available for this source.')
 	})
 	.describe(
 		'Whether uncertainty measures can be added to (or changed on) the given problem.\n\nLets the frontend decide whether to show the \"Add uncertainty measures\" action at all,\nindependently of whether CUMULUS has already been initialized for the problem.'
@@ -7094,6 +7411,8 @@ export const ApplyScenarioMeasuresMethodCumulusApplyScenarioMeasuresPostQueryPar
 });
 
 export const applyScenarioMeasuresMethodCumulusApplyScenarioMeasuresPostBodyStartingPointOnePreferenceTypeDefault = `reference_point`;
+export const applyScenarioMeasuresMethodCumulusApplyScenarioMeasuresPostBodyUncertaintyMeasuresOneItemAlphaOneExclusiveMin = 0;
+export const applyScenarioMeasuresMethodCumulusApplyScenarioMeasuresPostBodyUncertaintyMeasuresOneItemAlphaOneExclusiveMax = 1;
 
 export const ApplyScenarioMeasuresMethodCumulusApplyScenarioMeasuresPostBody = zod
 	.object({
@@ -7159,28 +7478,44 @@ export const ApplyScenarioMeasuresMethodCumulusApplyScenarioMeasuresPostBody = z
 								])
 								.describe('Which uncertainty aggregate to apply.'),
 							scenario_model_id: zod
-								.number()
-								.describe('DB id of the ScenarioModelDB that defines the scenario structure.'),
+								.union([zod.number(), zod.null()])
+								.optional()
+								.describe(
+									"DB id of the ScenarioModelDB that defines the scenario structure, or None to aggregate over the problem's graphical model."
+								),
 							symbols: zod
 								.array(zod.string())
+								.min(1)
 								.describe('Symbols of objectives or functions to aggregate.'),
 							prefix: zod
 								.union([zod.string(), zod.null()])
 								.optional()
 								.describe('Prefix for the new aggregate symbols. Defaults vary by measure_type.'),
 							alpha: zod
-								.union([zod.number(), zod.null()])
+								.union([
+									zod
+										.number()
+										.gt(
+											applyScenarioMeasuresMethodCumulusApplyScenarioMeasuresPostBodyUncertaintyMeasuresOneItemAlphaOneExclusiveMin
+										)
+										.lt(
+											applyScenarioMeasuresMethodCumulusApplyScenarioMeasuresPostBodyUncertaintyMeasuresOneItemAlphaOneExclusiveMax
+										),
+									zod.null()
+								])
 								.optional()
 								.describe(
-									'Confidence level for CVaR, e.g. 0.95. Required for conditional_value_at_risk.'
+									"Probability mass of the averaged tail of worst outcomes in the element's own direction, e.g. 0.05 for the worst 5 % (often called CVaR 95 %). Required for conditional_value_at_risk."
 								),
 							leaf_weights: zod
 								.union([zod.record(zod.string(), zod.number()), zod.null()])
 								.optional()
-								.describe('Leaf-name → weight mapping. Required for weighted_scenarios.')
+								.describe(
+									'Leaf-name → weight mapping. Required for weighted_scenarios; not available for a graphical model.'
+								)
 						})
 						.describe(
-							'Specification for adding a scenario-based uncertainty aggregate to the problem.\n\nAll measures in a single request must reference the same ``scenario_model_id``.\nThe resulting combined (multi-scenario) problem replaces the current problem.'
+							"Specification for adding an uncertainty aggregate to the problem.\n\nThe aggregate is taken over either a scenario model (``scenario_model_id`` set) or, when\n``scenario_model_id`` is None, the outcome distributions of the problem's graphical model.\nAll measures in a single request must reference the same source. With a scenario model, the\nresulting combined (multi-scenario) problem replaces the current problem. With a graphical\nmodel, the aggregates replace the problem's objectives."
 						)
 				),
 				zod.null()
@@ -7583,6 +7918,8 @@ export const ModifyProblemMethodCumulusModifyProblemPostQueryParams = zod.object
 });
 
 export const modifyProblemMethodCumulusModifyProblemPostBodyModificationsSoftConstraintsOneItemViolationSymbolDefault = `constraint_violation`;
+export const modifyProblemMethodCumulusModifyProblemPostBodyModificationsUncertaintyMeasuresOneItemAlphaOneExclusiveMin = 0;
+export const modifyProblemMethodCumulusModifyProblemPostBodyModificationsUncertaintyMeasuresOneItemAlphaOneExclusiveMax = 1;
 
 export const ModifyProblemMethodCumulusModifyProblemPostBody = zod
 	.object({
@@ -7654,10 +7991,14 @@ export const ModifyProblemMethodCumulusModifyProblemPostBody = zod
 										])
 										.describe('Which uncertainty aggregate to apply.'),
 									scenario_model_id: zod
-										.number()
-										.describe('DB id of the ScenarioModelDB that defines the scenario structure.'),
+										.union([zod.number(), zod.null()])
+										.optional()
+										.describe(
+											"DB id of the ScenarioModelDB that defines the scenario structure, or None to aggregate over the problem's graphical model."
+										),
 									symbols: zod
 										.array(zod.string())
+										.min(1)
 										.describe('Symbols of objectives or functions to aggregate.'),
 									prefix: zod
 										.union([zod.string(), zod.null()])
@@ -7666,18 +8007,30 @@ export const ModifyProblemMethodCumulusModifyProblemPostBody = zod
 											'Prefix for the new aggregate symbols. Defaults vary by measure_type.'
 										),
 									alpha: zod
-										.union([zod.number(), zod.null()])
+										.union([
+											zod
+												.number()
+												.gt(
+													modifyProblemMethodCumulusModifyProblemPostBodyModificationsUncertaintyMeasuresOneItemAlphaOneExclusiveMin
+												)
+												.lt(
+													modifyProblemMethodCumulusModifyProblemPostBodyModificationsUncertaintyMeasuresOneItemAlphaOneExclusiveMax
+												),
+											zod.null()
+										])
 										.optional()
 										.describe(
-											'Confidence level for CVaR, e.g. 0.95. Required for conditional_value_at_risk.'
+											"Probability mass of the averaged tail of worst outcomes in the element's own direction, e.g. 0.05 for the worst 5 % (often called CVaR 95 %). Required for conditional_value_at_risk."
 										),
 									leaf_weights: zod
 										.union([zod.record(zod.string(), zod.number()), zod.null()])
 										.optional()
-										.describe('Leaf-name → weight mapping. Required for weighted_scenarios.')
+										.describe(
+											'Leaf-name → weight mapping. Required for weighted_scenarios; not available for a graphical model.'
+										)
 								})
 								.describe(
-									'Specification for adding a scenario-based uncertainty aggregate to the problem.\n\nAll measures in a single request must reference the same ``scenario_model_id``.\nThe resulting combined (multi-scenario) problem replaces the current problem.'
+									"Specification for adding an uncertainty aggregate to the problem.\n\nThe aggregate is taken over either a scenario model (``scenario_model_id`` set) or, when\n``scenario_model_id`` is None, the outcome distributions of the problem's graphical model.\nAll measures in a single request must reference the same source. With a scenario model, the\nresulting combined (multi-scenario) problem replaces the current problem. With a graphical\nmodel, the aggregates replace the problem's objectives."
 								)
 						),
 						zod.null()
@@ -7728,6 +8081,85 @@ export const ModifyProblemMethodCumulusModifyProblemPostResponse = zod
 		problem_deleted: zod
 			.boolean()
 			.default(modifyProblemMethodCumulusModifyProblemPostResponseProblemDeletedDefault)
+			.describe(
+				"True when the modified problem was found infeasible and deleted again. The modification did not take effect; 'error' says which constraints could not be met."
+			)
+	})
+	.describe('Response from the CUMULUS modify-problem endpoint.');
+
+/**
+ * Create a new problem from a graphical-model problem under hypothetical assumptions.
+ *
+ * The new problem is recompiled from the conditioned diagram and gets its own copy of the
+ * graphical metadata; the original problem is left as it is. Like a modification, it stays
+ * temporary until the background checks confirm it is feasible and set its ideal and nadir.
+ * Poll `/modify-problem/status/{state_id}` for the outcome.
+ *
+ * Raises:
+ *     HTTPException: 404 if the problem has no graphical model; 400 if the assumptions are
+ *         invalid, add nothing new, or contradict what the problem already assumes.
+ * @summary Create Hypothetical
+ */
+export const CreateHypotheticalMethodCumulusHypotheticalPostQueryParams = zod.object({
+	problem_id: zod.union([zod.number(), zod.null()]).optional()
+});
+
+export const CreateHypotheticalMethodCumulusHypotheticalPostBody = zod
+	.object({
+		problem_id: zod.number(),
+		session_id: zod.union([zod.number(), zod.null()]).optional(),
+		parent_state_id: zod.union([zod.number(), zod.null()]).optional(),
+		assumptions: zod
+			.object({
+				chance: zod.record(zod.string(), zod.string()).optional(),
+				decisions: zod.record(zod.string(), zod.string()).optional()
+			})
+			.describe("States assumed for some of a diagram's parentless chance nodes and decisions.")
+	})
+	.describe(
+		'Request model for the CUMULUS hypothetical endpoint.\n\nCreates a new problem from a graphical-model problem under `assumptions`, on top of whatever\nit already assumes. The response and status polling are those of modify-problem.'
+	);
+
+export const createHypotheticalMethodCumulusHypotheticalPostResponseResponseTypeDefault = `cumulus.modify`;
+export const createHypotheticalMethodCumulusHypotheticalPostResponseIsReadyDefault = false;
+export const createHypotheticalMethodCumulusHypotheticalPostResponseCurrentSolutionFeasibleDefault = true;
+export const createHypotheticalMethodCumulusHypotheticalPostResponseProblemDeletedDefault = false;
+
+export const CreateHypotheticalMethodCumulusHypotheticalPostResponse = zod
+	.object({
+		response_type: zod
+			.literal('cumulus.modify')
+			.default(createHypotheticalMethodCumulusHypotheticalPostResponseResponseTypeDefault),
+		state_id: zod.number().describe('The newly created modification state id.'),
+		problem_id: zod.number().describe('The ID of the newly created modified problem.'),
+		original_problem_id: zod
+			.union([zod.number(), zod.null()])
+			.describe('The ID of the original problem.'),
+		scenario_model_id: zod
+			.union([zod.number(), zod.null()])
+			.optional()
+			.describe('DB id of the ScenarioModelDB associated with the original problem, if any.'),
+		is_ready: zod
+			.boolean()
+			.default(createHypotheticalMethodCumulusHypotheticalPostResponseIsReadyDefault)
+			.describe(
+				'False immediately after the endpoint returns; True once the background feasibility check completes.'
+			),
+		error: zod
+			.union([zod.string(), zod.null()])
+			.optional()
+			.describe('Set if the background feasibility check failed.'),
+		current_solution_feasible: zod
+			.boolean()
+			.default(
+				createHypotheticalMethodCumulusHypotheticalPostResponseCurrentSolutionFeasibleDefault
+			)
+			.describe(
+				'Whether some current solution is known to satisfy the modified problem, which proves it feasible. Known immediately, without a solve. When False, the background check decides whether the modified problem has any solutions.'
+			),
+		problem_deleted: zod
+			.boolean()
+			.default(createHypotheticalMethodCumulusHypotheticalPostResponseProblemDeletedDefault)
 			.describe(
 				"True when the modified problem was found infeasible and deleted again. The modification did not take effect; 'error' says which constraints could not be met."
 			)
@@ -9423,6 +9855,587 @@ export const BuildMapSiteSelectionMapPostResponse = zod
 		site_node_names: zod.array(zod.string())
 	})
 	.describe('Response body for the site selection map endpoint.');
+
+/**
+ * Compile a `(DiscreteNetwork, DecisionAnnotation)` pair into a `Problem`, and persist it.
+ *
+ * Persists the `ProblemDB` plus a `GraphicalModelMetaData` row holding the network, annotation,
+ * `RootedJunctionTree`, and `IndexMap`, in one commit. Guest users may not compile.
+ *
+ * Raises:
+ *     HTTPException: 401 for a guest user; 400 for a `ValueError` from validation or
+ *         compilation (e.g. `max_cluster_size` exceeded), or if the total cluster state space
+ *         exceeds `_SERVER_MAX_TOTAL_CLUSTER_SIZE`.
+ * @summary Compile Graphical Model
+ */
+export const compileGraphicalModelGraphicalCompilePostBodyNetworkNameDefault = ``;
+export const compileGraphicalModelGraphicalCompilePostBodyNetworkVariablesItemDescriptionDefault = ``;
+export const compileGraphicalModelGraphicalCompilePostBodyNetworkVariablesItemKindDefault = `labelized`;
+export const compileGraphicalModelGraphicalCompilePostBodyAnnotationSchemaVersionDefault = 1;
+export const compileGraphicalModelGraphicalCompilePostBodyAnnotationDecisionsItemNameDefault = ``;
+export const compileGraphicalModelGraphicalCompilePostBodyAnnotationObjectivesItemNameDefault = ``;
+export const compileGraphicalModelGraphicalCompilePostBodyAnnotationObjectivesItemMaximizeDefault = false;
+export const compileGraphicalModelGraphicalCompilePostBodyAnnotationConstraintsItemNameDefault = ``;
+export const compileGraphicalModelGraphicalCompilePostBodyAnnotationConstraintsItemConsTypeDefault = `<=`;
+export const compileGraphicalModelGraphicalCompilePostBodyAnnotationRiskMeasuresItemKindDefault = `cvar`;
+export const compileGraphicalModelGraphicalCompilePostBodyAnnotationNoForgettingDefault = false;
+export const compileGraphicalModelGraphicalCompilePostBodyOnExceedDefault = `warn`;
+
+export const CompileGraphicalModelGraphicalCompilePostBody = zod
+	.object({
+		network: zod
+			.object({
+				name: zod.string().default(compileGraphicalModelGraphicalCompilePostBodyNetworkNameDefault),
+				variables: zod.array(
+					zod
+						.object({
+							name: zod.string(),
+							description: zod
+								.string()
+								.default(
+									compileGraphicalModelGraphicalCompilePostBodyNetworkVariablesItemDescriptionDefault
+								),
+							kind: zod
+								.enum(['labelized', 'range', 'integer', 'discretized', 'numerical'])
+								.default(
+									compileGraphicalModelGraphicalCompilePostBodyNetworkVariablesItemKindDefault
+								)
+								.describe(
+									"Mirrors pyAgrum's `VarType` discriminator for `DiscreteVariable` subclasses."
+								),
+							labels: zod.array(zod.string()),
+							lower_bound: zod.union([zod.number(), zod.null()]).optional(),
+							upper_bound: zod.union([zod.number(), zod.null()]).optional(),
+							integer_values: zod.union([zod.array(zod.number()), zod.null()]).optional(),
+							ticks: zod.union([zod.array(zod.number()), zod.null()]).optional(),
+							numerical_values: zod.union([zod.array(zod.number()), zod.null()]).optional()
+						})
+						.describe(
+							"A discrete chance node's domain, mirroring one pyAgrum `DiscreteVariable` subclass.\n\n`labels` holds the domain in state-index order; the kind-specific fields allow reconstructing\nthe same pyAgrum subclass."
+						)
+				),
+				arcs: zod.array(zod.tuple([zod.string(), zod.string()])),
+				potentials: zod.record(
+					zod.string(),
+					zod
+						.object({
+							variables: zod.array(zod.string()),
+							shape: zod.array(zod.number()),
+							values: zod.array(zod.unknown())
+						})
+						.describe(
+							"A conditional probability table over one or more `DiscreteVariable`s.\n\n`variables` is the node itself first, then its parents in arc-insertion order. `values`'s axes\nmatch `variables` (the reverse of pyAgrum's `Tensor.toarray()`)."
+						)
+				)
+			})
+			.describe(
+				"A discrete Bayesian network: chance nodes, arcs between them, and one CPT per node.\n\nNear-isomorphic to pyAgrum's `BayesNet`; see `adapters\/pyagrum.py`. Nodes are addressed by name."
+			),
+		annotation: zod
+			.object({
+				schema_version: zod
+					.number()
+					.default(compileGraphicalModelGraphicalCompilePostBodyAnnotationSchemaVersionDefault),
+				decisions: zod
+					.array(
+						zod
+							.object({
+								symbol: zod.string(),
+								name: zod
+									.string()
+									.default(
+										compileGraphicalModelGraphicalCompilePostBodyAnnotationDecisionsItemNameDefault
+									),
+								states: zod.array(zod.string()),
+								information_set: zod.array(zod.string()).optional()
+							})
+							.describe(
+								'A decision (choice) node. Not part of `DiscreteNetwork` -- it has no CPT, only a domain.'
+							)
+					)
+					.optional(),
+				objectives: zod.array(
+					zod
+						.object({
+							symbol: zod.string(),
+							name: zod
+								.string()
+								.default(
+									compileGraphicalModelGraphicalCompilePostBodyAnnotationObjectivesItemNameDefault
+								),
+							parents: zod.array(zod.string()),
+							utility: zod
+								.object({
+									variables: zod.array(zod.string()),
+									shape: zod.array(zod.number()),
+									values: zod.array(zod.unknown())
+								})
+								.describe(
+									"A conditional probability table over one or more `DiscreteVariable`s.\n\n`variables` is the node itself first, then its parents in arc-insertion order. `values`'s axes\nmatch `variables` (the reverse of pyAgrum's `Tensor.toarray()`)."
+								),
+							maximize: zod
+								.boolean()
+								.default(
+									compileGraphicalModelGraphicalCompilePostBodyAnnotationObjectivesItemMaximizeDefault
+								),
+							unit: zod.union([zod.string(), zod.null()]).optional()
+						})
+						.describe(
+							"A utility node: one linear objective, valued over its parents' joint state.\n\nObjectives are kept separate rather than summed into one utility as pyAgrum does."
+						)
+				),
+				constraints: zod
+					.array(
+						zod
+							.object({
+								symbol: zod.string(),
+								name: zod
+									.string()
+									.default(
+										compileGraphicalModelGraphicalCompilePostBodyAnnotationConstraintsItemNameDefault
+									),
+								kind: zod
+									.enum(['decision', 'probability', 'expected_value', 'tail'])
+									.describe('Which quantity a `DiagramConstraint` is linear in.'),
+								nodes: zod.array(zod.string()),
+								func: zod.array(zod.unknown()),
+								cons_type: zod
+									.enum(['=', '<='])
+									.default(
+										compileGraphicalModelGraphicalCompilePostBodyAnnotationConstraintsItemConsTypeDefault
+									)
+									.describe('An enumerator for supported constraint expression types.')
+							})
+							.describe(
+								'A diagram-level constraint, expressed in terms of node symbols rather than compiled variables.\n\n`kind` determines how `func` is compiled.'
+							)
+					)
+					.optional(),
+				risk_measures: zod
+					.array(
+						zod
+							.object({
+								symbol: zod.string(),
+								target: zod.string(),
+								kind: zod
+									.enum(['cvar'])
+									.default(
+										compileGraphicalModelGraphicalCompilePostBodyAnnotationRiskMeasuresItemKindDefault
+									)
+									.describe('Which risk measure to apply. Only `cvar` is implemented.'),
+								alpha: zod.number()
+							})
+							.describe(
+								'A risk transform recorded against one objective, applied to the diagram before compiling.'
+							)
+					)
+					.optional(),
+				decision_order: zod.union([zod.array(zod.string()), zod.null()]).optional(),
+				no_forgetting: zod
+					.boolean()
+					.default(compileGraphicalModelGraphicalCompilePostBodyAnnotationNoForgettingDefault)
+			})
+			.describe(
+				'The full decision\/objective overlay for one `DiscreteNetwork`.\n\nConstruction checks internal consistency only; references into a network are checked by\n`validate_against`.'
+			),
+		name: zod.union([zod.string(), zod.null()]).optional(),
+		max_cluster_size: zod.union([zod.number(), zod.null()]).optional(),
+		on_exceed: zod
+			.enum(['warn', 'raise'])
+			.default(compileGraphicalModelGraphicalCompilePostBodyOnExceedDefault)
+	})
+	.describe('Body for `POST \/graphical\/compile`.');
+
+export const CompileGraphicalModelGraphicalCompilePostResponse = zod
+	.object({
+		problem_id: zod.number()
+	})
+	.describe('Response for `POST \/graphical\/compile`.');
+
+/**
+ * The DAG and node types of a graphical model, without inference.
+ *
+ * Raises:
+ *     HTTPException: 404 if the problem doesn't exist, isn't visible to `user`, or has no
+ *         `GraphicalModelMetaData` row.
+ * @summary Get Structure
+ */
+export const GetStructureGraphicalProblemIdStructureGetParams = zod.object({
+	problem_id: zod.number()
+});
+
+export const GetStructureGraphicalProblemIdStructureGetResponse = zod
+	.object({
+		nodes: zod.array(
+			zod
+				.object({
+					id: zod.string(),
+					label: zod.string(),
+					kind: zod.enum(['chance', 'decision', 'objective']),
+					states: zod.union([zod.array(zod.string()), zod.null()]).optional(),
+					description: zod.union([zod.string(), zod.null()]).optional()
+				})
+				.describe('One node in a `GET \/graphical\/{problem_id}\/structure` response.')
+		),
+		edges: zod.array(
+			zod
+				.object({
+					id: zod.string(),
+					source: zod.string(),
+					target: zod.string()
+				})
+				.describe('One directed edge in a `GET \/graphical\/{problem_id}\/structure` response.')
+		),
+		assumptions: zod
+			.object({
+				chance: zod.record(zod.string(), zod.string()).optional(),
+				decisions: zod.record(zod.string(), zod.string()).optional()
+			})
+			.optional()
+			.describe("States assumed for some of a diagram's parentless chance nodes and decisions.")
+	})
+	.describe('Response for `GET \/graphical\/{problem_id}\/structure`.');
+
+/**
+ * Set hard evidence, run inference, and return posteriors/policy/utilities in one payload.
+ *
+ * Uses a cached engine (see `_engine_cache`), except with `request.solution` and some decision
+ * unpinned, which uses a fresh one where unpinned decisions follow that solution's policy. The
+ * decisions a hypothetical problem assumes are always pinned.
+ *
+ * Raises:
+ *     HTTPException: 404 if the problem or session isn't found or visible, or the problem has no
+ *         `GraphicalModelMetaData`, or for an unusable `solution` (see
+ *         `_fetch_solution_policies`); 400 for invalid evidence/decision_evidence/solution, a pin
+ *         contradicting an assumed decision, or a diagram pyAgrum rejects; 501 for several
+ *         objectives with decisions, unless `decision_evidence` pins every decision or
+ *         `solution` is given (see `_compute_utilities`).
+ * @summary Whatif
+ */
+export const whatifGraphicalWhatifPostBodyEvidenceDefault = {};
+export const whatifGraphicalWhatifPostBodyDecisionEvidenceDefault = {};
+
+export const WhatifGraphicalWhatifPostBody = zod
+	.object({
+		problem_id: zod.number(),
+		session_id: zod.union([zod.number(), zod.null()]).optional(),
+		evidence: zod
+			.record(zod.string(), zod.string())
+			.default(whatifGraphicalWhatifPostBodyEvidenceDefault),
+		decision_evidence: zod
+			.record(zod.string(), zod.string())
+			.default(whatifGraphicalWhatifPostBodyDecisionEvidenceDefault),
+		solution: zod
+			.union([
+				zod
+					.object({
+						state_id: zod.number(),
+						solution_index: zod.number()
+					})
+					.describe(
+						'One solution stored in a `StateDB` row, e.g. a CUMULUS `SolutionReferenceResponseLite`.'
+					),
+				zod.null()
+			])
+			.optional()
+	})
+	.describe('Body for `POST \/graphical\/whatif`.');
+
+export const whatifGraphicalWhatifPostResponseOffPolicyDecisionsDefault = [];
+export const whatifGraphicalWhatifPostResponseDecisionPosteriorsDefault = {};
+
+export const WhatifGraphicalWhatifPostResponse = zod
+	.object({
+		posteriors: zod.record(zod.string(), zod.array(zod.number())),
+		policy: zod.union([zod.record(zod.string(), zod.string()), zod.null()]).optional(),
+		utilities: zod.record(zod.string(), zod.number()),
+		utility_std_devs: zod.record(zod.string(), zod.number()),
+		off_policy_decisions: zod
+			.array(zod.string())
+			.default(whatifGraphicalWhatifPostResponseOffPolicyDecisionsDefault),
+		decision_posteriors: zod
+			.record(zod.string(), zod.array(zod.number()))
+			.default(whatifGraphicalWhatifPostResponseDecisionPosteriorsDefault)
+	})
+	.describe('Response for `POST \/graphical\/whatif`.');
+
+/**
+ * Decode a solved `Problem`'s policy against `evidence`.
+ *
+ * Raises:
+ *     HTTPException: 404 if the problem isn't found or visible, has no graphical metadata or
+ *         `IndexMap`, or `solution_id` isn't a saved solution of `problem_id`; 403 if the saved
+ *         solution belongs to another user and `user` is not an admin/analyst; 400 if not
+ *         exactly one of `variable_values`/`solution_id` is given, or for invalid evidence or
+ *         variable values.
+ * @summary Get Policy
+ */
+export const GetPolicyGraphicalProblemIdPolicyPostParams = zod.object({
+	problem_id: zod.number()
+});
+
+export const getPolicyGraphicalProblemIdPolicyPostBodyEvidenceDefault = {};
+
+export const GetPolicyGraphicalProblemIdPolicyPostBody = zod
+	.object({
+		variable_values: zod
+			.union([
+				zod.record(zod.string(), zod.union([zod.array(zod.number()), zod.number()])),
+				zod.null()
+			])
+			.optional(),
+		solution_id: zod.union([zod.number(), zod.null()]).optional(),
+		evidence: zod
+			.record(zod.string(), zod.string())
+			.default(getPolicyGraphicalProblemIdPolicyPostBodyEvidenceDefault)
+	})
+	.describe('Body for `POST \/graphical\/{problem_id}\/policy`.');
+
+export const GetPolicyGraphicalProblemIdPolicyPostResponse = zod
+	.object({
+		policy: zod.record(zod.string(), zod.string())
+	})
+	.describe('Response for `POST \/graphical\/{problem_id}\/policy`.');
+
+/**
+ * Save the current evidence dict under a name, for later reuse/sharing by id.
+ *
+ * Raises:
+ *     HTTPException: 404 if the problem doesn't exist, isn't visible to `user`, or has no
+ *         `GraphicalModelMetaData`; 400 for invalid evidence.
+ * @summary Create Evidence Set
+ */
+export const CreateEvidenceSetGraphicalProblemIdEvidenceSetsPostParams = zod.object({
+	problem_id: zod.number()
+});
+
+export const createEvidenceSetGraphicalProblemIdEvidenceSetsPostBodyEvidenceDefault = {};
+
+export const CreateEvidenceSetGraphicalProblemIdEvidenceSetsPostBody = zod
+	.object({
+		name: zod.string(),
+		evidence: zod
+			.record(zod.string(), zod.string())
+			.default(createEvidenceSetGraphicalProblemIdEvidenceSetsPostBodyEvidenceDefault)
+	})
+	.describe('Body for `POST \/graphical\/{problem_id}\/evidence-sets`.');
+
+export const CreateEvidenceSetGraphicalProblemIdEvidenceSetsPostResponse = zod
+	.object({
+		id: zod.number(),
+		problem_id: zod.number(),
+		name: zod.string(),
+		evidence: zod.record(zod.string(), zod.string()),
+		created_at: zod.iso.datetime({ offset: true })
+	})
+	.describe('Response shape for every named-evidence-set endpoint below.');
+
+/**
+ * Every named evidence set saved against `problem_id`, regardless of which user saved it.
+ *
+ * Evidence sets are shareable: anyone who can see the problem can read them, while deletion is
+ * restricted to the owner.
+ *
+ * Raises:
+ *     HTTPException: 404 if the problem doesn't exist or isn't visible to `user`.
+ * @summary List Evidence Sets
+ */
+export const ListEvidenceSetsGraphicalProblemIdEvidenceSetsGetParams = zod.object({
+	problem_id: zod.number()
+});
+
+export const ListEvidenceSetsGraphicalProblemIdEvidenceSetsGetResponseItem = zod
+	.object({
+		id: zod.number(),
+		problem_id: zod.number(),
+		name: zod.string(),
+		evidence: zod.record(zod.string(), zod.string()),
+		created_at: zod.iso.datetime({ offset: true })
+	})
+	.describe('Response shape for every named-evidence-set endpoint below.');
+export const ListEvidenceSetsGraphicalProblemIdEvidenceSetsGetResponse = zod.array(
+	ListEvidenceSetsGraphicalProblemIdEvidenceSetsGetResponseItem
+);
+
+/**
+ * Fetch one named evidence set by id, so it can be shared by URL.
+ *
+ * Visibility is checked against the set's problem.
+ *
+ * Raises:
+ *     HTTPException: 404 if no such evidence set exists, or its problem isn't visible to `user`.
+ * @summary Get Evidence Set
+ */
+export const GetEvidenceSetGraphicalEvidenceSetsEvidenceSetIdGetParams = zod.object({
+	evidence_set_id: zod.number()
+});
+
+export const GetEvidenceSetGraphicalEvidenceSetsEvidenceSetIdGetResponse = zod
+	.object({
+		id: zod.number(),
+		problem_id: zod.number(),
+		name: zod.string(),
+		evidence: zod.record(zod.string(), zod.string()),
+		created_at: zod.iso.datetime({ offset: true })
+	})
+	.describe('Response shape for every named-evidence-set endpoint below.');
+
+/**
+ * Delete a named evidence set. Owner (or admin/analyst) only, unlike reading/listing.
+ *
+ * Raises:
+ *     HTTPException: 404 if no such evidence set exists, or its problem isn't visible to `user`;
+ *         403 if `user` neither saved it nor is an admin/analyst.
+ * @summary Delete Evidence Set
+ */
+export const DeleteEvidenceSetGraphicalEvidenceSetsEvidenceSetIdDeleteParams = zod.object({
+	evidence_set_id: zod.number()
+});
+
+export const DeleteEvidenceSetGraphicalEvidenceSetsEvidenceSetIdDeleteResponse = zod.unknown();
+
+/**
+ * Single-node hard-evidence sweep, one node at a time, holding everything else at `evidence`.
+ *
+ * Sweeps every chance node other than `target` and the evidenced ones (decision nodes are not
+ * swept), using the cached engine.
+ *
+ * Raises:
+ *     HTTPException: 401 for a guest user; 404 if the problem isn't found or visible, or has no
+ *         `GraphicalModelMetaData`; 400 for invalid evidence, `target`, `target_state` or
+ *         `nodes`, or too many nodes to sweep; 501 if `target` is an objective of a diagram
+ *         with several objectives and a decision (see `_compute_utilities`), or the problem
+ *         assumes a decision.
+ * @summary Sensitivity
+ */
+export const sensitivityGraphicalSensitivityPostBodyEvidenceDefault = {};
+
+export const SensitivityGraphicalSensitivityPostBody = zod
+	.object({
+		problem_id: zod.number(),
+		session_id: zod.union([zod.number(), zod.null()]).optional(),
+		evidence: zod
+			.record(zod.string(), zod.string())
+			.default(sensitivityGraphicalSensitivityPostBodyEvidenceDefault),
+		target: zod.string(),
+		target_state: zod.union([zod.string(), zod.null()]).optional(),
+		nodes: zod.union([zod.array(zod.string()), zod.null()]).optional()
+	})
+	.describe('Body for `POST \/graphical\/sensitivity`.');
+
+export const SensitivityGraphicalSensitivityPostResponse = zod
+	.object({
+		base_value: zod.number(),
+		results: zod.array(
+			zod
+				.object({
+					node: zod.string(),
+					values: zod.record(zod.string(), zod.number()),
+					low: zod.number(),
+					high: zod.number(),
+					swing: zod.number()
+				})
+				.describe("One swept node's tornado-bar entry.")
+		)
+	})
+	.describe('Response for `POST \/graphical\/sensitivity`.');
+
+/**
+ * Value of information for observing `node` before deciding, as a gain in expected utility.
+ *
+ * `VoI(node) = sum_s P(node=s) * value(node=s) - value()`, computed with `_sweep_node`. Only
+ * defined for diagrams with at least one decision; otherwise there is nothing the observation
+ * could change, so the request is rejected rather than returning zero.
+ *
+ * Raises:
+ *     HTTPException: 404 if the problem isn't found or visible, or has no
+ *         `GraphicalModelMetaData`; 400 if the diagram has no decisions, or for an invalid
+ *         `target`, `node` (or one already in `evidence`), or evidence; 501 for several
+ *         objectives with a decision (see `_compute_utilities`), or if the problem assumes a
+ *         decision.
+ * @summary Value Of Information
+ */
+export const valueOfInformationGraphicalVoiPostBodyEvidenceDefault = {};
+
+export const ValueOfInformationGraphicalVoiPostBody = zod
+	.object({
+		problem_id: zod.number(),
+		session_id: zod.union([zod.number(), zod.null()]).optional(),
+		evidence: zod
+			.record(zod.string(), zod.string())
+			.default(valueOfInformationGraphicalVoiPostBodyEvidenceDefault),
+		node: zod.string(),
+		target: zod.string()
+	})
+	.describe('Body for `POST \/graphical\/voi`.');
+
+export const ValueOfInformationGraphicalVoiPostResponse = zod
+	.object({
+		base_value: zod.number(),
+		expected_value_with_observation: zod.number(),
+		value_of_information: zod.number(),
+		marginal: zod.record(zod.string(), zod.number())
+	})
+	.describe('Response for `POST \/graphical\/voi`.');
+
+/**
+ * Compile the canned irrigation demo diagram (`desdeo/problem/graphical/demo.py`).
+ *
+ * Builds the model server-side and delegates to `compile_graphical_model`.
+ *
+ * Unless `request.force` is set, returns the caller's most recent problem with the demo name if
+ * its network matches the demo (see `_demo_irrigation_metadata_matches`), and compiles a new
+ * copy otherwise.
+ *
+ * Raises:
+ *     HTTPException: whatever `compile_graphical_model` raises (e.g. 401 for a guest user).
+ * @summary Compile Demo Irrigation Model
+ */
+export const compileDemoIrrigationModelGraphicalDemoIrrigationPostBodyForceDefault = false;
+
+export const CompileDemoIrrigationModelGraphicalDemoIrrigationPostBody = zod
+	.object({
+		force: zod
+			.boolean()
+			.default(compileDemoIrrigationModelGraphicalDemoIrrigationPostBodyForceDefault)
+	})
+	.describe(
+		'Body for `POST \/graphical\/demo\/irrigation`. Empty body (`{}`) is a normal, expected call.'
+	);
+
+export const CompileDemoIrrigationModelGraphicalDemoIrrigationPostResponse = zod
+	.object({
+		problem_id: zod.number()
+	})
+	.describe('Response for `POST \/graphical\/compile`.');
+
+/**
+ * Solve a compiled diagram's `Problem` for one objective, via `guess_best_solver`.
+ *
+ * A minimal single-objective solve, so the policy of a solved problem can be shown via
+ * `/policy`. Only compiled graphical diagrams are accepted.
+ *
+ * Raises:
+ *     HTTPException: 404 if the problem isn't found or visible, or isn't a compiled graphical
+ *         diagram; 400 for an unknown `objective_symbol` or if no compatible solver exists;
+ *         500 if the solver raises or reports failure.
+ * @summary Solve Graphical Model
+ */
+export const SolveGraphicalModelGraphicalProblemIdSolvePostParams = zod.object({
+	problem_id: zod.number()
+});
+
+export const SolveGraphicalModelGraphicalProblemIdSolvePostBody = zod
+	.object({
+		objective_symbol: zod.string()
+	})
+	.describe('Body for `POST \/graphical\/{problem_id}\/solve`.');
+
+export const SolveGraphicalModelGraphicalProblemIdSolvePostResponse = zod
+	.object({
+		variable_values: zod.record(zod.string(), zod.union([zod.array(zod.number()), zod.number()]))
+	})
+	.describe('Response for `POST \/graphical\/{problem_id}\/solve`.');
 
 /**
  * Vote for a band using this endpoint.

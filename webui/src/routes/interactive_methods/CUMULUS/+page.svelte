@@ -2,6 +2,7 @@
 	// Layout and core components
 	import { BaseLayout } from '$lib/components/custom/method_layout/index.js';
 	import { methodSelection } from '../../../stores/methodSelection';
+	import { auth } from '../../../stores/auth';
 	import { errorMessage, isLoading } from '../../../stores/uiState';
 	import { onMount } from 'svelte';
 	import LoadingSpinner from '$lib/components/custom/notifications/loading-spinner.svelte';
@@ -26,7 +27,43 @@
 	import VisualizationsPanel from '$lib/components/custom/visualizations-panel/visualizations-panel.svelte';
 	import UtopiaMap from '$lib/components/custom/nimbus/utopia-map.svelte';
 	import SolutionDescriptionPanel from '$lib/components/custom/nimbus/solution-description-panel.svelte';
+	import {
+		VisualizationTabs,
+		type VisualizationTab
+	} from '$lib/components/custom/visualization-tabs';
 	import { PREFERENCE_TYPES } from '$lib/constants';
+
+	import {
+		NetworkPanel,
+		createNetworkHighlightStore,
+		ancestralSet,
+		descendants,
+		buildAdjacency,
+		decisionsBlockingUtilities,
+		describeDecisions,
+		solutionStateTier,
+		filterDecisionEvidence,
+		formatUtility,
+		formatShare,
+		sharesLabel,
+		describeShares
+	} from '$lib/components/custom/network';
+	import type {
+		DecisionMode,
+		NetworkAssumptions,
+		NetworkEvidence,
+		NetworkKind,
+		NetworkModel,
+		NetworkPolicySource,
+		NetworkSolutionRef,
+		WhatIfContext,
+		WhatIfResult
+	} from '$lib/components/custom/network';
+	import IconFlag from '@lucide/svelte/icons/flag';
+	import IconArrowUp from '@lucide/svelte/icons/arrow-up';
+	import IconArrowDown from '@lucide/svelte/icons/arrow-down';
+	import { toggleSet } from '$lib/helpers';
+	import { dev } from '$app/environment';
 
 	// Utility functions (reused from NIMBUS — logic is identical)
 	import {
@@ -166,20 +203,432 @@
 
 	// Scenario setup dialog state
 	let show_scenario_setup_dialog = $state(false);
-	// 'initial': shown automatically on first load of a scenario-bearing problem.
+	// 'initial': shown automatically on first load of a problem with scenarios or a graphical model,
+	// including a new hypothetical.
 	// 'reopen': opened later from the "Add uncertainty measures" menu action, either to add
 	// measures that were declined initially, or to rebuild the combined problem with different ones.
-	let scenario_setup_mode: 'initial' | 'reopen' = $state('initial');
-	let pending_scenario_model_id = $state(0);
+	let scenario_setup_mode = $state<'initial' | 'reopen'>('initial');
+	// The problem the measures are applied to; may differ from `problem` for a new hypothetical.
+	let pending_problem_id = $state(0);
+	let pending_source = $state<CumulusScenarioSetupResponseSource>('scenario_model');
+	// Set while the initial setup dialog is open for a new hypothetical; dismissing it keeps the
+	// old problem.
+	let pending_hypothetical = $state(false);
+	// The first-open setup of the current problem must be answered: there is no state without it.
+	let scenario_setup_dismissible = $derived(
+		scenario_setup_mode === 'reopen' || pending_hypothetical
+	);
+	// Null for the graphical source.
+	let pending_scenario_model_id: number | null = $state(null);
 	let pending_objective_symbols: string[] = $state([]);
+	let pending_measure_types: MeasureType[] = $state([]);
 	const AVAILABLE_MEASURES: { value: MeasureType; label: string }[] = [
 		{ value: 'expected_value', label: 'Expected value (E_)' },
 		{ value: 'worst_case_robust', label: 'Worst-case robust (robust_)' },
-		{ value: 'conditional_value_at_risk', label: 'Conditional Value at Risk (CVaR, α = 95%)' }
+		{ value: 'conditional_value_at_risk', label: 'Conditional Value at Risk (CVAR_)' }
 	];
+	let offered_measures = $derived(
+		AVAILABLE_MEASURES.filter((m) => pending_measure_types.includes(m.value))
+	);
 	let selected_measures: MeasureType[] = $state(['expected_value']);
-	let cvar_alpha = $state(0.95);
+	let cvar_alpha = $state(0.05);
 	let combined_problem_name = $state('');
+
+	// Network structure demo dialog (dev only), backed by the irrigation demo diagram compiled on
+	// the backend. `<NetworkPanel>` owns the network state; this page handles compiling/solving the
+	// demo, the decision-mode toggle, node flags, and cross-highlighting.
+	// Plain `string`, not `DecisionMode`, for the SegmentedControl binding.
+	let show_network_dialog = $state(false);
+	let network_decision_mode_str = $state<string>('manual');
+	let network_decision_mode = $derived(network_decision_mode_str as DecisionMode);
+	let network_flagged: Set<string> = $state(new Set());
+
+	// Network dialog for the current problem, available when it was compiled from a graphical model
+	// (`graphical_model_metadata`) or a stationary diagram (`stationary_model_metadata`).
+	// `$derived.by` because the inline `$derived(...)` form makes svelte-check misreport `problem`
+	// as `never` here.
+	let network_kind = $derived.by((): NetworkKind | null => {
+		const metadata = problem?.problem_metadata;
+		if (metadata?.graphical_model_metadata?.length) return 'graphical';
+		if (metadata?.stationary_model_metadata?.length) return 'stationary';
+		return null;
+	});
+	let show_network_dialog_real = $state(false);
+
+	// The real dialog's side panel: per-objective utilities and each decision's state.
+	// Derived, so replacing `problem` with the same id doesn't reload (and reset) the panel.
+	let network_real_model_id = $derived.by(() => problem?.id);
+	let network_real_model = $state<NetworkModel | null>(null);
+	let network_real_evidence = $state<NetworkEvidence>({});
+	let network_real_result = $state<WhatIfResult | null>(null);
+	// What `network_real_result` was computed for, and the name of its solution if it had one.
+	let network_real_result_context = $state<WhatIfContext | null>(null);
+	let network_real_result_solution_name = $state<string | null>(null);
+	// Stationary only: the last what-if request failed, and the panel still shows the previous result.
+	let network_real_error = $state<string | null>(null);
+	// Pins belong to one problem; they survive the panel remounting, not a change of problem.
+	$effect.pre(() => {
+		void network_real_model_id;
+		network_real_evidence = {};
+	});
+	function handle_network_real_structure_load(model: NetworkModel) {
+		network_real_model = model;
+		network_real_result = null;
+		network_real_result_context = null;
+		network_real_result_solution_name = null;
+		network_real_error = null;
+	}
+	function handle_network_real_whatif_result(result: WhatIfResult, context: WhatIfContext) {
+		network_real_result = result;
+		network_real_result_context = context;
+		network_real_result_solution_name = same_solution(context.solution, network_real_solution_ref)
+			? (network_real_solution?.name ?? null)
+			: null;
+		network_real_error = null;
+	}
+	function handle_network_real_whatif_error(message: string) {
+		network_real_error = message;
+	}
+	function same_solution(a: NetworkSolutionRef | null, b: NetworkSolutionRef | null): boolean {
+		return a?.stateId === b?.stateId && a?.solutionIndex === b?.solutionIndex;
+	}
+	// Unpinned decisions follow the solution selected in the main UI, else the first current one.
+	// A stationary problem shows the status-quo policy instead of the first current solution.
+	let network_real_solution = $derived.by(() => {
+		const selected = mode === 'iterate' ? chosen_solutions[selected_iteration_index[0]] : undefined;
+		if (network_kind === 'stationary') return selected ?? null;
+		return selected ?? current_state.current_solutions?.[0] ?? null;
+	});
+	let network_real_solution_ref = $derived.by((): NetworkSolutionRef | null =>
+		network_real_solution
+			? {
+					stateId: network_real_solution.state_id,
+					solutionIndex: network_real_solution.solution_index ?? 0
+				}
+			: null
+	);
+	// Labels of the decisions to pin before any utilities can be shown.
+	let network_real_unpinned = $derived.by(() => {
+		const model = network_real_model;
+		if (!model) return [];
+		const pins = filterDecisionEvidence(model, network_real_evidence);
+		const blocking = new Set(decisionsBlockingUtilities(model, pins, !!network_real_solution_ref));
+		return model.nodes.filter((n) => blocking.has(n.id)).map((n) => n.label);
+	});
+	let network_real_off_policy = $derived(network_real_result?.offPolicyDecisions ?? []);
+	// Without a solution, `policy` only repeats the pins, so it isn't read as "from solution".
+	// The solution's policy plus any decision its posterior makes certain, matching the canvas.
+	let network_real_followed_policy = $derived.by(() => {
+		if (!network_real_solution_ref) return undefined;
+		const certain = Object.fromEntries(
+			(network_real_model?.nodes ?? []).flatMap((n) => {
+				const probs = network_real_result?.decisionPosteriors?.[n.id];
+				const state = n.states?.find((_, i) => solutionStateTier(probs, i) === 'certain');
+				return state === undefined ? [] : [[n.id, state]];
+			})
+		) as Record<string, string>;
+		return { ...certain, ...network_real_result?.policy };
+	});
+	let network_real_decisions = $derived(
+		network_real_model
+			? describeDecisions(
+					network_real_model,
+					network_real_evidence,
+					network_real_followed_policy,
+					network_real_off_policy
+				)
+			: []
+	);
+	// Decision id -> the states the followed solution may still choose, e.g. "yes / no".
+	let network_real_possible_states = $derived(
+		Object.fromEntries(
+			(network_real_model?.nodes ?? []).flatMap((n) => {
+				const probs = network_real_result?.decisionPosteriors?.[n.id];
+				if (!probs || !n.states) return [];
+				const possible = n.states.filter((_, i) => solutionStateTier(probs, i) !== null);
+				return [[n.id, possible.join(' / ')]];
+			})
+		) as Record<string, string>
+	);
+	let network_real_off_policy_labels = $derived(
+		network_real_decisions.filter((d) => d.source === 'off-policy').map((d) => d.label)
+	);
+	let network_real_objectives = $derived(
+		(network_real_model?.nodes.filter((n) => n.kind === 'objective') ?? []).map((node) => {
+			const objective = problem?.objectives.find((o) => `util_${o.symbol}` === node.id);
+			return { node, symbol: objective?.symbol, maximize: objective?.maximize };
+		})
+	);
+	// The stationary side panel's labels, for what the shown result was computed for.
+	let network_stationary_evidence = $derived(
+		network_real_result_context?.evidence ?? network_real_evidence
+	);
+	let network_stationary_shares_label = $derived(
+		network_real_model ? sharesLabel(network_real_model, network_stationary_evidence) : ''
+	);
+	let network_stationary_has_solution = $derived(
+		network_real_result_context ? !!network_real_result_context.solution : !!network_real_solution
+	);
+	let network_stationary_policy_label = $derived.by(() => {
+		const context = network_real_result_context;
+		if (!context) {
+			return network_real_solution
+				? `Policy of the selected solution${network_real_solution.name ? ` ${network_real_solution.name}` : ''}.`
+				: 'No solution is selected: showing the status-quo policy.';
+		}
+		if (!context.solution) {
+			return network_real_solution_ref
+				? 'Showing the status-quo policy.'
+				: 'No solution is selected: showing the status-quo policy.';
+		}
+		const name = network_real_result_solution_name ? ` ${network_real_result_solution_name}` : '';
+		return same_solution(context.solution, network_real_solution_ref)
+			? `Policy of the selected solution${name}.`
+			: `Policy of a previously selected solution${name}.`;
+	});
+	let network_real_shares = $derived(
+		network_real_model
+			? describeShares(
+					network_real_model,
+					network_real_result?.decisionPosteriors,
+					network_real_result?.stationary?.arrivalShares
+				)
+			: []
+	);
+
+	function toggle_network_flag(id: string) {
+		network_flagged = toggleSet(network_flagged, id);
+	}
+
+	// The demo problem is compiled and solved the first time the dialog opens, and its id is cached
+	// in `sessionStorage` per user. A stale cached id is handled by `handle_network_structure_error`.
+	const NETWORK_DEMO_PROBLEM_ID_KEY = 'cumulus-network-demo-problem-id';
+	function network_demo_cache_key(): string {
+		return `${NETWORK_DEMO_PROBLEM_ID_KEY}:${$auth.user?.id ?? 'anon'}`;
+	}
+	// The demo diagram's only objective.
+	const NETWORK_DEMO_OBJECTIVE_SYMBOL = 'profit';
+
+	let network_problem_id: number | null = $state(null);
+	let network_compiling = $state(false);
+	let network_compile_error: string | null = $state(null);
+	let network_policy_source: NetworkPolicySource | null = $state(null);
+	let network_solving = $state(false);
+	let network_solve_error: string | null = $state(null);
+
+	/** `force`: bypass the cache and the backend's reuse of an existing demo problem. */
+	async function ensure_network_demo_compiled(force = false) {
+		if (!force && (network_problem_id !== null || network_compiling)) return;
+		if (!force) {
+			const cached = sessionStorage.getItem(network_demo_cache_key());
+			if (cached) {
+				network_problem_id = Number(cached);
+				return;
+			}
+		}
+		network_compiling = true;
+		network_compile_error = null;
+		try {
+			const res = await fetch('/api/graphical/demo/irrigation', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ force })
+			});
+			if (!res.ok) throw new Error(`Failed to compile network demo (status ${res.status})`);
+			const data: { problem_id: number } = await res.json();
+			network_problem_id = data.problem_id;
+			sessionStorage.setItem(network_demo_cache_key(), String(data.problem_id));
+		} catch (e) {
+			network_compile_error = e instanceof Error ? e.message : 'Failed to compile network demo';
+		} finally {
+			network_compiling = false;
+		}
+	}
+
+	// Solve the demo problem and pass the solution to `<NetworkPanel>` as `policySource`.
+	// Non-fatal: without it, the panel uses the live-inference policy.
+	async function ensure_network_demo_solved() {
+		if (network_problem_id === null || network_policy_source || network_solving) return;
+		network_solving = true;
+		network_solve_error = null;
+		try {
+			const res = await fetch(`/api/graphical/${network_problem_id}/solve`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ objective_symbol: NETWORK_DEMO_OBJECTIVE_SYMBOL })
+			});
+			if (!res.ok) throw new Error(`Failed to solve network demo (status ${res.status})`);
+			const data: { variable_values: Record<string, number[] | number> } = await res.json();
+			network_policy_source = { variableValues: data.variable_values };
+		} catch (e) {
+			network_solve_error = e instanceof Error ? e.message : 'Failed to solve network demo';
+		} finally {
+			network_solving = false;
+		}
+	}
+
+	// Forget the cached demo problem and compile (or fetch) it again. `force` is passed to
+	// `ensure_network_demo_compiled`.
+	function reset_network_demo(force = false) {
+		sessionStorage.removeItem(network_demo_cache_key());
+		network_problem_id = null;
+		network_policy_source = null;
+		network_compile_error = null;
+		network_solve_error = null;
+		network_model = null;
+		void ensure_network_demo_compiled(force);
+	}
+
+	// A failed structure fetch means the cached demo id is stale (e.g. after a DB reset), so
+	// recompile automatically, at most once per dialog open.
+	let network_structure_retry_attempted = false;
+	function handle_network_structure_error() {
+		if (network_structure_retry_attempted) return;
+		network_structure_retry_attempted = true;
+		reset_network_demo();
+	}
+
+	// Branches the session onto a new problem under the DM's assumptions, as hard objective bounds
+	// used to: the original problem and its solutions stay as they were.
+	let network_real_exploring = $state(false);
+	// Shown inside the dialog, where the page-level error alert may be hidden.
+	let network_real_explore_error = $state<string | null>(null);
+	async function handle_network_real_explore(assumptions: NetworkAssumptions) {
+		if (!problem) return;
+		network_real_exploring = true;
+		network_real_explore_error = null;
+		try {
+			const new_problem_id = await createHypotheticalRequest(
+				problem.id,
+				current_state.state_id ?? null,
+				assumptions
+			);
+			if (new_problem_id === null) {
+				network_real_explore_error = $errorMessage ?? 'Creating the hypothetical failed.';
+				errorMessage.set(null);
+				return;
+			}
+			const initialization = await initializeCumulusStateRequest(new_problem_id);
+			if (!initialization) {
+				network_real_explore_error = $errorMessage ?? 'Opening the hypothetical failed.';
+				errorMessage.set(null);
+				return;
+			}
+			if (initialization.response_type === 'cumulus.scenario_setup') {
+				// The name only prefills the combined problem's name, so a failed fetch leaves it blank.
+				const name = await getProblemProblemProblemIdGet(new_problem_id)
+					.then((resp) => (resp.status === 200 ? resp.data.name : ''))
+					.catch(() => '');
+				show_network_dialog_real = false;
+				open_initial_scenario_setup(
+					new_problem_id,
+					name,
+					initialization,
+					scenario_availability?.applied_measures ?? []
+				);
+				pending_hypothetical = true;
+				return;
+			}
+			await apply_initialization_result(initialization);
+			await refresh_scenario_availability();
+			switched_to_hypothetical();
+		} finally {
+			network_real_exploring = false;
+		}
+	}
+
+	function switched_to_hypothetical() {
+		network_real_evidence = {};
+		warning_message =
+			'Switched to a new problem under these assumptions. The original problem and its ' +
+			'solutions are unchanged.';
+	}
+
+	// Back to the network dialog, evidence intact, when the hypothetical's setup is not completed.
+	function return_to_network_dialog(error: string | null = null) {
+		network_real_explore_error = error;
+		show_network_dialog_real = true;
+	}
+
+	// Close the dialog if the problem is replaced by one without a network.
+	$effect(() => {
+		if (network_kind === null) show_network_dialog_real = false;
+	});
+
+	$effect(() => {
+		if (show_network_dialog) void ensure_network_demo_compiled();
+	});
+	$effect(() => {
+		if (network_problem_id !== null) void ensure_network_demo_solved();
+	});
+
+	// Cross-highlighting between the canvas and a "(demo) Reference point" panel listing the
+	// objectives. The model comes from `onStructureLoad`.
+	const network_highlight = createNetworkHighlightStore();
+	let network_model = $state<NetworkModel | null>(null);
+	function handle_network_structure_load(model: NetworkModel) {
+		network_model = model;
+	}
+	let network_reference_point_objectives = $derived(
+		network_model?.nodes.filter((n) => n.kind === 'objective') ?? []
+	);
+	let network_objective_ids = $derived(
+		new Set(network_reference_point_objectives.map((n) => n.id))
+	);
+	// Built once per model rather than on every hover.
+	let network_adjacency = $derived(network_model ? buildAdjacency(network_model) : null);
+	// Reverse direction: hovering (or selecting) a node on the canvas highlights the objectives
+	// it can influence in the reference-point panel.
+	let network_influenced_objectives: Set<string> = $state(new Set());
+
+	// Panel -> canvas: seed's ancestor closure (inclusive of the seed itself).
+	function handle_reference_point_row_hover(id: string | null) {
+		if (!network_model || !network_adjacency) return;
+		network_highlight.set(id ? ancestralSet(network_model, [id], network_adjacency) : null);
+	}
+
+	// Canvas -> panel: focus is `hovered ?? selected`, like `NetworkView`, so hovering out falls
+	// back to the selection.
+	let network_hovered_id: string | null = $state(null);
+	let network_selected_id: string | null = $state(null);
+	let network_focus_id = $derived(network_hovered_id ?? network_selected_id);
+
+	function handle_network_hover(id: string | null) {
+		network_hovered_id = id;
+	}
+
+	function handle_network_select(id: string | null) {
+		network_selected_id = id;
+	}
+
+	// Highlight the focused node's descendant closure (including itself), in the same store the
+	// panel -> canvas direction uses.
+	$effect(() => {
+		const id = network_focus_id;
+		if (id === null || !network_model || !network_adjacency) {
+			network_influenced_objectives = new Set();
+			network_highlight.set(null);
+			return;
+		}
+		const forward = new Set([id, ...descendants(network_model, id, network_adjacency)]);
+		network_influenced_objectives = new Set(
+			[...forward].filter((nodeId) => network_objective_ids.has(nodeId))
+		);
+		network_highlight.set(forward);
+	});
+
+	// Reset highlight state when the dialog closes (closing may not fire `mouseleave`).
+	// `<NetworkPanel>` is unmounted on close, so its own state resets by itself.
+	$effect(() => {
+		if (!show_network_dialog) {
+			network_hovered_id = null;
+			network_selected_id = null;
+			network_highlight.set(null);
+			network_influenced_objectives = new Set();
+			network_model = null;
+			network_structure_retry_attempted = false;
+		}
+	});
 
 	// Whether the current problem (or the base problem it was combined from) has scenarios at
 	// all — gates whether "Add uncertainty measures" is enabled in the hamburger menu.
@@ -195,14 +644,16 @@
 
 	function open_add_uncertainty_measures() {
 		if (!problem || !scenario_availability?.available) return;
-		pending_scenario_model_id = scenario_availability.scenario_model_id!;
+		pending_problem_id = problem.id;
+		pending_source = scenario_availability.source ?? 'scenario_model';
+		pending_scenario_model_id = scenario_availability.scenario_model_id ?? null;
 		pending_objective_symbols = scenario_availability.objective_symbols ?? [];
-		const applied = scenario_availability.applied_measures ?? [];
-		selected_measures =
-			applied.length > 0
-				? [...(applied as MeasureType[])]
-				: ['expected_value', 'worst_case_robust'];
-		cvar_alpha = 0.95;
+		pending_measure_types = scenario_availability.measure_types ?? [];
+		selected_measures = preselectedMeasures(
+			scenario_availability.applied_measures ?? [],
+			pending_measure_types
+		);
+		cvar_alpha = 0.05;
 		combined_problem_name = `${problem.name} (combined)`;
 		scenario_setup_mode = 'reopen';
 		show_scenario_setup_dialog = true;
@@ -245,6 +696,28 @@
 
 	let hasUtopiaMetadata = $state(false);
 	let hasSolutionDescription = $state(false);
+
+	// Problem-specific visualizations beside the main chart, one tab each.
+	let custom_visualization_tab = $state('');
+	let custom_visualization_tabs = $derived.by(() => {
+		const tabs: VisualizationTab[] = [];
+		if (hasUtopiaMetadata) tabs.push({ id: 'map', label: 'Map', content: utopia_map_tab });
+		if (hasSolutionDescription) {
+			tabs.push({ id: 'description', label: 'Explanation', content: solution_description_tab });
+		}
+		if (network_kind !== null) tabs.push({ id: 'network', label: 'Network', content: network_tab });
+		return tabs;
+	});
+	// The network tab follows the selected solution, else the first current one (else, for a
+	// stationary problem, the status quo).
+	let network_tab_solution_ref = $derived.by((): NetworkSolutionRef | null => {
+		const solution =
+			chosen_solutions[selected_iteration_index[0]] ??
+			(network_kind === 'stationary' ? undefined : current_state.current_solutions?.[0]);
+		return solution
+			? { stateId: solution.state_id, solutionIndex: solution.solution_index ?? 0 }
+			: null;
+	});
 	let solutionDescription = $state<string | null>(null);
 
 	let mapStates: MapState[] = $state([]);
@@ -294,33 +767,36 @@
 
 	async function confirm_scenario_setup() {
 		show_scenario_setup_dialog = false;
-		if (!problem) return;
 		if (selected_measures.length === 0) {
 			// No measures chosen — treat as "use plain problem". Only meaningful on first load;
 			// reopening from the menu with nothing selected is just a no-op cancel.
-			if (scenario_setup_mode === 'initial') {
-				const plainResult = await initializeCumulusStateRequest(problem.id, true);
-				if (plainResult) await apply_initialization_result(plainResult);
-				await refresh_scenario_availability();
-			}
+			if (scenario_setup_mode === 'initial') await use_problem_as_is();
 			return;
 		}
+		const hypothetical = pending_hypothetical;
+		pending_hypothetical = false;
 		const measure_options: MeasureOptions = { cvar_alpha };
+		// In the order of `AVAILABLE_MEASURES`, whatever order they were picked in.
+		const order = (m: MeasureType) => {
+			const i = AVAILABLE_MEASURES.findIndex((a) => a.value === m);
+			return i < 0 ? AVAILABLE_MEASURES.length : i;
+		};
+		const measures = [...selected_measures].sort((a, b) => order(a) - order(b));
 		const scenarioResult =
 			scenario_setup_mode === 'initial'
 				? await initializeCumulusStateWithScenariosRequest(
-						problem.id,
+						pending_problem_id,
 						pending_scenario_model_id,
 						pending_objective_symbols,
-						selected_measures,
+						measures,
 						measure_options,
 						combined_problem_name.trim() ? combined_problem_name.trim() : undefined
 					)
 				: await applyScenarioMeasuresRequest(
-						problem.id,
+						pending_problem_id,
 						pending_scenario_model_id,
 						pending_objective_symbols,
-						selected_measures,
+						measures,
 						measure_options,
 						combined_problem_name.trim() ? combined_problem_name.trim() : undefined
 					);
@@ -329,23 +805,45 @@
 			show_objectives_dialog = true;
 			await refresh_scenario_availability();
 		}
+		if (hypothetical) finish_hypothetical_setup(scenarioResult !== null);
 	}
 
 	async function cancel_scenario_setup() {
 		show_scenario_setup_dialog = false;
-		if (!problem) return;
-		if (scenario_setup_mode === 'initial') {
-			const plainResult = await initializeCumulusStateRequest(problem.id, true);
-			if (plainResult) await apply_initialization_result(plainResult);
-			await refresh_scenario_availability();
+		if (scenario_setup_mode === 'initial') await use_problem_as_is();
+	}
+
+	async function use_problem_as_is() {
+		const hypothetical = pending_hypothetical;
+		pending_hypothetical = false;
+		const plainResult = await initializeCumulusStateRequest(pending_problem_id, true);
+		if (plainResult) await apply_initialization_result(plainResult);
+		await refresh_scenario_availability();
+		if (hypothetical) finish_hypothetical_setup(plainResult !== null);
+	}
+
+	function finish_hypothetical_setup(succeeded: boolean) {
+		if (succeeded) {
+			switched_to_hypothetical();
+			return;
 		}
+		return_to_network_dialog($errorMessage ?? 'Setting up the new problem failed.');
+		errorMessage.set(null);
+	}
+
+	// Called only for user dismissal (Esc, outside click, close button), which is blocked unless
+	// `scenario_setup_dismissible`.
+	function handle_scenario_setup_dismissed(open: boolean) {
+		if (open || !pending_hypothetical) return;
+		pending_hypothetical = false;
+		return_to_network_dialog();
 	}
 
 	function confirm_finish() {
 		const selectedSolution = chosen_solutions[selectedIndexes[0]];
 		const final_solution = { ...selectedSolution };
 		const solutionName =
-			blankToNull(selectedSolution.name) ?? `Solution #${selectedIndexes[0] + 1}`;
+			blankToNull(selectedSolution.name) ?? default_solution_name(selectedSolution);
 
 		openConfirmDialog({
 			title: 'Confirm Final Choice',
@@ -383,12 +881,18 @@
 		check_scenario_availability as checkScenarioAvailabilityRequest,
 		apply_scenario_measures as applyScenarioMeasuresRequest,
 		set_objective_constraints as setObjectiveConstraintsRequest,
+		create_hypothetical as createHypotheticalRequest,
+		default_solution_name,
 		get_objective_constraints as getObjectiveConstraintsRequest,
+		preselected_measures as preselectedMeasures,
 		type MeasureType,
 		type MeasureOptions
 	} from './handlers';
 	import { getProblemProblemProblemIdGet } from '$lib/gen/endpoints/DESDEOFastAPI';
-	import type { CumulusScenarioAvailabilityResponse } from '$lib/gen/endpoints/DESDEOFastAPI';
+	import type {
+		CumulusScenarioAvailabilityResponse,
+		CumulusScenarioSetupResponseSource
+	} from '$lib/gen/endpoints/DESDEOFastAPI';
 	import EndStateView from '../GNIMBUS/components/EndStateView.svelte';
 
 	async function handle_intermediate() {
@@ -654,7 +1158,7 @@
 
 			if (problem) {
 				hasUtopiaMetadata = checkUtopiaMetadata(problem);
-				hasSolutionDescription = !hasUtopiaMetadata && checkSolutionDescription(problem);
+				hasSolutionDescription = checkSolutionDescription(problem);
 
 				await initialize_cumulus_state(problem.id);
 			}
@@ -666,13 +1170,7 @@
 		if (!result) return;
 
 		if (result.response_type === 'cumulus.scenario_setup') {
-			pending_scenario_model_id = result.scenario_model_id!;
-			pending_objective_symbols = result.objective_symbols!;
-			selected_measures = ['expected_value', 'worst_case_robust'];
-			cvar_alpha = 0.95;
-			combined_problem_name = problem ? `${problem.name} (combined)` : '';
-			scenario_setup_mode = 'initial';
-			show_scenario_setup_dialog = true;
+			open_initial_scenario_setup(problem_id, problem?.name ?? '', result);
 			return;
 		}
 
@@ -680,15 +1178,40 @@
 		await refresh_scenario_availability();
 	}
 
+	// Opens the setup dialog for a problem that has scenarios but no measures chosen yet.
+	// `applied` are the measures to preselect, e.g. the ones on the problem a hypothetical came from.
+	function open_initial_scenario_setup(
+		problem_id: number,
+		problem_name: string,
+		result: Response,
+		applied: string[] = []
+	) {
+		pending_problem_id = problem_id;
+		pending_source = result.source ?? 'scenario_model';
+		pending_scenario_model_id = result.scenario_model_id ?? null;
+		pending_objective_symbols = result.objective_symbols ?? [];
+		pending_measure_types = result.measure_types ?? [];
+		selected_measures = preselectedMeasures(applied, pending_measure_types);
+		cvar_alpha = 0.05;
+		combined_problem_name = problem_name ? `${problem_name} (combined)` : '';
+		scenario_setup_mode = 'initial';
+		show_scenario_setup_dialog = true;
+	}
+
 	async function apply_initialization_result(result: Response) {
 		// If the backend built a combined scenario problem, switch to it so all subsequent
-		// requests (solve, save, finalize…) target the right problem and its objectives.
-		if (result.problem_id && problem && result.problem_id !== problem.id) {
+		// requests (solve, save, finalize…) target the right problem and its objectives. Also
+		// refetch if the held problem is missing ideal/nadir, since `/initialize` may have just
+		// estimated and persisted them.
+		const problem_changed = result.problem_id && problem && result.problem_id !== problem.id;
+		const bounds_incomplete =
+			problem?.objectives.some((o) => o.ideal == null || o.nadir == null) ?? false;
+		if (result.problem_id && problem && (problem_changed || bounds_incomplete)) {
 			const resp = await getProblemProblemProblemIdGet(result.problem_id);
 			if (resp.status === 200 && resp.data) {
 				problem = resp.data;
 				hasUtopiaMetadata = checkUtopiaMetadata(problem);
-				hasSolutionDescription = !hasUtopiaMetadata && checkSolutionDescription(problem);
+				hasSolutionDescription = checkSolutionDescription(problem);
 				active_objective_symbols = new Set(problem.objectives.map((o) => o.symbol));
 			}
 		}
@@ -766,6 +1289,47 @@
 	/>
 {/if}
 
+{#snippet utopia_map_tab()}
+	<UtopiaMap
+		mapOptions={mapState.mapOptions}
+		bind:selectedPeriod={mapState.selectedPeriod}
+		yearlist={mapState.yearlist}
+		geoJSON={mapState.geoJSON}
+		mapName={mapState.mapName}
+		mapDescription={mapState.mapDescription}
+	/>
+{/snippet}
+
+{#snippet solution_description_tab()}
+	<SolutionDescriptionPanel description={solutionDescription} />
+{/snippet}
+
+{#snippet network_tab()}
+	{#if problem}
+		<div class="flex h-full min-h-0 flex-col gap-2 p-2">
+			<div class="flex items-center justify-between gap-2 text-xs">
+				<span class="text-muted-foreground"
+					>{network_kind === 'stationary' && !network_tab_solution_ref
+						? 'Status-quo policy: no solution is selected.'
+						: 'Policy and expected utilities of the selected solution.'}</span
+				>
+				<Button variant="outline" size="sm" onclick={() => (show_network_dialog_real = true)}>
+					Explore
+				</Button>
+			</div>
+			<div class="min-h-0 flex-1">
+				<NetworkPanel
+					modelId={network_real_model_id ?? problem.id}
+					kind={network_kind ?? 'graphical'}
+					decisionMode="manual"
+					policySolution={network_tab_solution_ref}
+					readonly
+				/>
+			</div>
+		</div>
+	{/if}
+{/snippet}
+
 {#if mode === 'final'}
 	<BaseLayout showLeftSidebar={false} showRightSidebar={false} bottomPanelTitle="Final Solution">
 		{#snippet visualizationArea()}
@@ -787,22 +1351,13 @@
 							/>
 						</Resizable.Pane>
 
-						{#if hasUtopiaMetadata}
+						{#if custom_visualization_tabs.length > 0}
 							<ResizableHandle withHandle class="border-l border-gray-200 shadow-sm" />
 							<Resizable.Pane defaultSize={35} minSize={20} class="h-full">
-								<UtopiaMap
-									mapOptions={mapState.mapOptions}
-									bind:selectedPeriod={mapState.selectedPeriod}
-									yearlist={mapState.yearlist}
-									geoJSON={mapState.geoJSON}
-									mapName={mapState.mapName}
-									mapDescription={mapState.mapDescription}
+								<VisualizationTabs
+									tabs={custom_visualization_tabs}
+									bind:value={custom_visualization_tab}
 								/>
-							</Resizable.Pane>
-						{:else if hasSolutionDescription}
-							<ResizableHandle withHandle class="border-l border-gray-200 shadow-sm" />
-							<Resizable.Pane defaultSize={35} minSize={20} class="h-full">
-								<SolutionDescriptionPanel description={solutionDescription} />
 							</Resizable.Pane>
 						{/if}
 					</Resizable.PaneGroup>
@@ -933,6 +1488,20 @@
 					>
 						Add uncertainty measures
 					</DropdownMenu.Item>
+					<DropdownMenu.Item>Modify problem</DropdownMenu.Item>
+					{#if network_kind !== null}
+						<!-- Shown when the current problem was compiled from a graphical model or a
+						     stationary diagram. -->
+						<DropdownMenu.Item onclick={() => (show_network_dialog_real = true)}>
+							View network structure
+						</DropdownMenu.Item>
+					{/if}
+					{#if dev}
+						<!-- Dev-only network demo, hidden in production builds. -->
+						<DropdownMenu.Item onclick={() => (show_network_dialog = true)}>
+							View network structure (demo)
+						</DropdownMenu.Item>
+					{/if}
 				</DropdownMenu.Content>
 			</DropdownMenu.Root>
 		{/snippet}
@@ -960,22 +1529,13 @@
 							/>
 						</Resizable.Pane>
 
-						{#if mode === 'iterate' && hasUtopiaMetadata}
-							<ResizableHandle withHandle class=" border-4 border-gray-200 shadow-sm" />
-							<Resizable.Pane defaultSize={35} minSize={20} class="h-full">
-								<UtopiaMap
-									mapOptions={mapState.mapOptions}
-									bind:selectedPeriod={mapState.selectedPeriod}
-									yearlist={mapState.yearlist}
-									geoJSON={mapState.geoJSON}
-									mapName={mapState.mapName}
-									mapDescription={mapState.mapDescription}
-								/>
-							</Resizable.Pane>
-						{:else if mode === 'iterate' && hasSolutionDescription}
+						{#if mode === 'iterate' && custom_visualization_tabs.length > 0}
 							<ResizableHandle withHandle class="border-4 border-gray-200 shadow-sm" />
 							<Resizable.Pane defaultSize={35} minSize={20} class="h-full">
-								<SolutionDescriptionPanel description={solutionDescription} />
+								<VisualizationTabs
+									tabs={custom_visualization_tabs}
+									bind:value={custom_visualization_tab}
+								/>
 							</Resizable.Pane>
 						{/if}
 					</Resizable.PaneGroup>
@@ -998,6 +1558,8 @@
 					handle_row_click={handle_solution_click}
 					{isSaved}
 					{selected_type_solutions}
+					defaultName={default_solution_name}
+					showIterationColumn={false}
 					secondaryObjectiveValues={selected_type_solutions === 'current'
 						? problem
 							? [
@@ -1068,21 +1630,35 @@
 {/if}
 
 <!-- Scenario setup dialog -->
-<Dialog.Root bind:open={show_scenario_setup_dialog}>
+<Dialog.Root bind:open={show_scenario_setup_dialog} onOpenChange={handle_scenario_setup_dismissed}>
 	<Dialog.Portal>
 		<Dialog.Overlay />
-		<Dialog.Content class="max-w-sm">
+		<Dialog.Content
+			class={scenario_setup_dismissible ? 'max-w-sm' : 'max-w-sm [&_[data-dialog-close]]:hidden'}
+			escapeKeydownBehavior={scenario_setup_dismissible ? 'close' : 'ignore'}
+			interactOutsideBehavior={scenario_setup_dismissible ? 'close' : 'ignore'}
+		>
 			<Dialog.Header>
 				<Dialog.Title>
-					{scenario_setup_mode === 'initial'
-						? 'Scenario-based Problem Detected'
-						: 'Add Uncertainty Measures'}
+					{scenario_setup_mode === 'reopen'
+						? 'Add Uncertainty Measures'
+						: pending_source === 'graphical'
+							? 'Problem with Uncertain Outcomes Detected'
+							: 'Scenario-based Problem Detected'}
 				</Dialog.Title>
 				<Dialog.Description>
-					{scenario_setup_mode === 'initial'
-						? 'This problem has associated scenarios. Select which uncertainty measures to include in the combined problem. At least one measure is recommended.'
-						: 'Select which uncertainty measures to include. Rebuilding replaces the current combined problem and restarts the method against it; your earlier solutions stay available under the previous problem.'}
+					{scenario_setup_mode === 'reopen'
+						? 'Select which uncertainty measures to include. Rebuilding replaces the current combined problem and restarts the method against it; your earlier solutions stay available under the previous problem.'
+						: pending_source === 'graphical'
+							? 'This problem was compiled from a graphical model with uncertain outcomes. Select which uncertainty measures to include. At least one measure is recommended.'
+							: 'This problem has associated scenarios. Select which uncertainty measures to include in the combined problem. At least one measure is recommended.'}
 				</Dialog.Description>
+				{#if pending_source === 'graphical'}
+					<p class="text-muted-foreground text-xs">
+						The chosen measures replace the original objectives, including any compiled risk-measure
+						objectives.
+					</p>
+				{/if}
 			</Dialog.Header>
 			<div class="space-y-3 py-4">
 				<div class="flex flex-col gap-1">
@@ -1094,7 +1670,7 @@
 						class="rounded border px-2 py-1 text-sm"
 					/>
 				</div>
-				{#each AVAILABLE_MEASURES as measure (measure.value)}
+				{#each offered_measures as measure (measure.value)}
 					{@const isChecked = selected_measures.includes(measure.value)}
 					{@const checkboxId = `measure-checkbox-${measure.value}`}
 					<div class="flex items-center gap-3">
@@ -1113,7 +1689,7 @@
 				{#if selected_measures.includes('conditional_value_at_risk')}
 					<div class="flex items-center gap-3 pl-7">
 						<label for="cvar-alpha-input" class="text-muted-foreground text-sm"
-							>CVaR confidence level (α)</label
+							>CVaR tail probability (α)</label
 						>
 						<input
 							id="cvar-alpha-input"
@@ -1124,6 +1700,7 @@
 							bind:value={cvar_alpha}
 							class="w-20 rounded border px-2 py-1 text-sm"
 						/>
+						<span class="text-muted-foreground text-xs">0.05 = average of the worst 5 %</span>
 					</div>
 				{/if}
 			</div>
@@ -1132,9 +1709,8 @@
 					{scenario_setup_mode === 'initial' ? 'Use problem as-is' : 'Cancel'}
 				</Button>
 				<Button variant="default" onclick={confirm_scenario_setup}>
-					{scenario_setup_mode === 'initial'
-						? 'Build combined problem'
-						: 'Rebuild combined problem'}
+					{scenario_setup_mode === 'initial' ? 'Build' : 'Rebuild'}
+					{pending_source === 'graphical' ? 'problem with these measures' : 'combined problem'}
 				</Button>
 			</Dialog.Footer>
 		</Dialog.Content>
@@ -1313,6 +1889,321 @@
 			<Dialog.Footer>
 				<Dialog.Close>
 					<Button variant="default">Done</Button>
+				</Dialog.Close>
+			</Dialog.Footer>
+		</Dialog.Content>
+	</Dialog.Portal>
+</Dialog.Root>
+
+<!-- Network structure dialog (demo) -->
+<Dialog.Root bind:open={show_network_dialog}>
+	<Dialog.Portal>
+		<Dialog.Overlay />
+		<Dialog.Content class="flex h-[85vh] w-[95vw] max-w-[95vw] flex-col gap-3 sm:max-w-[95vw]">
+			<Dialog.Header>
+				<Dialog.Title>Network structure (demo)</Dialog.Title>
+				<Dialog.Description>
+					Preview of the reusable graphical-model network component embedded in CUMULUS. This is a
+					real, live diagram now -- compiled server-side (`POST /graphical/demo/irrigation`, the
+					same compiler `/graphical/compile` itself uses) from a small irrigation influence diagram
+					(`desdeo/problem/graphical/demo.py`) and driven entirely by the actual `/graphical/*`
+					endpoints: structure, evidence-driven what-if inference, saved evidence sets, and (in
+					Solver mode) a policy decoded from a genuinely solved MILP (`POST /graphical/{network_problem_id}/solve`
+					+ `/policy`). What's still illustrative: this diagram is a fixed, unrelated sample -- not
+					derived from the currently selected optimization problem or its objectives, and it isn't
+					the same diagram `sample-network.ts`'s Storybook story shows (that fixture has an
+					irrigation-decision -> crop-yield arc this backend can't compile directly; see `demo.py`'s
+					own docstring for the reformulation). Try pinning "weather" to see "soil_moisture" respond
+					to a real inference call.
+				</Dialog.Description>
+			</Dialog.Header>
+			<div class="flex flex-wrap items-center gap-3 text-sm">
+				<span class="text-muted-foreground">Decision mode:</span>
+				<SegmentedControl
+					size="sm"
+					bind:value={network_decision_mode_str}
+					options={[
+						{ value: 'manual', label: 'Manual' },
+						{ value: 'solver', label: 'Solver' }
+					]}
+				/>
+				{#if network_flagged.size > 0}
+					<span class="text-muted-foreground">
+						Flagged for follow-up: {[...network_flagged].join(', ')}
+					</span>
+				{/if}
+				{#if network_solve_error}
+					<span class="text-destructive">
+						{network_solve_error} (Solver mode falls back to /whatif's own live policy.)
+					</span>
+				{/if}
+				<Button variant="ghost" size="sm" class="ml-auto" onclick={() => reset_network_demo(true)}>
+					Recompile demo
+				</Button>
+			</div>
+			<div class="flex min-h-0 flex-1 gap-3">
+				<div class="min-h-0 flex-1">
+					{#if network_problem_id !== null}
+						<NetworkPanel
+							modelId={network_problem_id}
+							policySource={network_decision_mode === 'solver' ? network_policy_source : null}
+							decisionMode={network_decision_mode}
+							highlight={$network_highlight}
+							onNodeHover={handle_network_hover}
+							onNodeSelect={handle_network_select}
+							onStructureLoad={handle_network_structure_load}
+							onStructureError={handle_network_structure_error}
+						>
+							{#snippet nodeChrome({ id })}
+								<button
+									type="button"
+									class="bg-background flex size-4 items-center justify-center rounded-full border shadow-sm"
+									title={network_flagged.has(id) ? 'Unflag' : 'Flag for follow-up'}
+									onclick={(e) => {
+										e.stopPropagation();
+										toggle_network_flag(id);
+									}}
+								>
+									<IconFlag
+										class="size-2.5 {network_flagged.has(id)
+											? 'text-primary'
+											: 'text-muted-foreground'}"
+									/>
+								</button>
+							{/snippet}
+						</NetworkPanel>
+					{:else if network_compile_error}
+						<div class="text-destructive flex h-full items-center justify-center text-sm">
+							{network_compile_error}
+							<Button variant="outline" size="sm" class="ml-2" onclick={() => reset_network_demo()}>
+								Retry
+							</Button>
+						</div>
+					{:else}
+						<div class="text-muted-foreground flex h-full items-center justify-center text-sm">
+							Compiling demo diagram…
+						</div>
+					{/if}
+				</div>
+				<div class="w-48 shrink-0 space-y-2 overflow-auto">
+					<p class="text-muted-foreground text-xs">
+						(demo) Reference point -- stand-in for a real reference-point widget. Hover an objective
+						to highlight its ancestor subgraph on the canvas; hover a canvas node to see which
+						objectives it can influence.
+					</p>
+					{#each network_reference_point_objectives as node (node.id)}
+						<button
+							type="button"
+							class="block w-full rounded-md border px-2 py-1 text-left text-sm {network_influenced_objectives.has(
+								node.id
+							)
+								? 'border-primary bg-primary/10'
+								: ''}"
+							onmouseenter={() => handle_reference_point_row_hover(node.id)}
+							onmouseleave={() => handle_reference_point_row_hover(null)}
+							onfocus={() => handle_reference_point_row_hover(node.id)}
+							onblur={() => handle_reference_point_row_hover(null)}
+						>
+							{node.label}
+						</button>
+					{/each}
+				</div>
+			</div>
+			<Dialog.Footer>
+				<Dialog.Close>
+					<Button variant="outline">Close</Button>
+				</Dialog.Close>
+			</Dialog.Footer>
+		</Dialog.Content>
+	</Dialog.Portal>
+</Dialog.Root>
+
+<!-- Network structure dialog (current problem). Separate from the demo dialog, which has
+     demo-specific compile/solve controls. -->
+<Dialog.Root bind:open={show_network_dialog_real}>
+	<Dialog.Portal>
+		<Dialog.Overlay />
+		<Dialog.Content class="flex h-[85vh] w-[95vw] max-w-[95vw] flex-col gap-3 sm:max-w-[95vw]">
+			<Dialog.Header>
+				<Dialog.Title>Network structure</Dialog.Title>
+				<Dialog.Description>
+					{#if network_kind === 'stationary'}
+						The stationary diagram this problem was compiled from, with each decision's share of
+						patient-steps under the selected solution's randomised policy, or the status quo when no
+						solution is selected. Pinning states conditions on observed patient-steps.
+					{:else}
+						The graphical model (Bayesian network / influence diagram) this problem was compiled
+						from, read live via the same `/graphical/*` endpoints the demo above uses -- structure,
+						evidence-driven what-if inference, and saved evidence sets, against the problem
+						currently loaded in this session rather than a fixed sample diagram. Exploring evidence
+						here changes nothing; "Explore in CUMULUS" creates a new problem under the evidence on
+						decisions and chance nodes without parents, and switches the method to it.
+					{/if}
+				</Dialog.Description>
+			</Dialog.Header>
+			<div class="min-h-0 flex-1">
+				{#if problem}
+					<NetworkPanel
+						modelId={network_real_model_id ?? problem.id}
+						kind={network_kind ?? 'graphical'}
+						decisionMode="manual"
+						policySolution={network_real_solution_ref}
+						bind:evidence={network_real_evidence}
+						onWhatIfResult={handle_network_real_whatif_result}
+						onWhatIfError={handle_network_real_whatif_error}
+						onStructureLoad={handle_network_real_structure_load}
+						onExploreAssumptions={network_kind === 'graphical'
+							? handle_network_real_explore
+							: undefined}
+						exploreLabel="Explore in CUMULUS"
+						exploring={network_real_exploring}
+						exploreError={network_real_explore_error}
+						aside={network_real_aside}
+						asideAutoSaveId="cumulus-network-aside"
+					/>
+				{/if}
+				{#snippet network_real_aside()}
+					{#if network_kind === 'stationary'}
+						{@render network_stationary_aside()}
+					{:else}
+						<div class="space-y-3 text-sm">
+							<div class="space-y-1">
+								<p class="text-muted-foreground text-xs font-medium">Expected utilities</p>
+								{#if network_real_unpinned.length > 0}
+									<p class="text-muted-foreground text-xs">
+										Pin every decision to see utilities; unpinned: {network_real_unpinned.join(
+											', '
+										)}.
+									</p>
+								{:else if network_real_off_policy_labels.length > 0}
+									<p class="text-muted-foreground text-xs">
+										Your pins moved {network_real_off_policy_labels.join(', ')} off the solution's path;
+										pin
+										{network_real_off_policy_labels.join(', ')} too to see utilities.
+									</p>
+								{:else}
+									{#each network_real_objectives as { node, maximize } (node.id)}
+										{@const mean = network_real_result?.utilities?.[node.id]}
+										<div class="rounded-md border px-2 py-1">
+											<div class="flex items-center gap-1">
+												{#if maximize === true}
+													<IconArrowUp class="size-3 shrink-0" />
+												{:else if maximize === false}
+													<IconArrowDown class="size-3 shrink-0" />
+												{/if}
+												<span class="truncate" title={node.label}>{node.label}</span>
+											</div>
+											<div class="text-muted-foreground text-xs tabular-nums">
+												{mean != null
+													? formatUtility(mean, network_real_result?.utilityStdDevs?.[node.id])
+													: '–'}
+											</div>
+										</div>
+									{/each}
+								{/if}
+							</div>
+							{#if network_real_decisions.length > 0}
+								<div class="space-y-1">
+									<p class="text-muted-foreground text-xs font-medium">Decisions</p>
+									{#each network_real_decisions as decision (decision.id)}
+										<div class="rounded-md border px-2 py-1">
+											<div class="truncate" title={decision.label}>
+												{decision.label}{decision.state
+													? `: ${decision.state}`
+													: network_real_possible_states[decision.id]
+														? `: ${network_real_possible_states[decision.id]}`
+														: ''}
+											</div>
+											<div class="text-muted-foreground text-xs">
+												{#if decision.source === 'pinned'}
+													pinned
+												{:else if decision.source === 'off-policy'}
+													off the solution's path — pin it
+												{:else if decision.source === 'solution'}
+													from solution {network_real_solution?.name ?? ''}
+												{:else if decision.dependsOn.length > 0}
+													unresolved — depends on {decision.dependsOn.join(', ')}
+												{:else}
+													unresolved
+												{/if}
+											</div>
+										</div>
+									{/each}
+								</div>
+							{/if}
+						</div>
+					{/if}
+				{/snippet}
+				{#snippet network_stationary_aside()}
+					{@const stationary = network_real_result?.stationary}
+					<div class="space-y-3 text-sm">
+						{#if network_real_error}
+							<p class="text-destructive text-xs">
+								The last request failed: {network_real_error}{network_real_result_context
+									? '; showing the previous result'
+									: ''}.
+							</p>
+						{/if}
+						<p class="text-muted-foreground text-xs">{network_stationary_policy_label}</p>
+						<div class="space-y-1">
+							<p class="text-muted-foreground text-xs font-medium">
+								{network_stationary_has_solution ? "Solution's" : "Status quo's"} per-step values (unconditional{stationary
+									? `, discount ${stationary.discount}`
+									: ''})
+							</p>
+							{#each network_real_objectives as { node, symbol, maximize } (node.id)}
+								{@const value = symbol !== undefined ? stationary?.objectives[symbol] : undefined}
+								<div class="rounded-md border px-2 py-1">
+									<div class="flex items-center gap-1">
+										{#if maximize === true}
+											<IconArrowUp class="size-3 shrink-0" />
+										{:else if maximize === false}
+											<IconArrowDown class="size-3 shrink-0" />
+										{/if}
+										<span class="truncate" title={node.label}>{node.label}</span>
+									</div>
+									<div class="text-muted-foreground text-xs tabular-nums">
+										{value != null ? formatUtility(value) : '–'}
+									</div>
+								</div>
+							{/each}
+						</div>
+						{#if network_real_shares.length > 0}
+							<div class="space-y-1">
+								<p class="text-muted-foreground text-xs font-medium">Decisions</p>
+								<p class="text-muted-foreground text-xs">
+									Action shares: {network_stationary_shares_label}.
+								</p>
+								{#each network_real_shares as decision (decision.id)}
+									<div class="rounded-md border px-2 py-1">
+										<div class="truncate" title={decision.label}>{decision.label}</div>
+										<div class="text-muted-foreground text-xs tabular-nums">
+											{decision.shares.length > 0
+												? decision.shares
+														.map((s) => `${s.state} ${formatShare(s.share)}`)
+														.join(' · ')
+												: '–'}
+										</div>
+										{#if decision.arrivalShares}
+											<div class="text-muted-foreground text-xs tabular-nums">
+												Arrival share q: {decision.arrivalShares
+													.map((s) => `${s.state} ${formatShare(s.share)}`)
+													.join(' · ')}
+											</div>
+										{/if}
+									</div>
+								{/each}
+							</div>
+						{/if}
+						<p class="text-muted-foreground text-xs">
+							Pins condition on observed patient-steps; they don't change the policy.
+						</p>
+					</div>
+				{/snippet}
+			</div>
+			<Dialog.Footer>
+				<Dialog.Close>
+					<Button variant="outline">Close</Button>
 				</Dialog.Close>
 			</Dialog.Footer>
 		</Dialog.Content>

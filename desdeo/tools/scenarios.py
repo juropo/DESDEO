@@ -9,6 +9,7 @@ from desdeo.problem.schema import (
     Objective,
     Problem,
     ScalarizationFunction,
+    SparseTensorConstant,
     TensorConstant,
     TensorVariable,
     Variable,
@@ -223,12 +224,12 @@ def leaf_expr(info: _ElemResolution, leaf: str) -> "str | list":
     return next((e.func for e in info.elem_list if e.symbol == leaf_sym), leaf_sym)
 
 
-def _symbols_in(node) -> set[str]:
+def symbols_in(node) -> set[str]:
     """Collect every symbol referenced in a MathJSON node, ignoring operator keywords."""
     if isinstance(node, str):
         return set() if node in _RESERVED else {node}
     if isinstance(node, list):
-        return {symbol for child in node for symbol in _symbols_in(child)}
+        return {symbol for child in node for symbol in symbols_in(child)}
     return set()
 
 
@@ -263,7 +264,7 @@ def require_no_forward_references(info: _ElemResolution, combined: "Problem") ->
         func = next((e.func for e in info.elem_list if e.symbol == leaf_sym), None)
         if func is None:
             continue
-        used = _symbols_in(func)
+        used = symbols_in(func)
         for symbols in later_kinds.values():
             if referenced := sorted(used & symbols):
                 msg = (
@@ -309,6 +310,7 @@ def append_aggregated_elem(
     func: Any,
     description: "str | None" = None,
     maximize: bool = False,
+    unit: "str | None" = None,
     is_linear: bool = False,
     is_convex: bool = False,
     is_twice_differentiable: bool = False,
@@ -317,7 +319,7 @@ def append_aggregated_elem(
 
     Appends an Objective if found_type is 'objectives', a ScalarizationFunction if
     'scalarization_funcs', and an ExtraFunction for everything else.
-    ``description`` and ``maximize`` are only used for objectives.
+    ``description``, ``maximize`` and ``unit`` are only used for objectives.
     """
     if found_type == "objectives":
         new_objectives.append(
@@ -327,6 +329,7 @@ def append_aggregated_elem(
                 symbol=symbol,
                 func=func,
                 maximize=maximize,
+                unit=unit,
                 is_linear=is_linear,
                 is_convex=is_convex,
                 is_twice_differentiable=is_twice_differentiable,
@@ -474,7 +477,7 @@ def _to_hashable(value: Any) -> Any:
     return value
 
 
-def _constant_value_key(const: Constant | TensorConstant) -> Any:
+def _constant_value_key(const: Constant | TensorConstant | SparseTensorConstant) -> Any:
     """Return a hashable representation of a constant's value(s), for equality comparison.
 
     ``Constant`` stores a single scalar in ``.value``. ``TensorConstant`` stores its data in
@@ -483,6 +486,8 @@ def _constant_value_key(const: Constant | TensorConstant) -> Any:
     """
     if isinstance(const, TensorConstant):
         return _to_hashable(const.get_values())
+    if isinstance(const, SparseTensorConstant):
+        return (_to_hashable(const.shape), _to_hashable(const.indices), _to_hashable(const.values))
     return const.value
 
 
@@ -537,6 +542,7 @@ def _combine_elements(
     scenario_problems: dict[str, Problem],
     var_maps: dict[str, dict[str, str]],
     const_maps: dict[str, dict[str, str]],
+    *,
     get_list: callable,
     make_update: callable,
     extra_leaf_maps: "dict[str, dict[str, str]] | None" = None,
@@ -749,7 +755,13 @@ def build_combined_scenario_problem(
 
     def _combine(get_list, extra_maps=None):
         return _combine_elements(
-            leaf_scenarios, scenario_problems, var_maps, const_maps, get_list, _name_update, extra_maps
+            leaf_scenarios,
+            scenario_problems,
+            var_maps,
+            const_maps,
+            get_list=get_list,
+            make_update=_name_update,
+            extra_leaf_maps=extra_maps,
         )
 
     def _renames(symbol_map, *, with_min: bool = False) -> dict[str, dict[str, str]]:

@@ -32,6 +32,7 @@ from pydantic import (
     model_validator,
 )
 from pydantic_core import PydanticCustomError
+from scipy.sparse import csr_array, sparray
 
 from desdeo.problem.infix_parser import InfixExpressionParser
 
@@ -365,6 +366,71 @@ class TensorConstant(BaseModel):
         return Constant(name=name, symbol=symbol, value=value)
 
 
+class SparseTensorConstant(BaseModel):
+    """Model for a sparse vector or matrix of constant values, stored in coordinate (COO) format.
+
+    A sparse constant may only appear as the left operand of `MatMul`, or be multiplied by a scalar.
+    """
+
+    model_config = ConfigDict(frozen=True, from_attributes=True, extra="forbid")
+
+    name: str = Field(description="Descriptive name of the sparse tensor. E.g., 'transition kernel'.")
+    """Descriptive name of the sparse tensor. E.g., 'transition kernel'."""
+    symbol: str = Field(
+        description="Symbol to represent the constant. This will be used in the rest of the problem definition."
+    )
+    """Symbol to represent the constant. This will be used in the rest of the problem definition."""
+    shape: list[int] = Field(
+        description="The dimensions of the tensor, with one or two axes. E.g., `[2, 3]` is a 2 by 3 matrix."
+    )
+    """The dimensions of the tensor, with one or two axes. E.g., `[2, 3]` is a 2 by 3 matrix."""
+    indices: list[list[int]] = Field(
+        description=(
+            "The 0-based coordinates of the stored entries, one list per axis, all of the same length."
+            " E.g., `[[0, 1], [2, 0]]` stores the entries at (0, 2) and (1, 0)."
+        )
+    )
+    """The 0-based coordinates of the stored entries, one list per axis, all of the same length.
+    E.g., `[[0, 1], [2, 0]]` stores the entries at (0, 2) and (1, 0)."""
+    values: list[float] = Field(description="The values of the stored entries, in the order of `indices`.")
+    """The values of the stored entries, in the order of `indices`."""
+
+    @model_validator(mode="after")
+    def _check_coordinates(self) -> Self:
+        """Check the shape, and that the coordinates are within bounds and unique."""
+        if len(self.shape) not in (1, 2) or any(dim <= 0 for dim in self.shape):
+            msg = f"The shape of '{self.symbol}' must have one or two positive axes, got {self.shape}."
+            raise ValueError(msg)
+        if len(self.indices) != len(self.shape):
+            msg = f"'{self.symbol}' needs one index list per axis ({len(self.shape)}), got {len(self.indices)}."
+            raise ValueError(msg)
+        if any(len(axis) != len(self.values) for axis in self.indices):
+            msg = f"The index lists and values of '{self.symbol}' must all have the same length."
+            raise ValueError(msg)
+        for axis, (axis_indices, dim) in enumerate(zip(self.indices, self.shape, strict=True)):
+            if any(i < 0 or i >= dim for i in axis_indices):
+                msg = f"An index on axis {axis} of '{self.symbol}' is out of bounds for size {dim}."
+                raise ValueError(msg)
+        if len(set(zip(*self.indices, strict=True))) != len(self.values):
+            msg = f"'{self.symbol}' has duplicate coordinates."
+            raise ValueError(msg)
+        return self
+
+    def to_scipy(self) -> csr_array:
+        """Return the constant as a CSR array, of shape `(1, n)` for a vector and `shape` for a matrix."""
+        if len(self.shape) == 1:
+            return csr_array((self.values, ([0] * len(self.values), self.indices[0])), shape=(1, self.shape[0]))
+        return csr_array((self.values, tuple(self.indices)), shape=tuple(self.shape))
+
+    def to_scipy_operand(self) -> sparray:
+        """Return the constant as used in expressions: a 1-D sparse array for a vector, CSR for a matrix."""
+        return self.to_scipy()[0] if len(self.shape) == 1 else self.to_scipy()
+
+    def to_dense(self) -> np.ndarray:
+        """Return the constant as a dense numpy array of shape `shape`."""
+        return self.to_scipy().toarray().reshape(self.shape)
+
+
 class Variable(BaseModel):
     """Model for a variable."""
 
@@ -641,9 +707,7 @@ class ExtraFunction(BaseModel):
     )
     """Whether the function expression is twice differentiable or not. Defaults to `False`"""
     _parse_infix_to_func = field_validator("func", mode="before")(parse_infix_to_func)
-    _enforce_linear_implies_convex_and_smooth = model_validator(mode="before")(
-        enforce_linear_implies_convex_and_smooth
-    )
+    _enforce_linear_implies_convex_and_smooth = model_validator(mode="before")(enforce_linear_implies_convex_and_smooth)
 
 
 class ScalarizationFunction(BaseModel):
@@ -688,9 +752,7 @@ class ScalarizationFunction(BaseModel):
     )
     """Whether the function expression is twice differentiable or not. Defaults to `False`"""
     _parse_infix_to_func = field_validator("func", mode="before")(parse_infix_to_func)
-    _enforce_linear_implies_convex_and_smooth = model_validator(mode="before")(
-        enforce_linear_implies_convex_and_smooth
-    )
+    _enforce_linear_implies_convex_and_smooth = model_validator(mode="before")(enforce_linear_implies_convex_and_smooth)
 
 
 class Url(BaseModel):
@@ -873,9 +935,7 @@ class Objective(BaseModel):
     )
     """Whether the function expression is twice differentiable or not. Defaults to `False`"""
     _parse_infix_to_func = field_validator("func", mode="before")(parse_infix_to_func)
-    _enforce_linear_implies_convex_and_smooth = model_validator(mode="before")(
-        enforce_linear_implies_convex_and_smooth
-    )
+    _enforce_linear_implies_convex_and_smooth = model_validator(mode="before")(enforce_linear_implies_convex_and_smooth)
 
 
 class Constraint(BaseModel):
@@ -948,7 +1008,7 @@ class Constraint(BaseModel):
     """A list of paths to models saved on disk. Can be 'None' for if either 'func' or 'simulator_path'
     is not 'None'. If 'None', either 'func' or 'simulator_path' must not be 'None'."""
     is_linear: bool = Field(
-        description="Whether the constraint is linear or not. Defaults to False, e.g., a linearity of constraint is" \
+        description="Whether the constraint is linear or not. Defaults to False, e.g., a linearity of constraint is"
         " not assumed.",
         default=False,
     )
@@ -963,9 +1023,7 @@ class Constraint(BaseModel):
     )
     """Whether the function expression is twice differentiable or not. Defaults to `False`"""
     _parse_infix_to_func = field_validator("func", mode="before")(parse_infix_to_func)
-    _enforce_linear_implies_convex_and_smooth = model_validator(mode="before")(
-        enforce_linear_implies_convex_and_smooth
-    )
+    _enforce_linear_implies_convex_and_smooth = model_validator(mode="before")(enforce_linear_implies_convex_and_smooth)
 
 
 class DiscreteRepresentation(BaseModel):
@@ -1027,9 +1085,11 @@ class Problem(BaseModel):
     @classmethod
     def from_problemdb(cls, db_instance: "ProblemDB") -> "Problem":
         """."""
-        constants = [Constant.model_validate(const) for const in db_instance.constants] + [
-            TensorConstant.model_validate(const) for const in db_instance.tensor_constants
-        ]
+        constants = (
+            [Constant.model_validate(const) for const in db_instance.constants]
+            + [TensorConstant.model_validate(const) for const in db_instance.tensor_constants]
+            + [SparseTensorConstant.model_validate(const) for const in db_instance.sparse_tensor_constants]
+        )
 
         return cls(
             name=db_instance.name,
@@ -1550,7 +1610,7 @@ class Problem(BaseModel):
     """Name of the problem."""
     description: str = Field(description="Description of the problem.")
     """Description of the problem."""
-    constants: list[Constant | TensorConstant] | None = Field(
+    constants: list[Constant | TensorConstant | SparseTensorConstant] | None = Field(
         description="Optional list of the constants present in the problem.", default=None
     )
     """List of the constants present in the problem. Defaults to `None`."""

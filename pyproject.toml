@@ -18,30 +18,31 @@ keywords = [
 ]
 requires-python = ">=3.12,<3.14"
 dependencies = [
-  "numpy >= 2.2.0, < 2.4",        # nevergrad 1.0.12 metamodel does float(model.predict(...)); numpy>=2.4 rejects size-1 ndim>0 -> scalar conversion
-  "scipy >= 1.11.4",
-  "polars >= 1.41",
-  "pyarrow >= 20.0.0",
-  "numba >= 0.61.0",
-  "pydantic >= 2.9",
-  "pydantic-settings >= 2.9",
-  "sympy >= 1.0",
-  "plotly>=6.0",
-  "pyparsing >= 3.0",
-  "nevergrad >= 1.0.12",
-  "bayesian-optimization >= 1.0", # effectively held at 1.4.0: nevergrad 1.0.12 hard-pins bayesian-optimization==1.4.0, so v2/v3 cannot be installed until nevergrad relaxes it
-  "pyomo >= 6.8",
-  "gurobipy >= 12.0.0",
-  "tsp-solver >= 0.1",
-  "greenlet >= 3.1.1",
-  "pymoo >= 0.6.1.2",
-  "shap >= 0.47.0",
-  "requests >= 2.32.0",
-  "cvxpy[scip]>=1.8.0,<1.9",      # 1.9 regresses solver precision apparently?
-  "moocore >= 0.1.7",
-  "websockets>=15.0.1",
-  "coco-experiment>=2.8.2",
-  "imodels>=2.0.4",
+    "numpy >= 2.2.0, < 2.4", # nevergrad 1.0.12 metamodel does float(model.predict(...)); numpy>=2.4 rejects size-1 ndim>0 -> scalar conversion
+    "scipy >= 1.11.4",
+    "polars >= 1.41",
+    "pyarrow >= 20.0.0",
+    "numba >= 0.61.0",
+    "pydantic >= 2.9",
+    "pydantic-settings >= 2.9",
+    "sympy >= 1.0",
+    "plotly>=6.0",
+    "pyparsing >= 3.0",
+    "nevergrad >= 1.0.12",
+    "bayesian-optimization >= 1.0", # effectively held at 1.4.0: nevergrad 1.0.12 hard-pins bayesian-optimization==1.4.0, so v2/v3 cannot be installed until nevergrad relaxes it
+    "pyomo >= 6.8",
+    "gurobipy >= 12.0.0",
+    "tsp-solver >= 0.1",
+    "greenlet >= 3.1.1",
+    "pymoo >= 0.6.1.2",
+    "shap >= 0.47.0",
+    "requests >= 2.32.0",
+    "cvxpy[scip]>=1.8.0,<1.9", # 1.9 regresses solver precision apparently?
+    "moocore >= 0.1.7",
+    "websockets>=15.0.1",
+    "coco-experiment>=2.8.2",
+    "imodels>=2.0.4",
+    "pyagrum>=3.1.1",
 ]
 
 [project.urls]
@@ -284,6 +285,7 @@ markers = [
   "cumulus: tests related to the CUMULUS method.",
   "external: tests related to providers interfacing to external problems.",
   "scenario: tests related to scenario-based optimization.",
+  "graphical: tests related to graphical models (Bayesian networks, influence diagrams).",
   "fixme: tests that are not passing, but maybe should, yet are ignored.",
   "githubskip: skip these tests on GitHub workflows.",
 ]
@@ -304,6 +306,11 @@ filterwarnings = [
   # DeprecationWarning on every prediction (tens of thousands in the scalarization tests). It is a
   # third-party issue in nevergrad, not DESDEO, and cannot be fixed here.
   "ignore:Conversion of an array with ndim",
+  # pyAgrum's SWIG-generated types (SwigPyPacked, SwigPyObject, swigvarlink) lack a __module__
+  # attribute, which importlib warns about on every import. Third-party SWIG binding issue, not
+  # something desdeo/problem/graphical/adapters/pyagrum.py can fix.
+  "ignore:builtin type Swig",
+  "ignore:builtin type swigvarlink",
 ]
 testpaths = ["tests", "desdeo/api/tests"]
 

@@ -5,6 +5,8 @@ from typing import Any, Literal
 from pydantic import BaseModel
 from sqlmodel import JSON, Column, Field, SQLModel
 
+from desdeo.problem.graphical import DiagramAssumptions
+
 from .generic import SolutionInfo
 from .generic_states import SolutionReferenceResponse, SolutionReferenceResponseLite
 from .preference import ReferencePoint
@@ -212,26 +214,46 @@ class SoftConstraintSpec(BaseModel):
     )
 
 
-class UncertaintyMeasureSpec(BaseModel):
-    """Specification for adding a scenario-based uncertainty aggregate to the problem.
+UncertaintyMeasureType = Literal[
+    "expected_value", "worst_case_robust", "conditional_value_at_risk", "weighted_scenarios"
+]
+"""The uncertainty aggregates that can be applied to a problem."""
 
-    All measures in a single request must reference the same ``scenario_model_id``.
-    The resulting combined (multi-scenario) problem replaces the current problem.
+
+class UncertaintyMeasureSpec(BaseModel):
+    """Specification for adding an uncertainty aggregate to the problem.
+
+    The aggregate is taken over either a scenario model (``scenario_model_id`` set) or, when
+    ``scenario_model_id`` is None, the outcome distributions of the problem's graphical model.
+    All measures in a single request must reference the same source. With a scenario model, the
+    resulting combined (multi-scenario) problem replaces the current problem. With a graphical
+    model, the aggregates replace the problem's objectives.
     """
 
-    measure_type: Literal["expected_value", "worst_case_robust", "conditional_value_at_risk", "weighted_scenarios"] = (
-        Field(description="Which uncertainty aggregate to apply.")
+    measure_type: UncertaintyMeasureType = Field(description="Which uncertainty aggregate to apply.")
+    scenario_model_id: int | None = Field(
+        default=None,
+        description=(
+            "DB id of the ScenarioModelDB that defines the scenario structure, "
+            "or None to aggregate over the problem's graphical model."
+        ),
     )
-    scenario_model_id: int = Field(description="DB id of the ScenarioModelDB that defines the scenario structure.")
-    symbols: list[str] = Field(description="Symbols of objectives or functions to aggregate.")
+    symbols: list[str] = Field(min_length=1, description="Symbols of objectives or functions to aggregate.")
     prefix: str | None = Field(
         default=None, description="Prefix for the new aggregate symbols. Defaults vary by measure_type."
     )
     alpha: float | None = Field(
-        default=None, description="Confidence level for CVaR, e.g. 0.95. Required for conditional_value_at_risk."
+        default=None,
+        gt=0,
+        lt=1,
+        description=(
+            "Probability mass of the averaged tail of worst outcomes in the element's own direction, "
+            "e.g. 0.05 for the worst 5 % (often called CVaR 95 %). Required for conditional_value_at_risk."
+        ),
     )
     leaf_weights: dict[str, float] | None = Field(
-        default=None, description="Leaf-name → weight mapping. Required for weighted_scenarios."
+        default=None,
+        description="Leaf-name → weight mapping. Required for weighted_scenarios; not available for a graphical model.",
     )
 
 
@@ -270,6 +292,20 @@ class CumulusModificationRequest(SQLModel):
     modifications: ProblemModification = Field(sa_column=Column(JSON))
 
 
+class CumulusHypotheticalRequest(SQLModel):
+    """Request model for the CUMULUS hypothetical endpoint.
+
+    Creates a new problem from a graphical-model problem under `assumptions`, on top of whatever
+    it already assumes. The response and status polling are those of modify-problem.
+    """
+
+    problem_id: int
+    session_id: int | None = Field(default=None)
+    parent_state_id: int | None = Field(default=None)
+
+    assumptions: DiagramAssumptions = Field(sa_column=Column(JSON))
+
+
 class CumulusModificationResponse(SQLModel):
     """Response from the CUMULUS modify-problem endpoint."""
 
@@ -305,16 +341,27 @@ class CumulusModificationResponse(SQLModel):
     )
 
 
+UncertaintySource = Literal["scenario_model", "graphical"]
+"""Where uncertainty measures are taken over: a scenario model, or a graphical model's outcome distributions."""
+
+
 class CumulusScenarioSetupResponse(SQLModel):
     """Response when the problem has scenarios but no uncertainty measures have been chosen yet.
 
-    The frontend should present this to the decision maker and let them choose which
-    uncertainty aggregates to include, then re-call get-or-initialize with the chosen measures.
+    The scenarios come from a scenario model or from the problem's graphical model. The frontend
+    should present this to the decision maker and let them choose which uncertainty aggregates to
+    include, then re-call get-or-initialize with the chosen measures.
     """
 
     response_type: Literal["cumulus.scenario_setup"] = "cumulus.scenario_setup"
-    scenario_model_id: int = Field(description="DB id of the ScenarioModelDB associated with this problem.")
+    source: UncertaintySource = Field(default="scenario_model", description="Where the scenarios come from.")
+    scenario_model_id: int | None = Field(
+        default=None, description="DB id of the ScenarioModelDB associated with this problem; None for 'graphical'."
+    )
     objective_symbols: list[str] = Field(description="Symbols of the objectives available for aggregation.")
+    measure_types: list[UncertaintyMeasureType] = Field(
+        default_factory=list, description="The uncertainty measure types available for this source."
+    )
 
 
 class CumulusScenarioAvailabilityResponse(SQLModel):
@@ -324,10 +371,14 @@ class CumulusScenarioAvailabilityResponse(SQLModel):
     independently of whether CUMULUS has already been initialized for the problem.
     """
 
-    available: bool = Field(description="Whether the problem has an associated scenario model.")
+    available: bool = Field(description="Whether the problem has an associated scenario model or graphical model.")
+    source: UncertaintySource | None = Field(default=None, description="Where the scenarios come from, if available.")
     base_problem_id: int | None = Field(
         default=None,
-        description="Id of the problem actually carrying the scenario model, found by walking parent_problem_id.",
+        description=(
+            "Id of the problem the measures are applied to, found by walking parent_problem_id: the one "
+            "carrying the scenario model, or the nearest one whose objectives are not yet aggregated."
+        ),
     )
     scenario_model_id: int | None = Field(default=None, description="DB id of the ScenarioModelDB, if available.")
     objective_symbols: list[str] = Field(
@@ -336,6 +387,9 @@ class CumulusScenarioAvailabilityResponse(SQLModel):
     applied_measures: list[str] = Field(
         default_factory=list,
         description="Measure types already present on the current problem's objectives, detected by symbol prefix.",
+    )
+    measure_types: list[UncertaintyMeasureType] = Field(
+        default_factory=list, description="The uncertainty measure types available for this source."
     )
 
 

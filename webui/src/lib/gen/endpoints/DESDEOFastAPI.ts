@@ -6,6 +6,14 @@
  * OpenAPI spec version: 0.1.0
  */
 import { customFetch } from '../../api/new-client';
+/**
+ * Model of the request to change the user's active session.
+ */
+export interface ActivateSessionRequest {
+	/** One of the user's own sessions, or None for none. */
+	session_id?: number | null;
+}
+
 export interface BodyAddNewAnalystAddNewAnalystPost {
 	grant_type?: string | null;
 	username: string;
@@ -142,6 +150,189 @@ export interface BodyLoginLoginPost {
 	client_secret?: string | null;
 }
 
+export type CompileRequestOnExceed =
+	(typeof CompileRequestOnExceed)[keyof typeof CompileRequestOnExceed];
+
+export const CompileRequestOnExceed = {
+	warn: 'warn',
+	raise: 'raise'
+} as const;
+
+/**
+ * Mirrors pyAgrum's `VarType` discriminator for `DiscreteVariable` subclasses.
+ */
+export type DiscreteVariableKind = (typeof DiscreteVariableKind)[keyof typeof DiscreteVariableKind];
+
+export const DiscreteVariableKind = {
+	labelized: 'labelized',
+	range: 'range',
+	integer: 'integer',
+	discretized: 'discretized',
+	numerical: 'numerical'
+} as const;
+
+/**
+ * A discrete chance node's domain, mirroring one pyAgrum `DiscreteVariable` subclass.
+ *
+ * `labels` holds the domain in state-index order; the kind-specific fields allow reconstructing
+ * the same pyAgrum subclass.
+ */
+export interface DiscreteVariable {
+	name: string;
+	description?: string;
+	kind?: DiscreteVariableKind;
+	labels: string[];
+	lower_bound?: number | null;
+	upper_bound?: number | null;
+	integer_values?: number[] | null;
+	ticks?: number[] | null;
+	numerical_values?: number[] | null;
+}
+
+/**
+ * A conditional probability table over one or more `DiscreteVariable`s.
+ *
+ * `variables` is the node itself first, then its parents in arc-insertion order. `values`'s axes
+ * match `variables` (the reverse of pyAgrum's `Tensor.toarray()`).
+ */
+export interface Potential {
+	variables: string[];
+	shape: number[];
+	values: unknown[];
+}
+
+export type DiscreteNetworkPotentials = { [key: string]: Potential };
+
+/**
+ * A discrete Bayesian network: chance nodes, arcs between them, and one CPT per node.
+ *
+ * Near-isomorphic to pyAgrum's `BayesNet`; see `adapters/pyagrum.py`. Nodes are addressed by name.
+ */
+export interface DiscreteNetwork {
+	name?: string;
+	variables: DiscreteVariable[];
+	/**
+	 * @items.minItems 2
+	 * @items.maxItems 2
+	 */
+	arcs: [string, string][];
+	potentials: DiscreteNetworkPotentials;
+}
+
+/**
+ * A decision (choice) node. Not part of `DiscreteNetwork` -- it has no CPT, only a domain.
+ */
+export interface DecisionNode {
+	symbol: string;
+	name?: string;
+	states: string[];
+	information_set?: string[];
+}
+
+/**
+ * A utility node: one linear objective, valued over its parents' joint state.
+ *
+ * Objectives are kept separate rather than summed into one utility as pyAgrum does.
+ */
+export interface ObjectiveNode {
+	symbol: string;
+	name?: string;
+	parents: string[];
+	utility: Potential;
+	maximize?: boolean;
+	unit?: string | null;
+}
+
+/**
+ * Which quantity a `DiagramConstraint` is linear in.
+ */
+export type DiagramConstraintKind =
+	(typeof DiagramConstraintKind)[keyof typeof DiagramConstraintKind];
+
+export const DiagramConstraintKind = {
+	decision: 'decision',
+	probability: 'probability',
+	expected_value: 'expected_value',
+	tail: 'tail'
+} as const;
+
+/**
+ * An enumerator for supported constraint expression types.
+ */
+export type ConstraintTypeEnum = (typeof ConstraintTypeEnum)[keyof typeof ConstraintTypeEnum];
+
+export const ConstraintTypeEnum = {
+	'=': '=',
+	'<=': '<='
+} as const;
+
+/**
+ * A diagram-level constraint, expressed in terms of node symbols rather than compiled variables.
+ *
+ * `kind` determines how `func` is compiled.
+ */
+export interface DiagramConstraint {
+	symbol: string;
+	name?: string;
+	kind: DiagramConstraintKind;
+	nodes: string[];
+	func: unknown[];
+	cons_type?: ConstraintTypeEnum;
+}
+
+/**
+ * Which risk measure to apply. Only `cvar` is implemented.
+ */
+export type RiskMeasureKind = (typeof RiskMeasureKind)[keyof typeof RiskMeasureKind];
+
+export const RiskMeasureKind = {
+	cvar: 'cvar'
+} as const;
+
+/**
+ * A risk transform recorded against one objective, applied to the diagram before compiling.
+ */
+export interface RiskMeasure {
+	symbol: string;
+	target: string;
+	kind?: RiskMeasureKind;
+	alpha: number;
+}
+
+/**
+ * The full decision/objective overlay for one `DiscreteNetwork`.
+ *
+ * Construction checks internal consistency only; references into a network are checked by
+ * `validate_against`.
+ */
+export interface DecisionAnnotation {
+	schema_version?: number;
+	decisions?: DecisionNode[];
+	objectives: ObjectiveNode[];
+	constraints?: DiagramConstraint[];
+	risk_measures?: RiskMeasure[];
+	decision_order?: string[] | null;
+	no_forgetting?: boolean;
+}
+
+/**
+ * Body for `POST /graphical/compile`.
+ */
+export interface CompileRequest {
+	network: DiscreteNetwork;
+	annotation: DecisionAnnotation;
+	name?: string | null;
+	max_cluster_size?: number | null;
+	on_exceed?: CompileRequestOnExceed;
+}
+
+/**
+ * Response for `POST /graphical/compile`.
+ */
+export interface CompileResponse {
+	problem_id: number;
+}
+
 /**
  * The SQLModel equivalent to `Constant`.
  */
@@ -195,16 +386,6 @@ export interface Url {
 	/** Optional. A tuple of username and password to be used for authentication when making requests to the URL. */
 	auth?: [string, string] | null;
 }
-
-/**
- * An enumerator for supported constraint expression types.
- */
-export type ConstraintTypeEnum = (typeof ConstraintTypeEnum)[keyof typeof ConstraintTypeEnum];
-
-export const ConstraintTypeEnum = {
-	'=': '=',
-	'<=': '<='
-} as const;
 
 /**
  * The SQLModel equivalent to `Constraint`.
@@ -404,6 +585,31 @@ export interface CumulusFinalizeResponse {
 	all_solutions: SolutionReferenceResponseLite[];
 }
 
+export type DiagramAssumptionsChance = { [key: string]: string };
+
+export type DiagramAssumptionsDecisions = { [key: string]: string };
+
+/**
+ * States assumed for some of a diagram's parentless chance nodes and decisions.
+ */
+export interface DiagramAssumptions {
+	chance?: DiagramAssumptionsChance;
+	decisions?: DiagramAssumptionsDecisions;
+}
+
+/**
+ * Request model for the CUMULUS hypothetical endpoint.
+ *
+ * Creates a new problem from a graphical-model problem under `assumptions`, on top of whatever
+ * it already assumes. The response and status polling are those of modify-problem.
+ */
+export interface CumulusHypotheticalRequest {
+	problem_id: number;
+	session_id?: number | null;
+	parent_state_id?: number | null;
+	assumptions: DiagramAssumptions;
+}
+
 export type CumulusInitializationRequestScalarizationOptions = {
 	[key: string]: number | string | boolean;
 } | null;
@@ -426,28 +632,34 @@ export const UncertaintyMeasureSpecMeasureType = {
 } as const;
 
 /**
- * Leaf-name → weight mapping. Required for weighted_scenarios.
+ * Leaf-name → weight mapping. Required for weighted_scenarios; not available for a graphical model.
  */
 export type UncertaintyMeasureSpecLeafWeights = { [key: string]: number } | null;
 
 /**
- * Specification for adding a scenario-based uncertainty aggregate to the problem.
+ * Specification for adding an uncertainty aggregate to the problem.
  *
- * All measures in a single request must reference the same ``scenario_model_id``.
- * The resulting combined (multi-scenario) problem replaces the current problem.
+ * The aggregate is taken over either a scenario model (``scenario_model_id`` set) or, when
+ * ``scenario_model_id`` is None, the outcome distributions of the problem's graphical model.
+ * All measures in a single request must reference the same source. With a scenario model, the
+ * resulting combined (multi-scenario) problem replaces the current problem. With a graphical
+ * model, the aggregates replace the problem's objectives.
  */
 export interface UncertaintyMeasureSpec {
 	/** Which uncertainty aggregate to apply. */
 	measure_type: UncertaintyMeasureSpecMeasureType;
-	/** DB id of the ScenarioModelDB that defines the scenario structure. */
-	scenario_model_id: number;
-	/** Symbols of objectives or functions to aggregate. */
+	/** DB id of the ScenarioModelDB that defines the scenario structure, or None to aggregate over the problem's graphical model. */
+	scenario_model_id?: number | null;
+	/**
+	 * Symbols of objectives or functions to aggregate.
+	 * @minItems 1
+	 */
 	symbols: string[];
 	/** Prefix for the new aggregate symbols. Defaults vary by measure_type. */
 	prefix?: string | null;
-	/** Confidence level for CVaR, e.g. 0.95. Required for conditional_value_at_risk. */
+	/** Probability mass of the averaged tail of worst outcomes in the element's own direction, e.g. 0.05 for the worst 5 % (often called CVaR 95 %). Required for conditional_value_at_risk. */
 	alpha?: number | null;
-	/** Leaf-name → weight mapping. Required for weighted_scenarios. */
+	/** Leaf-name → weight mapping. Required for weighted_scenarios; not available for a graphical model. */
 	leaf_weights?: UncertaintyMeasureSpecLeafWeights;
 }
 
@@ -638,15 +850,39 @@ export interface CumulusSaveResponse {
 }
 
 /**
+ * Where the scenarios come from, if available.
+ */
+export type CumulusScenarioAvailabilityResponseSource =
+	| (typeof CumulusScenarioAvailabilityResponseSource)[keyof typeof CumulusScenarioAvailabilityResponseSource]
+	| null;
+
+export const CumulusScenarioAvailabilityResponseSource = {
+	scenario_model: 'scenario_model',
+	graphical: 'graphical'
+} as const;
+
+export type CumulusScenarioAvailabilityResponseMeasureTypesItem =
+	(typeof CumulusScenarioAvailabilityResponseMeasureTypesItem)[keyof typeof CumulusScenarioAvailabilityResponseMeasureTypesItem];
+
+export const CumulusScenarioAvailabilityResponseMeasureTypesItem = {
+	expected_value: 'expected_value',
+	worst_case_robust: 'worst_case_robust',
+	conditional_value_at_risk: 'conditional_value_at_risk',
+	weighted_scenarios: 'weighted_scenarios'
+} as const;
+
+/**
  * Whether uncertainty measures can be added to (or changed on) the given problem.
  *
  * Lets the frontend decide whether to show the "Add uncertainty measures" action at all,
  * independently of whether CUMULUS has already been initialized for the problem.
  */
 export interface CumulusScenarioAvailabilityResponse {
-	/** Whether the problem has an associated scenario model. */
+	/** Whether the problem has an associated scenario model or graphical model. */
 	available: boolean;
-	/** Id of the problem actually carrying the scenario model, found by walking parent_problem_id. */
+	/** Where the scenarios come from, if available. */
+	source?: CumulusScenarioAvailabilityResponseSource;
+	/** Id of the problem the measures are applied to, found by walking parent_problem_id: the one carrying the scenario model, or the nearest one whose objectives are not yet aggregated. */
 	base_problem_id?: number | null;
 	/** DB id of the ScenarioModelDB, if available. */
 	scenario_model_id?: number | null;
@@ -654,20 +890,48 @@ export interface CumulusScenarioAvailabilityResponse {
 	objective_symbols?: string[];
 	/** Measure types already present on the current problem's objectives, detected by symbol prefix. */
 	applied_measures?: string[];
+	/** The uncertainty measure types available for this source. */
+	measure_types?: CumulusScenarioAvailabilityResponseMeasureTypesItem[];
 }
+
+/**
+ * Where the scenarios come from.
+ */
+export type CumulusScenarioSetupResponseSource =
+	(typeof CumulusScenarioSetupResponseSource)[keyof typeof CumulusScenarioSetupResponseSource];
+
+export const CumulusScenarioSetupResponseSource = {
+	scenario_model: 'scenario_model',
+	graphical: 'graphical'
+} as const;
+
+export type CumulusScenarioSetupResponseMeasureTypesItem =
+	(typeof CumulusScenarioSetupResponseMeasureTypesItem)[keyof typeof CumulusScenarioSetupResponseMeasureTypesItem];
+
+export const CumulusScenarioSetupResponseMeasureTypesItem = {
+	expected_value: 'expected_value',
+	worst_case_robust: 'worst_case_robust',
+	conditional_value_at_risk: 'conditional_value_at_risk',
+	weighted_scenarios: 'weighted_scenarios'
+} as const;
 
 /**
  * Response when the problem has scenarios but no uncertainty measures have been chosen yet.
  *
- * The frontend should present this to the decision maker and let them choose which
- * uncertainty aggregates to include, then re-call get-or-initialize with the chosen measures.
+ * The scenarios come from a scenario model or from the problem's graphical model. The frontend
+ * should present this to the decision maker and let them choose which uncertainty aggregates to
+ * include, then re-call get-or-initialize with the chosen measures.
  */
 export interface CumulusScenarioSetupResponse {
 	response_type?: 'cumulus.scenario_setup';
-	/** DB id of the ScenarioModelDB associated with this problem. */
-	scenario_model_id: number;
+	/** Where the scenarios come from. */
+	source?: CumulusScenarioSetupResponseSource;
+	/** DB id of the ScenarioModelDB associated with this problem; None for 'graphical'. */
+	scenario_model_id?: number | null;
 	/** Symbols of the objectives available for aggregation. */
 	objective_symbols: string[];
+	/** The uncertainty measure types available for this source. */
+	measure_types?: CumulusScenarioSetupResponseMeasureTypesItem[];
 }
 
 /**
@@ -686,6 +950,13 @@ export interface CustomClusterOptions {
 export interface DBSCANOptions {
 	/** DBSCAN clustering algorithm. */
 	name?: string;
+}
+
+/**
+ * Body for `POST /graphical/demo/irrigation`. Empty body (`{}`) is a normal, expected call.
+ */
+export interface DemoIrrigationRequest {
+	force?: boolean;
 }
 
 /**
@@ -1062,6 +1333,29 @@ export interface EndProcessPreference {
 	method?: string;
 	success: boolean | null;
 	set_preferences: EndProcessPreferenceSetPreferences;
+}
+
+export type EvidenceSetCreateRequestEvidence = { [key: string]: string };
+
+/**
+ * Body for `POST /graphical/{problem_id}/evidence-sets`.
+ */
+export interface EvidenceSetCreateRequest {
+	name: string;
+	evidence?: EvidenceSetCreateRequestEvidence;
+}
+
+export type EvidenceSetResponseEvidence = { [key: string]: string };
+
+/**
+ * Response shape for every named-evidence-set endpoint below.
+ */
+export interface EvidenceSetResponse {
+	id: number;
+	problem_id: number;
+	name: string;
+	evidence: EvidenceSetResponseEvidence;
+	created_at: string;
 }
 
 /**
@@ -1621,6 +1915,49 @@ export interface GenericIntermediateSolutionResponse {
 }
 
 /**
+ * Response model for `StationaryModelMetaData`, without the diagram and index map.
+ */
+export interface StationaryModelMetaDataPublic {
+	id: number | null;
+	metadata_type: string;
+}
+
+/**
+ * Metadata for a graphical model (Bayesian network / influence diagram) compiled `Problem`.
+ *
+ * Mirrors `SiteSelectionMetaData`'s JSON-blob-column pattern rather than `ScenarioModelDB`'s
+ * relational one: see `.claude/desdeo-graphical-models-plan.md`'s Phase 3 checklist item and
+ * design decisions table ("Compiled-model metadata ... persists via the API's
+ * `ProblemMetaDataDB` side-table pattern, not a field on core `Problem`"). Nothing in the
+ * current API queries *into* a stored problem's substructure at the SQL level (unlike
+ * `ScenarioModelDB`, whose relational mapping exists specifically for its polymorphic pools
+ * and per-leaf scenario dispatch) -- a JSON blob per document is sufficient here, same as
+ * `SiteSelectionMetaData`'s `sites_json`/`nodes_json`/`travel_time_matrix_json`.
+ *
+ * Each JSON column round-trips one `problem/graphical` pydantic model via `.model_dump_json()`/
+ * `.model_validate_json()`: `network_json` <-> `DiscreteNetwork`, `annotation_json` <->
+ * `DecisionAnnotation`, `rjt_json` <-> `RootedJunctionTree` (Phase 3). `index_map_json` is
+ * Phase 4's `IndexMap`, returned alongside the compiled `Problem` by `compile_diagram` -- it
+ * stays `None` until a Phase 4/7 compile step populates it, since nothing before that point has
+ * an `IndexMap` to store.
+ */
+export interface GraphicalModelMetaData {
+	id?: number | null;
+	metadata_id?: number | null;
+	metadata_type?: string;
+	/** JSON-serialised `desdeo.problem.graphical.DiscreteNetwork` */
+	network_json: string;
+	/** JSON-serialised `desdeo.problem.graphical.DecisionAnnotation` */
+	annotation_json: string;
+	/** JSON-serialised `desdeo.problem.graphical.RootedJunctionTree`, once built */
+	rjt_json?: string | null;
+	/** JSON-serialised `IndexMap` (Phase 4), once the diagram has been compiled */
+	index_map_json?: string | null;
+	/** JSON-serialised `desdeo.problem.graphical.DiagramAssumptions` of a hypothetical problem; `network_json` is then already conditioned on them */
+	assumptions_json?: string | null;
+}
+
+/**
  * Used for requesting a group to be created.
  */
 export interface GroupCreateRequest {
@@ -2042,6 +2379,28 @@ export interface ObjectiveDB {
 	scenario_model_id?: number | null;
 }
 
+export type PolicyRequestVariableValues = { [key: string]: number[] | number } | null;
+
+export type PolicyRequestEvidence = { [key: string]: string };
+
+/**
+ * Body for `POST /graphical/{problem_id}/policy`.
+ */
+export interface PolicyRequest {
+	variable_values?: PolicyRequestVariableValues;
+	solution_id?: number | null;
+	evidence?: PolicyRequestEvidence;
+}
+
+export type PolicyResponsePolicy = { [key: string]: string };
+
+/**
+ * Response for `POST /graphical/{problem_id}/policy`.
+ */
+export interface PolicyResponse {
+	policy: PolicyResponsePolicy;
+}
+
 /**
  * An enumerator for the possible variable type domains of a problem.
  */
@@ -2240,6 +2599,8 @@ export interface ProblemMetaDataPublic {
 	representative_nd_metadata: RepresentativeNonDominatedSolutions[] | null;
 	site_selection_metadata: SiteSelectionMetaData[] | null;
 	solution_description_metadata: SolutionDescriptionMetaData[] | null;
+	graphical_model_metadata: GraphicalModelMetaData[] | null;
+	stationary_model_metadata: StationaryModelMetaDataPublic[] | null;
 }
 
 /**
@@ -2369,6 +2730,41 @@ export interface ScoreBandsResponse {
 	obj_order: number[];
 }
 
+export type SensitivityNodeResultValues = { [key: string]: number };
+
+/**
+ * One swept node's tornado-bar entry.
+ */
+export interface SensitivityNodeResult {
+	node: string;
+	values: SensitivityNodeResultValues;
+	low: number;
+	high: number;
+	swing: number;
+}
+
+export type SensitivityRequestEvidence = { [key: string]: string };
+
+/**
+ * Body for `POST /graphical/sensitivity`.
+ */
+export interface SensitivityRequest {
+	problem_id: number;
+	session_id?: number | null;
+	evidence?: SensitivityRequestEvidence;
+	target: string;
+	target_state?: string | null;
+	nodes?: string[] | null;
+}
+
+/**
+ * Response for `POST /graphical/sensitivity`.
+ */
+export interface SensitivityResponse {
+	base_value: number;
+	results: SensitivityNodeResult[];
+}
+
 /**
  * A coverage connection edge between two nodes.
  */
@@ -2446,6 +2842,30 @@ export interface SolutionDescriptionResponse {
 }
 
 /**
+ * One solution stored in a `StateDB` row, e.g. a CUMULUS `SolutionReferenceResponseLite`.
+ */
+export interface SolutionRef {
+	state_id: number;
+	solution_index: number;
+}
+
+/**
+ * Body for `POST /graphical/{problem_id}/solve`.
+ */
+export interface SolveRequest {
+	objective_symbol: string;
+}
+
+export type SolveResponseVariableValues = { [key: string]: number[] | number };
+
+/**
+ * Response for `POST /graphical/{problem_id}/solve`.
+ */
+export interface SolveResponse {
+	variable_values: SolveResponseVariableValues;
+}
+
+/**
  * A problem metadata class to store the preferred solver of a problem.
  *
  * A problem metadata class to store the preferred solver of a problem.
@@ -2457,6 +2877,43 @@ export interface SolverSelectionMetadata {
 	metadata_type?: string;
 	/** The string representation of the selected solver. */
 	solver_string_representation: string;
+}
+
+/**
+ * One directed edge in a `GET /graphical/{problem_id}/structure` response.
+ */
+export interface StructureEdge {
+	id: string;
+	source: string;
+	target: string;
+}
+
+export type StructureNodeKind = (typeof StructureNodeKind)[keyof typeof StructureNodeKind];
+
+export const StructureNodeKind = {
+	chance: 'chance',
+	decision: 'decision',
+	objective: 'objective'
+} as const;
+
+/**
+ * One node in a `GET /graphical/{problem_id}/structure` response.
+ */
+export interface StructureNode {
+	id: string;
+	label: string;
+	kind: StructureNodeKind;
+	states?: string[] | null;
+	description?: string | null;
+}
+
+/**
+ * Response for `GET /graphical/{problem_id}/structure`.
+ */
+export interface StructureResponse {
+	nodes: StructureNode[];
+	edges: StructureEdge[];
+	assumptions?: DiagramAssumptions;
 }
 
 /**
@@ -2497,6 +2954,7 @@ export interface UserPublic {
 	id: number;
 	role: UserRole;
 	group_ids: number[] | null;
+	active_session_id?: number | null;
 }
 
 /**
@@ -2535,6 +2993,68 @@ export interface UtopiaResponse {
 	description: string;
 	/** A list of years for which the maps have been generated. */
 	years: string[];
+}
+
+export type VoiRequestEvidence = { [key: string]: string };
+
+/**
+ * Body for `POST /graphical/voi`.
+ */
+export interface VoiRequest {
+	problem_id: number;
+	session_id?: number | null;
+	evidence?: VoiRequestEvidence;
+	node: string;
+	target: string;
+}
+
+export type VoiResponseMarginal = { [key: string]: number };
+
+/**
+ * Response for `POST /graphical/voi`.
+ */
+export interface VoiResponse {
+	base_value: number;
+	expected_value_with_observation: number;
+	value_of_information: number;
+	marginal: VoiResponseMarginal;
+}
+
+export type WhatIfRequestEvidence = { [key: string]: string };
+
+export type WhatIfRequestDecisionEvidence = { [key: string]: string };
+
+/**
+ * Body for `POST /graphical/whatif`.
+ */
+export interface WhatIfRequest {
+	problem_id: number;
+	session_id?: number | null;
+	evidence?: WhatIfRequestEvidence;
+	decision_evidence?: WhatIfRequestDecisionEvidence;
+	solution?: SolutionRef | null;
+}
+
+export type WhatIfResponsePosteriors = { [key: string]: number[] };
+
+export type WhatIfResponsePolicy = { [key: string]: string } | null;
+
+export type WhatIfResponseUtilities = { [key: string]: number };
+
+export type WhatIfResponseUtilityStdDevs = { [key: string]: number };
+
+export type WhatIfResponseDecisionPosteriors = { [key: string]: number[] };
+
+/**
+ * Response for `POST /graphical/whatif`.
+ */
+export interface WhatIfResponse {
+	posteriors: WhatIfResponsePosteriors;
+	policy?: WhatIfResponsePolicy;
+	utilities: WhatIfResponseUtilities;
+	utility_std_devs: WhatIfResponseUtilityStdDevs;
+	off_policy_decisions?: string[];
+	decision_posteriors?: WhatIfResponseDecisionPosteriors;
 }
 
 export type LoginLoginPostParams = {
@@ -2706,6 +3226,10 @@ export type SetObjectiveConstraintsMethodCumulusObjectiveConstraintPostParams = 
 };
 
 export type ModifyProblemMethodCumulusModifyProblemPostParams = {
+	problem_id?: number | null;
+};
+
+export type CreateHypotheticalMethodCumulusHypotheticalPostParams = {
 	problem_id?: number | null;
 };
 
@@ -4131,6 +4655,55 @@ export const createNewSessionSessionNewPost = async (
 	);
 };
 
+export type activateSessionSessionActivatePostResponse200 = {
+	data: InteractiveSessionBase | null;
+	status: 200;
+};
+
+export type activateSessionSessionActivatePostResponse422 = {
+	data: HTTPValidationError;
+	status: 422;
+};
+
+export type activateSessionSessionActivatePostResponseSuccess =
+	activateSessionSessionActivatePostResponse200 & {
+		headers: Headers;
+	};
+export type activateSessionSessionActivatePostResponseError =
+	activateSessionSessionActivatePostResponse422 & {
+		headers: Headers;
+	};
+
+export type activateSessionSessionActivatePostResponse =
+	| activateSessionSessionActivatePostResponseSuccess
+	| activateSessionSessionActivatePostResponseError;
+
+export const getActivateSessionSessionActivatePostUrl = () => {
+	return `http://localhost:8000/session/activate`;
+};
+
+/**
+ * Make one of the user's own sessions the active one, or clear it with `session_id=None`.
+ *
+ * Methods resume and record their states in the active session. Analysts and admins can see
+ * other users' sessions but not activate them, so their own work never lands in someone else's.
+ * @summary Activate Session
+ */
+export const activateSessionSessionActivatePost = async (
+	activateSessionRequest: ActivateSessionRequest,
+	options?: RequestInit
+): Promise<activateSessionSessionActivatePostResponse> => {
+	return customFetch<activateSessionSessionActivatePostResponse>(
+		getActivateSessionSessionActivatePostUrl(),
+		{
+			...options,
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json', ...options?.headers },
+			body: JSON.stringify(activateSessionRequest)
+		}
+	);
+};
+
 export type getSessionSessionGetSessionIdGetResponse200 = {
 	data: InteractiveSessionBase;
 	status: 200;
@@ -5534,10 +6107,11 @@ export const getGetOrInitializeMethodCumulusGetOrInitializePostUrl = (
 /**
  * Get the latest CUMULUS state if it exists, or initialize a new one if it doesn't.
  *
- * If the problem has associated scenarios and no uncertainty measures have been specified, a
+ * If the problem has associated scenarios (a scenario model, or a graphical model whose
+ * objectives are not yet aggregated) and no uncertainty measures have been specified, a
  * ``CumulusScenarioSetupResponse`` is returned so the frontend can ask the decision maker which
  * aggregates to include.  When the frontend re-calls with ``uncertainty_measures`` populated, a
- * combined multi-scenario problem is built, saved to the database, and used for initialization.
+ * combined problem is built, saved to the database, and used for initialization.
  * @summary Get Or Initialize
  */
 export const getOrInitializeMethodCumulusGetOrInitializePost = async (
@@ -5600,7 +6174,7 @@ export const getGetScenarioAvailabilityMethodCumulusScenarioAvailabilityGetUrl =
 /**
  * Report whether uncertainty measures can be added to (or changed on) a problem.
  *
- * Looks past any combined scenario problem already built from it (via `parent_problem_id`),
+ * Looks past any combined problem already built from it (via `parent_problem_id`),
  * so this stays accurate whether `problem_id` is the original problem or one already combined
  * from it. Used to decide whether to show the "Add uncertainty measures" UI action at all.
  * @summary Get Scenario Availability
@@ -6049,6 +6623,76 @@ export const modifyProblemMethodCumulusModifyProblemPost = async (
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json', ...options?.headers },
 			body: JSON.stringify(cumulusModificationRequest)
+		}
+	);
+};
+
+export type createHypotheticalMethodCumulusHypotheticalPostResponse200 = {
+	data: CumulusModificationResponse;
+	status: 200;
+};
+
+export type createHypotheticalMethodCumulusHypotheticalPostResponse422 = {
+	data: HTTPValidationError;
+	status: 422;
+};
+
+export type createHypotheticalMethodCumulusHypotheticalPostResponseSuccess =
+	createHypotheticalMethodCumulusHypotheticalPostResponse200 & {
+		headers: Headers;
+	};
+export type createHypotheticalMethodCumulusHypotheticalPostResponseError =
+	createHypotheticalMethodCumulusHypotheticalPostResponse422 & {
+		headers: Headers;
+	};
+
+export type createHypotheticalMethodCumulusHypotheticalPostResponse =
+	| createHypotheticalMethodCumulusHypotheticalPostResponseSuccess
+	| createHypotheticalMethodCumulusHypotheticalPostResponseError;
+
+export const getCreateHypotheticalMethodCumulusHypotheticalPostUrl = (
+	params?: CreateHypotheticalMethodCumulusHypotheticalPostParams
+) => {
+	const normalizedParams = new URLSearchParams();
+
+	Object.entries(params || {}).forEach(([key, value]) => {
+		if (value !== undefined) {
+			normalizedParams.append(key, value === null ? 'null' : String(value));
+		}
+	});
+
+	const stringifiedParams = normalizedParams.toString();
+
+	return stringifiedParams.length > 0
+		? `http://localhost:8000/method/cumulus/hypothetical?${stringifiedParams}`
+		: `http://localhost:8000/method/cumulus/hypothetical`;
+};
+
+/**
+ * Create a new problem from a graphical-model problem under hypothetical assumptions.
+ *
+ * The new problem is recompiled from the conditioned diagram and gets its own copy of the
+ * graphical metadata; the original problem is left as it is. Like a modification, it stays
+ * temporary until the background checks confirm it is feasible and set its ideal and nadir.
+ * Poll `/modify-problem/status/{state_id}` for the outcome.
+ *
+ * Raises:
+ *     HTTPException: 404 if the problem has no graphical model; 400 if the assumptions are
+ *         invalid, add nothing new, or contradict what the problem already assumes.
+ * @summary Create Hypothetical
+ */
+export const createHypotheticalMethodCumulusHypotheticalPost = async (
+	cumulusHypotheticalRequest: CumulusHypotheticalRequest,
+	params?: CreateHypotheticalMethodCumulusHypotheticalPostParams,
+	options?: RequestInit
+): Promise<createHypotheticalMethodCumulusHypotheticalPostResponse> => {
+	return customFetch<createHypotheticalMethodCumulusHypotheticalPostResponse>(
+		getCreateHypotheticalMethodCumulusHypotheticalPostUrl(params),
+		{
+			...options,
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json', ...options?.headers },
+			body: JSON.stringify(cumulusHypotheticalRequest)
 		}
 	);
 };
@@ -7372,6 +8016,640 @@ export const buildMapSiteSelectionMapPost = async (
 		headers: { 'Content-Type': 'application/json', ...options?.headers },
 		body: JSON.stringify(siteSelectionMapRequest)
 	});
+};
+
+export type compileGraphicalModelGraphicalCompilePostResponse200 = {
+	data: CompileResponse;
+	status: 200;
+};
+
+export type compileGraphicalModelGraphicalCompilePostResponse422 = {
+	data: HTTPValidationError;
+	status: 422;
+};
+
+export type compileGraphicalModelGraphicalCompilePostResponseSuccess =
+	compileGraphicalModelGraphicalCompilePostResponse200 & {
+		headers: Headers;
+	};
+export type compileGraphicalModelGraphicalCompilePostResponseError =
+	compileGraphicalModelGraphicalCompilePostResponse422 & {
+		headers: Headers;
+	};
+
+export type compileGraphicalModelGraphicalCompilePostResponse =
+	| compileGraphicalModelGraphicalCompilePostResponseSuccess
+	| compileGraphicalModelGraphicalCompilePostResponseError;
+
+export const getCompileGraphicalModelGraphicalCompilePostUrl = () => {
+	return `http://localhost:8000/graphical/compile`;
+};
+
+/**
+ * Compile a `(DiscreteNetwork, DecisionAnnotation)` pair into a `Problem`, and persist it.
+ *
+ * Persists the `ProblemDB` plus a `GraphicalModelMetaData` row holding the network, annotation,
+ * `RootedJunctionTree`, and `IndexMap`, in one commit. Guest users may not compile.
+ *
+ * Raises:
+ *     HTTPException: 401 for a guest user; 400 for a `ValueError` from validation or
+ *         compilation (e.g. `max_cluster_size` exceeded), or if the total cluster state space
+ *         exceeds `_SERVER_MAX_TOTAL_CLUSTER_SIZE`.
+ * @summary Compile Graphical Model
+ */
+export const compileGraphicalModelGraphicalCompilePost = async (
+	compileRequest: CompileRequest,
+	options?: RequestInit
+): Promise<compileGraphicalModelGraphicalCompilePostResponse> => {
+	return customFetch<compileGraphicalModelGraphicalCompilePostResponse>(
+		getCompileGraphicalModelGraphicalCompilePostUrl(),
+		{
+			...options,
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json', ...options?.headers },
+			body: JSON.stringify(compileRequest)
+		}
+	);
+};
+
+export type getStructureGraphicalProblemIdStructureGetResponse200 = {
+	data: StructureResponse;
+	status: 200;
+};
+
+export type getStructureGraphicalProblemIdStructureGetResponse422 = {
+	data: HTTPValidationError;
+	status: 422;
+};
+
+export type getStructureGraphicalProblemIdStructureGetResponseSuccess =
+	getStructureGraphicalProblemIdStructureGetResponse200 & {
+		headers: Headers;
+	};
+export type getStructureGraphicalProblemIdStructureGetResponseError =
+	getStructureGraphicalProblemIdStructureGetResponse422 & {
+		headers: Headers;
+	};
+
+export type getStructureGraphicalProblemIdStructureGetResponse =
+	| getStructureGraphicalProblemIdStructureGetResponseSuccess
+	| getStructureGraphicalProblemIdStructureGetResponseError;
+
+export const getGetStructureGraphicalProblemIdStructureGetUrl = (problemId: number) => {
+	return `http://localhost:8000/graphical/${problemId}/structure`;
+};
+
+/**
+ * The DAG and node types of a graphical model, without inference.
+ *
+ * Raises:
+ *     HTTPException: 404 if the problem doesn't exist, isn't visible to `user`, or has no
+ *         `GraphicalModelMetaData` row.
+ * @summary Get Structure
+ */
+export const getStructureGraphicalProblemIdStructureGet = async (
+	problemId: number,
+	options?: RequestInit
+): Promise<getStructureGraphicalProblemIdStructureGetResponse> => {
+	return customFetch<getStructureGraphicalProblemIdStructureGetResponse>(
+		getGetStructureGraphicalProblemIdStructureGetUrl(problemId),
+		{
+			...options,
+			method: 'GET'
+		}
+	);
+};
+
+export type whatifGraphicalWhatifPostResponse200 = {
+	data: WhatIfResponse;
+	status: 200;
+};
+
+export type whatifGraphicalWhatifPostResponse422 = {
+	data: HTTPValidationError;
+	status: 422;
+};
+
+export type whatifGraphicalWhatifPostResponseSuccess = whatifGraphicalWhatifPostResponse200 & {
+	headers: Headers;
+};
+export type whatifGraphicalWhatifPostResponseError = whatifGraphicalWhatifPostResponse422 & {
+	headers: Headers;
+};
+
+export type whatifGraphicalWhatifPostResponse =
+	| whatifGraphicalWhatifPostResponseSuccess
+	| whatifGraphicalWhatifPostResponseError;
+
+export const getWhatifGraphicalWhatifPostUrl = () => {
+	return `http://localhost:8000/graphical/whatif`;
+};
+
+/**
+ * Set hard evidence, run inference, and return posteriors/policy/utilities in one payload.
+ *
+ * Uses a cached engine (see `_engine_cache`), except with `request.solution` and some decision
+ * unpinned, which uses a fresh one where unpinned decisions follow that solution's policy. The
+ * decisions a hypothetical problem assumes are always pinned.
+ *
+ * Raises:
+ *     HTTPException: 404 if the problem or session isn't found or visible, or the problem has no
+ *         `GraphicalModelMetaData`, or for an unusable `solution` (see
+ *         `_fetch_solution_policies`); 400 for invalid evidence/decision_evidence/solution, a pin
+ *         contradicting an assumed decision, or a diagram pyAgrum rejects; 501 for several
+ *         objectives with decisions, unless `decision_evidence` pins every decision or
+ *         `solution` is given (see `_compute_utilities`).
+ * @summary Whatif
+ */
+export const whatifGraphicalWhatifPost = async (
+	whatIfRequest: WhatIfRequest,
+	options?: RequestInit
+): Promise<whatifGraphicalWhatifPostResponse> => {
+	return customFetch<whatifGraphicalWhatifPostResponse>(getWhatifGraphicalWhatifPostUrl(), {
+		...options,
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json', ...options?.headers },
+		body: JSON.stringify(whatIfRequest)
+	});
+};
+
+export type getPolicyGraphicalProblemIdPolicyPostResponse200 = {
+	data: PolicyResponse;
+	status: 200;
+};
+
+export type getPolicyGraphicalProblemIdPolicyPostResponse422 = {
+	data: HTTPValidationError;
+	status: 422;
+};
+
+export type getPolicyGraphicalProblemIdPolicyPostResponseSuccess =
+	getPolicyGraphicalProblemIdPolicyPostResponse200 & {
+		headers: Headers;
+	};
+export type getPolicyGraphicalProblemIdPolicyPostResponseError =
+	getPolicyGraphicalProblemIdPolicyPostResponse422 & {
+		headers: Headers;
+	};
+
+export type getPolicyGraphicalProblemIdPolicyPostResponse =
+	| getPolicyGraphicalProblemIdPolicyPostResponseSuccess
+	| getPolicyGraphicalProblemIdPolicyPostResponseError;
+
+export const getGetPolicyGraphicalProblemIdPolicyPostUrl = (problemId: number) => {
+	return `http://localhost:8000/graphical/${problemId}/policy`;
+};
+
+/**
+ * Decode a solved `Problem`'s policy against `evidence`.
+ *
+ * Raises:
+ *     HTTPException: 404 if the problem isn't found or visible, has no graphical metadata or
+ *         `IndexMap`, or `solution_id` isn't a saved solution of `problem_id`; 403 if the saved
+ *         solution belongs to another user and `user` is not an admin/analyst; 400 if not
+ *         exactly one of `variable_values`/`solution_id` is given, or for invalid evidence or
+ *         variable values.
+ * @summary Get Policy
+ */
+export const getPolicyGraphicalProblemIdPolicyPost = async (
+	problemId: number,
+	policyRequest: PolicyRequest,
+	options?: RequestInit
+): Promise<getPolicyGraphicalProblemIdPolicyPostResponse> => {
+	return customFetch<getPolicyGraphicalProblemIdPolicyPostResponse>(
+		getGetPolicyGraphicalProblemIdPolicyPostUrl(problemId),
+		{
+			...options,
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json', ...options?.headers },
+			body: JSON.stringify(policyRequest)
+		}
+	);
+};
+
+export type createEvidenceSetGraphicalProblemIdEvidenceSetsPostResponse200 = {
+	data: EvidenceSetResponse;
+	status: 200;
+};
+
+export type createEvidenceSetGraphicalProblemIdEvidenceSetsPostResponse422 = {
+	data: HTTPValidationError;
+	status: 422;
+};
+
+export type createEvidenceSetGraphicalProblemIdEvidenceSetsPostResponseSuccess =
+	createEvidenceSetGraphicalProblemIdEvidenceSetsPostResponse200 & {
+		headers: Headers;
+	};
+export type createEvidenceSetGraphicalProblemIdEvidenceSetsPostResponseError =
+	createEvidenceSetGraphicalProblemIdEvidenceSetsPostResponse422 & {
+		headers: Headers;
+	};
+
+export type createEvidenceSetGraphicalProblemIdEvidenceSetsPostResponse =
+	| createEvidenceSetGraphicalProblemIdEvidenceSetsPostResponseSuccess
+	| createEvidenceSetGraphicalProblemIdEvidenceSetsPostResponseError;
+
+export const getCreateEvidenceSetGraphicalProblemIdEvidenceSetsPostUrl = (problemId: number) => {
+	return `http://localhost:8000/graphical/${problemId}/evidence-sets`;
+};
+
+/**
+ * Save the current evidence dict under a name, for later reuse/sharing by id.
+ *
+ * Raises:
+ *     HTTPException: 404 if the problem doesn't exist, isn't visible to `user`, or has no
+ *         `GraphicalModelMetaData`; 400 for invalid evidence.
+ * @summary Create Evidence Set
+ */
+export const createEvidenceSetGraphicalProblemIdEvidenceSetsPost = async (
+	problemId: number,
+	evidenceSetCreateRequest: EvidenceSetCreateRequest,
+	options?: RequestInit
+): Promise<createEvidenceSetGraphicalProblemIdEvidenceSetsPostResponse> => {
+	return customFetch<createEvidenceSetGraphicalProblemIdEvidenceSetsPostResponse>(
+		getCreateEvidenceSetGraphicalProblemIdEvidenceSetsPostUrl(problemId),
+		{
+			...options,
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json', ...options?.headers },
+			body: JSON.stringify(evidenceSetCreateRequest)
+		}
+	);
+};
+
+export type listEvidenceSetsGraphicalProblemIdEvidenceSetsGetResponse200 = {
+	data: EvidenceSetResponse[];
+	status: 200;
+};
+
+export type listEvidenceSetsGraphicalProblemIdEvidenceSetsGetResponse422 = {
+	data: HTTPValidationError;
+	status: 422;
+};
+
+export type listEvidenceSetsGraphicalProblemIdEvidenceSetsGetResponseSuccess =
+	listEvidenceSetsGraphicalProblemIdEvidenceSetsGetResponse200 & {
+		headers: Headers;
+	};
+export type listEvidenceSetsGraphicalProblemIdEvidenceSetsGetResponseError =
+	listEvidenceSetsGraphicalProblemIdEvidenceSetsGetResponse422 & {
+		headers: Headers;
+	};
+
+export type listEvidenceSetsGraphicalProblemIdEvidenceSetsGetResponse =
+	| listEvidenceSetsGraphicalProblemIdEvidenceSetsGetResponseSuccess
+	| listEvidenceSetsGraphicalProblemIdEvidenceSetsGetResponseError;
+
+export const getListEvidenceSetsGraphicalProblemIdEvidenceSetsGetUrl = (problemId: number) => {
+	return `http://localhost:8000/graphical/${problemId}/evidence-sets`;
+};
+
+/**
+ * Every named evidence set saved against `problem_id`, regardless of which user saved it.
+ *
+ * Evidence sets are shareable: anyone who can see the problem can read them, while deletion is
+ * restricted to the owner.
+ *
+ * Raises:
+ *     HTTPException: 404 if the problem doesn't exist or isn't visible to `user`.
+ * @summary List Evidence Sets
+ */
+export const listEvidenceSetsGraphicalProblemIdEvidenceSetsGet = async (
+	problemId: number,
+	options?: RequestInit
+): Promise<listEvidenceSetsGraphicalProblemIdEvidenceSetsGetResponse> => {
+	return customFetch<listEvidenceSetsGraphicalProblemIdEvidenceSetsGetResponse>(
+		getListEvidenceSetsGraphicalProblemIdEvidenceSetsGetUrl(problemId),
+		{
+			...options,
+			method: 'GET'
+		}
+	);
+};
+
+export type getEvidenceSetGraphicalEvidenceSetsEvidenceSetIdGetResponse200 = {
+	data: EvidenceSetResponse;
+	status: 200;
+};
+
+export type getEvidenceSetGraphicalEvidenceSetsEvidenceSetIdGetResponse422 = {
+	data: HTTPValidationError;
+	status: 422;
+};
+
+export type getEvidenceSetGraphicalEvidenceSetsEvidenceSetIdGetResponseSuccess =
+	getEvidenceSetGraphicalEvidenceSetsEvidenceSetIdGetResponse200 & {
+		headers: Headers;
+	};
+export type getEvidenceSetGraphicalEvidenceSetsEvidenceSetIdGetResponseError =
+	getEvidenceSetGraphicalEvidenceSetsEvidenceSetIdGetResponse422 & {
+		headers: Headers;
+	};
+
+export type getEvidenceSetGraphicalEvidenceSetsEvidenceSetIdGetResponse =
+	| getEvidenceSetGraphicalEvidenceSetsEvidenceSetIdGetResponseSuccess
+	| getEvidenceSetGraphicalEvidenceSetsEvidenceSetIdGetResponseError;
+
+export const getGetEvidenceSetGraphicalEvidenceSetsEvidenceSetIdGetUrl = (
+	evidenceSetId: number
+) => {
+	return `http://localhost:8000/graphical/evidence-sets/${evidenceSetId}`;
+};
+
+/**
+ * Fetch one named evidence set by id, so it can be shared by URL.
+ *
+ * Visibility is checked against the set's problem.
+ *
+ * Raises:
+ *     HTTPException: 404 if no such evidence set exists, or its problem isn't visible to `user`.
+ * @summary Get Evidence Set
+ */
+export const getEvidenceSetGraphicalEvidenceSetsEvidenceSetIdGet = async (
+	evidenceSetId: number,
+	options?: RequestInit
+): Promise<getEvidenceSetGraphicalEvidenceSetsEvidenceSetIdGetResponse> => {
+	return customFetch<getEvidenceSetGraphicalEvidenceSetsEvidenceSetIdGetResponse>(
+		getGetEvidenceSetGraphicalEvidenceSetsEvidenceSetIdGetUrl(evidenceSetId),
+		{
+			...options,
+			method: 'GET'
+		}
+	);
+};
+
+export type deleteEvidenceSetGraphicalEvidenceSetsEvidenceSetIdDeleteResponse200 = {
+	data: unknown;
+	status: 200;
+};
+
+export type deleteEvidenceSetGraphicalEvidenceSetsEvidenceSetIdDeleteResponse422 = {
+	data: HTTPValidationError;
+	status: 422;
+};
+
+export type deleteEvidenceSetGraphicalEvidenceSetsEvidenceSetIdDeleteResponseSuccess =
+	deleteEvidenceSetGraphicalEvidenceSetsEvidenceSetIdDeleteResponse200 & {
+		headers: Headers;
+	};
+export type deleteEvidenceSetGraphicalEvidenceSetsEvidenceSetIdDeleteResponseError =
+	deleteEvidenceSetGraphicalEvidenceSetsEvidenceSetIdDeleteResponse422 & {
+		headers: Headers;
+	};
+
+export type deleteEvidenceSetGraphicalEvidenceSetsEvidenceSetIdDeleteResponse =
+	| deleteEvidenceSetGraphicalEvidenceSetsEvidenceSetIdDeleteResponseSuccess
+	| deleteEvidenceSetGraphicalEvidenceSetsEvidenceSetIdDeleteResponseError;
+
+export const getDeleteEvidenceSetGraphicalEvidenceSetsEvidenceSetIdDeleteUrl = (
+	evidenceSetId: number
+) => {
+	return `http://localhost:8000/graphical/evidence-sets/${evidenceSetId}`;
+};
+
+/**
+ * Delete a named evidence set. Owner (or admin/analyst) only, unlike reading/listing.
+ *
+ * Raises:
+ *     HTTPException: 404 if no such evidence set exists, or its problem isn't visible to `user`;
+ *         403 if `user` neither saved it nor is an admin/analyst.
+ * @summary Delete Evidence Set
+ */
+export const deleteEvidenceSetGraphicalEvidenceSetsEvidenceSetIdDelete = async (
+	evidenceSetId: number,
+	options?: RequestInit
+): Promise<deleteEvidenceSetGraphicalEvidenceSetsEvidenceSetIdDeleteResponse> => {
+	return customFetch<deleteEvidenceSetGraphicalEvidenceSetsEvidenceSetIdDeleteResponse>(
+		getDeleteEvidenceSetGraphicalEvidenceSetsEvidenceSetIdDeleteUrl(evidenceSetId),
+		{
+			...options,
+			method: 'DELETE'
+		}
+	);
+};
+
+export type sensitivityGraphicalSensitivityPostResponse200 = {
+	data: SensitivityResponse;
+	status: 200;
+};
+
+export type sensitivityGraphicalSensitivityPostResponse422 = {
+	data: HTTPValidationError;
+	status: 422;
+};
+
+export type sensitivityGraphicalSensitivityPostResponseSuccess =
+	sensitivityGraphicalSensitivityPostResponse200 & {
+		headers: Headers;
+	};
+export type sensitivityGraphicalSensitivityPostResponseError =
+	sensitivityGraphicalSensitivityPostResponse422 & {
+		headers: Headers;
+	};
+
+export type sensitivityGraphicalSensitivityPostResponse =
+	| sensitivityGraphicalSensitivityPostResponseSuccess
+	| sensitivityGraphicalSensitivityPostResponseError;
+
+export const getSensitivityGraphicalSensitivityPostUrl = () => {
+	return `http://localhost:8000/graphical/sensitivity`;
+};
+
+/**
+ * Single-node hard-evidence sweep, one node at a time, holding everything else at `evidence`.
+ *
+ * Sweeps every chance node other than `target` and the evidenced ones (decision nodes are not
+ * swept), using the cached engine.
+ *
+ * Raises:
+ *     HTTPException: 401 for a guest user; 404 if the problem isn't found or visible, or has no
+ *         `GraphicalModelMetaData`; 400 for invalid evidence, `target`, `target_state` or
+ *         `nodes`, or too many nodes to sweep; 501 if `target` is an objective of a diagram
+ *         with several objectives and a decision (see `_compute_utilities`), or the problem
+ *         assumes a decision.
+ * @summary Sensitivity
+ */
+export const sensitivityGraphicalSensitivityPost = async (
+	sensitivityRequest: SensitivityRequest,
+	options?: RequestInit
+): Promise<sensitivityGraphicalSensitivityPostResponse> => {
+	return customFetch<sensitivityGraphicalSensitivityPostResponse>(
+		getSensitivityGraphicalSensitivityPostUrl(),
+		{
+			...options,
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json', ...options?.headers },
+			body: JSON.stringify(sensitivityRequest)
+		}
+	);
+};
+
+export type valueOfInformationGraphicalVoiPostResponse200 = {
+	data: VoiResponse;
+	status: 200;
+};
+
+export type valueOfInformationGraphicalVoiPostResponse422 = {
+	data: HTTPValidationError;
+	status: 422;
+};
+
+export type valueOfInformationGraphicalVoiPostResponseSuccess =
+	valueOfInformationGraphicalVoiPostResponse200 & {
+		headers: Headers;
+	};
+export type valueOfInformationGraphicalVoiPostResponseError =
+	valueOfInformationGraphicalVoiPostResponse422 & {
+		headers: Headers;
+	};
+
+export type valueOfInformationGraphicalVoiPostResponse =
+	| valueOfInformationGraphicalVoiPostResponseSuccess
+	| valueOfInformationGraphicalVoiPostResponseError;
+
+export const getValueOfInformationGraphicalVoiPostUrl = () => {
+	return `http://localhost:8000/graphical/voi`;
+};
+
+/**
+ * Value of information for observing `node` before deciding, as a gain in expected utility.
+ *
+ * `VoI(node) = sum_s P(node=s) * value(node=s) - value()`, computed with `_sweep_node`. Only
+ * defined for diagrams with at least one decision; otherwise there is nothing the observation
+ * could change, so the request is rejected rather than returning zero.
+ *
+ * Raises:
+ *     HTTPException: 404 if the problem isn't found or visible, or has no
+ *         `GraphicalModelMetaData`; 400 if the diagram has no decisions, or for an invalid
+ *         `target`, `node` (or one already in `evidence`), or evidence; 501 for several
+ *         objectives with a decision (see `_compute_utilities`), or if the problem assumes a
+ *         decision.
+ * @summary Value Of Information
+ */
+export const valueOfInformationGraphicalVoiPost = async (
+	voiRequest: VoiRequest,
+	options?: RequestInit
+): Promise<valueOfInformationGraphicalVoiPostResponse> => {
+	return customFetch<valueOfInformationGraphicalVoiPostResponse>(
+		getValueOfInformationGraphicalVoiPostUrl(),
+		{
+			...options,
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json', ...options?.headers },
+			body: JSON.stringify(voiRequest)
+		}
+	);
+};
+
+export type compileDemoIrrigationModelGraphicalDemoIrrigationPostResponse200 = {
+	data: CompileResponse;
+	status: 200;
+};
+
+export type compileDemoIrrigationModelGraphicalDemoIrrigationPostResponse422 = {
+	data: HTTPValidationError;
+	status: 422;
+};
+
+export type compileDemoIrrigationModelGraphicalDemoIrrigationPostResponseSuccess =
+	compileDemoIrrigationModelGraphicalDemoIrrigationPostResponse200 & {
+		headers: Headers;
+	};
+export type compileDemoIrrigationModelGraphicalDemoIrrigationPostResponseError =
+	compileDemoIrrigationModelGraphicalDemoIrrigationPostResponse422 & {
+		headers: Headers;
+	};
+
+export type compileDemoIrrigationModelGraphicalDemoIrrigationPostResponse =
+	| compileDemoIrrigationModelGraphicalDemoIrrigationPostResponseSuccess
+	| compileDemoIrrigationModelGraphicalDemoIrrigationPostResponseError;
+
+export const getCompileDemoIrrigationModelGraphicalDemoIrrigationPostUrl = () => {
+	return `http://localhost:8000/graphical/demo/irrigation`;
+};
+
+/**
+ * Compile the canned irrigation demo diagram (`desdeo/problem/graphical/demo.py`).
+ *
+ * Builds the model server-side and delegates to `compile_graphical_model`.
+ *
+ * Unless `request.force` is set, returns the caller's most recent problem with the demo name if
+ * its network matches the demo (see `_demo_irrigation_metadata_matches`), and compiles a new
+ * copy otherwise.
+ *
+ * Raises:
+ *     HTTPException: whatever `compile_graphical_model` raises (e.g. 401 for a guest user).
+ * @summary Compile Demo Irrigation Model
+ */
+export const compileDemoIrrigationModelGraphicalDemoIrrigationPost = async (
+	demoIrrigationRequest: DemoIrrigationRequest,
+	options?: RequestInit
+): Promise<compileDemoIrrigationModelGraphicalDemoIrrigationPostResponse> => {
+	return customFetch<compileDemoIrrigationModelGraphicalDemoIrrigationPostResponse>(
+		getCompileDemoIrrigationModelGraphicalDemoIrrigationPostUrl(),
+		{
+			...options,
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json', ...options?.headers },
+			body: JSON.stringify(demoIrrigationRequest)
+		}
+	);
+};
+
+export type solveGraphicalModelGraphicalProblemIdSolvePostResponse200 = {
+	data: SolveResponse;
+	status: 200;
+};
+
+export type solveGraphicalModelGraphicalProblemIdSolvePostResponse422 = {
+	data: HTTPValidationError;
+	status: 422;
+};
+
+export type solveGraphicalModelGraphicalProblemIdSolvePostResponseSuccess =
+	solveGraphicalModelGraphicalProblemIdSolvePostResponse200 & {
+		headers: Headers;
+	};
+export type solveGraphicalModelGraphicalProblemIdSolvePostResponseError =
+	solveGraphicalModelGraphicalProblemIdSolvePostResponse422 & {
+		headers: Headers;
+	};
+
+export type solveGraphicalModelGraphicalProblemIdSolvePostResponse =
+	| solveGraphicalModelGraphicalProblemIdSolvePostResponseSuccess
+	| solveGraphicalModelGraphicalProblemIdSolvePostResponseError;
+
+export const getSolveGraphicalModelGraphicalProblemIdSolvePostUrl = (problemId: number) => {
+	return `http://localhost:8000/graphical/${problemId}/solve`;
+};
+
+/**
+ * Solve a compiled diagram's `Problem` for one objective, via `guess_best_solver`.
+ *
+ * A minimal single-objective solve, so the policy of a solved problem can be shown via
+ * `/policy`. Only compiled graphical diagrams are accepted.
+ *
+ * Raises:
+ *     HTTPException: 404 if the problem isn't found or visible, or isn't a compiled graphical
+ *         diagram; 400 for an unknown `objective_symbol` or if no compatible solver exists;
+ *         500 if the solver raises or reports failure.
+ * @summary Solve Graphical Model
+ */
+export const solveGraphicalModelGraphicalProblemIdSolvePost = async (
+	problemId: number,
+	solveRequest: SolveRequest,
+	options?: RequestInit
+): Promise<solveGraphicalModelGraphicalProblemIdSolvePostResponse> => {
+	return customFetch<solveGraphicalModelGraphicalProblemIdSolvePostResponse>(
+		getSolveGraphicalModelGraphicalProblemIdSolvePostUrl(problemId),
+		{
+			...options,
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json', ...options?.headers },
+			body: JSON.stringify(solveRequest)
+		}
+	);
 };
 
 export type voteForABandGdmScoreBandsVotePostResponse200 = {

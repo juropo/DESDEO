@@ -129,6 +129,8 @@
 		isFrozen = false,
 		personalResultIndex,
 		isDecisionMaker,
+		defaultName,
+		showIterationColumn = true
 	}: {
 		problem: ProblemInfo;
 		solverResults: Array<Solution>;
@@ -145,6 +147,9 @@
 		isFrozen?: boolean;
 		personalResultIndex?: number | null;
 		isDecisionMaker?: boolean;
+		/** Name shown for an unnamed solution, overriding the method's default. */
+		defaultName?: (solution: Solution) => string;
+		showIterationColumn?: boolean;
 	} = $props();
 
 	// Get the display accuracy
@@ -152,9 +157,9 @@
 
 	// Helper function to get solution display name. idx is solutions solution_index
 	let displayName = $derived((idx: number | null, iterationNumber?: number) => {
-		if (methodPage !== "gnimbus") {
+		if (methodPage !== 'gnimbus') {
 			// For NIMBUS, use original logic
-			let indexSuffix = (solverResults.length > 1 && idx !== null) ? idx + 1 : '';
+			let indexSuffix = solverResults.length > 1 && idx !== null ? idx + 1 : '';
 			return `Solution ${indexSuffix}`;
 		}
 
@@ -173,7 +178,6 @@
 					return `Group solution ${idx}`;
 				}
 				return 'Group solution';
-
 		}
 	});
 
@@ -204,9 +208,13 @@
 			// Second column - Solution name
 			{
 				accessorKey: 'name',
-				header: ({ column }) => renderSnippet(ColumnHeader, { column, title: methodPage === "nimbus" ? 'Name (optional)' : "" }),
+				header: ({ column }) =>
+					renderSnippet(ColumnHeader, {
+						column,
+						title: methodPage === 'nimbus' ? 'Name (optional)' : ''
+					}),
 				cell: ({ row }) => renderSnippet(NameCell, { solution: row.original }),
-				enableSorting: methodPage === "nimbus",
+				enableSorting: methodPage === 'nimbus',
 				sortUndefined: 'last'
 			},
 			// Third column - Edit button (if saved)
@@ -217,7 +225,7 @@
 				enableSorting: false
 			},
 			// Fourth column - Iteration (only visible when not "current")
-			...(selected_type_solutions !== 'current'
+			...(selected_type_solutions !== 'current' && showIterationColumn
 				? [
 						{
 							id: 'iteration_number',
@@ -437,7 +445,8 @@
 			{solution.name}
 		{:else}
 			<span class="text-gray-400"
-				>{displayName(solution.solution_index, solution.iteration_number)}</span
+				>{defaultName?.(solution) ??
+					displayName(solution.solution_index, solution.iteration_number)}</span
 			>
 		{/if}
 	</div>
@@ -462,7 +471,7 @@
 {/snippet}
 
 {#snippet IterationCell({ solution }: { solution: Solution })}
-	{#if methodPage ==="gnimbus"}
+	{#if methodPage === 'gnimbus'}
 		{solution.iteration_number}
 	{:else}
 		{solution.state_id}
@@ -526,7 +535,7 @@
 				onclick={() => column.toggleSorting(column.getIsSorted() === 'asc')}
 				class="-ml-3 h-8 {objective ? 'flex-1 justify-start text-left' : ''}"
 				title={objective ? getObjectiveTitle(objective) : undefined}
-            >
+			>
 				<span>
 					{#if objective}
 						{objective.name}
@@ -550,7 +559,7 @@
 {#if problem}
 	<div class="flex h-full w-full flex-col">
 		{#if selected_type_solutions !== 'current' && !isFrozen}
-			{#if methodPage ==='gnimbus'}
+			{#if methodPage === 'gnimbus'}
 				<SolutionTableToolbar
 					{table}
 					filterColumn="iteration_number"
@@ -614,14 +623,14 @@
 							<PreviousSolutions
 								{problem}
 								previousObjectiveValues={secondaryObjectiveValues}
-								displayAccuracy={displayAccuracy}
+								{displayAccuracy}
 								columnsLength={columns.length}
 							/>
 						{:else if methodPage === 'gnimbus'}
 							<UserResults
 								{problem}
 								objectiveValues={secondaryObjectiveValues}
-								displayAccuracy={displayAccuracy}
+								{displayAccuracy}
 								columnsLength={columns.length}
 								personalResultIndex={personalResultIndex ?? -1}
 							/>

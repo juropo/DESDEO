@@ -16,7 +16,6 @@ from desdeo.problem import (
 )
 from desdeo.tools import (
     BaseSolver,
-    GurobipySolver,
     SolverOptions,
     SolverResults,
     add_group_asf,
@@ -164,6 +163,7 @@ def solve_group_sub_problems(  # noqa: C901
     current_objectives: dict[str, float],
     reference_points: dict[str, dict[str, float]],
     phase: str,
+    *,
     scalarization_options: dict | None = None,
     create_solver: BaseSolver | None = None,
     solver_options: SolverOptions | None = None,
@@ -244,8 +244,6 @@ def solve_group_sub_problems(  # noqa: C901
         raise GNIMBUSError(msg)
 
     init_solver = create_solver if create_solver is not None else guess_best_solver(problem)
-    if init_solver is GurobipySolver and not solver_options:
-        solver_options = {"OutputFlag": 0}  # TODO: how does one want this to behave?
     _solver_options = solver_options if solver_options is not None else None
     # print("solver is ", init_solver)
 

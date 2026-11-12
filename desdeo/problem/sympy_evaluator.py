@@ -4,7 +4,7 @@ import sympy as sp
 
 from desdeo.problem.evaluator import variable_dimension_enumerate
 from desdeo.problem.json_parser import FormatEnum, MathParser
-from desdeo.problem.schema import Problem
+from desdeo.problem.schema import Problem, SparseTensorConstant
 
 SUPPORTED_VAR_DIMENSIONS = ["scalar"]
 
@@ -56,6 +56,11 @@ class SympyEvaluator:
         Args:
             problem (Problem): the problem to be evaluated.
         """
+        for const in problem.constants or []:
+            if isinstance(const, SparseTensorConstant):
+                msg = f"The SymPy evaluator does not support the sparse constant '{const.symbol}'."
+                raise NotImplementedError(msg)
+
         if variable_dimension_enumerate(problem) not in SUPPORTED_VAR_DIMENSIONS:
             msg = "SymPy evaluator does not yet support tensors."
             raise SympyEvaluatorError(msg)
