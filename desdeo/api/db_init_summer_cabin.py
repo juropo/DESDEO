@@ -4,6 +4,7 @@ Includes everything from db_init.py and adds:
 - summer_cabin_battery_robust_ev_problem with stripped objectives
   (only E_f_1, f_2, E_f_3 kept as objectives; all others demoted to extra functions)
 - SolutionDescriptionMetaData for that problem
+- SolverSelectionMetadata choosing Gurobi for every summer cabin problem
 
 Run from desdeo/api/:
     python db_init_summer_cabin.py
@@ -18,7 +19,12 @@ from sqlmodel import Session, SQLModel
 from desdeo.api.config import ServerConfig, SettingsConfig
 from desdeo.api.db import engine
 from desdeo.api.models import ProblemDB, User, UserRole
-from desdeo.api.models.problem import DescriptionPart, ProblemMetaDataDB, SolutionDescriptionMetaData
+from desdeo.api.models.problem import (
+    DescriptionPart,
+    ProblemMetaDataDB,
+    SolutionDescriptionMetaData,
+    SolverSelectionMetadata,
+)
 from desdeo.api.models.scenario import ScenarioModelDB
 from desdeo.api.routers.user_authentication import get_password_hash
 from desdeo.problem.schema import ExtraFunction, Objective
@@ -185,6 +191,11 @@ if __name__ == "__main__":
                 separator="\n",
             )
             session.add(desc_metadata_full)
+            # Gurobi solves these well even with quadratic aggregates (e.g. variance), which
+            # guess_best_solver would route elsewhere. Combined problems inherit this.
+            session.add(
+                SolverSelectionMetadata(metadata_id=metadata_full_db.id, solver_string_representation="gurobipy")
+            )
             session.commit()
             print("Solution description metadata added for full problem.")
 
@@ -200,6 +211,7 @@ if __name__ == "__main__":
                 separator="\n",
             )
             session.add(desc_metadata)
+            session.add(SolverSelectionMetadata(metadata_id=metadata_db.id, solver_string_representation="gurobipy"))
             session.commit()
             print("Solution description metadata added for stripped problem.")
 
@@ -245,6 +257,9 @@ if __name__ == "__main__":
                 separator="\n",
             )
             session.add(desc_metadata_scenario)
+            session.add(
+                SolverSelectionMetadata(metadata_id=metadata_scenario_db.id, solver_string_representation="gurobipy")
+            )
             session.commit()
 
         print("Done.")

@@ -219,9 +219,14 @@ class UncertaintyMeasureSpec(BaseModel):
     The resulting combined (multi-scenario) problem replaces the current problem.
     """
 
-    measure_type: Literal["expected_value", "worst_case_robust", "conditional_value_at_risk", "weighted_scenarios"] = (
-        Field(description="Which uncertainty aggregate to apply.")
-    )
+    measure_type: Literal[
+        "expected_value",
+        "worst_case_robust",
+        "conditional_value_at_risk",
+        "weighted_scenarios",
+        "variance",
+        "mean_absolute_deviation",
+    ] = Field(description="Which uncertainty aggregate to apply.")
     scenario_model_id: int = Field(description="DB id of the ScenarioModelDB that defines the scenario structure.")
     symbols: list[str] = Field(description="Symbols of objectives or functions to aggregate.")
     prefix: str | None = Field(

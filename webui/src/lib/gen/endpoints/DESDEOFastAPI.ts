@@ -430,7 +430,9 @@ export const UncertaintyMeasureSpecMeasureType = {
 	expected_value: 'expected_value',
 	worst_case_robust: 'worst_case_robust',
 	conditional_value_at_risk: 'conditional_value_at_risk',
-	weighted_scenarios: 'weighted_scenarios'
+	weighted_scenarios: 'weighted_scenarios',
+	variance: 'variance',
+	mean_absolute_deviation: 'mean_absolute_deviation'
 } as const;
 
 /**

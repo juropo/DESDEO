@@ -9,6 +9,7 @@ import pytest
 from desdeo.mcdm.cumulus import (
     CumulusError,
     CumulusScalarization,
+    _fix_absolute_deviation_epigraphs,
     _fix_worst_case_epigraphs,
     _scenario_aug_weights,
     generate_starting_point,
@@ -23,6 +24,7 @@ from desdeo.tools import SolverResults
 from desdeo.tools.robust import add_single_objective_worst_case_regret, add_worst_case_robust
 from desdeo.tools.scenarios import build_combined_scenario_problem
 from desdeo.tools.scipy_solver_interfaces import ScipyDeSolver, ScipyMinimizeSolver
+from desdeo.tools.stochastic import add_mean_absolute_deviation, add_variance
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -730,3 +732,94 @@ def test_fix_worst_case_epigraphs_silent_on_the_normal_path(scenario_combined_wi
         fixed = _fix_worst_case_epigraphs(result, combined, leaves)
 
     assert fixed.optimal_objectives["robust_f_1"] == pytest.approx(25.0)
+
+
+# ---------------------------------------------------------------------------
+# _fix_absolute_deviation_epigraphs
+# ---------------------------------------------------------------------------
+
+# x_1 = 1 and s_{1,2,3}_x_2 = 2, 3, 4 make the f_1 leaves 3, 13, 25.
+_MAD_X = {"x_1": 1.0, "s_1_x_2": 2.0, "s_2_x_2": 3.0, "s_3_x_2": 4.0}
+_MAD_LEAF_F1 = {"s_1": 3.0, "s_2": 13.0, "s_3": 25.0}
+
+
+@pytest.fixture
+def scenario_combined_with_mad():
+    """simple_scenario_model combined problem with the MAD, variance and worst case of f_1."""
+    model = simple_scenario_model()
+    combined, symbol_maps = build_combined_scenario_problem(model)
+    combined, _ = add_mean_absolute_deviation(model, ["f_1"], combined=combined, symbol_maps=symbol_maps)
+    combined, _ = add_variance(model, ["f_1"], combined=combined, symbol_maps=symbol_maps)
+    combined, _ = add_worst_case_robust(model, ["f_1"], prefix="robust_", combined=combined, symbol_maps=symbol_maps)
+    return combined, dict(model.leaf_scenarios)
+
+
+def _mad_values(probs: dict[str, float], absdev: float) -> tuple[dict[str, float], float, float]:
+    """Variable values with exact mean/deviations and every absolute deviation set to *absdev*."""
+    mean = sum(probs[leaf] * v for leaf, v in _MAD_LEAF_F1.items())
+    values = dict(_MAD_X, _mean_f_1=mean, _t_robust_f_1=25.0)
+    for leaf, v in _MAD_LEAF_F1.items():
+        values[f"_dev_{leaf}_f_1"] = v - mean
+        values[f"_absdev_{leaf}_f_1"] = absdev
+    true_mad = sum(probs[leaf] * abs(v - mean) for leaf, v in _MAD_LEAF_F1.items())
+    true_var = sum(probs[leaf] * (v - mean) ** 2 for leaf, v in _MAD_LEAF_F1.items())
+    return values, true_mad, true_var
+
+
+@pytest.mark.cumulus
+@pytest.mark.scenario
+def test_fix_absolute_deviation_epigraphs_tightens_loose_bounds(scenario_combined_with_mad):
+    """Loose absolute-deviation bounds are set to |d_s| and the MAD is recomputed from them."""
+    combined, probs = scenario_combined_with_mad
+    values, true_mad, true_var = _mad_values(probs, absdev=100.0)
+    # The evaluator matches DataFrame columns to variables by position.
+    result = _evaluate_to_solver_results(combined, {v.symbol: values[v.symbol] for v in combined.variables})
+    assert result.optimal_objectives["MAD_f_1"] == pytest.approx(100.0)
+
+    fixed = _fix_absolute_deviation_epigraphs(result, combined)
+
+    assert fixed.optimal_objectives["MAD_f_1"] == pytest.approx(true_mad)
+    for leaf in _MAD_LEAF_F1:
+        u_sym = f"_absdev_{leaf}_f_1"
+        assert fixed.optimal_variables[u_sym] == pytest.approx(abs(values[f"_dev_{leaf}_f_1"]))
+        pos, neg = fixed.constraint_values[f"{u_sym}_pos"], fixed.constraint_values[f"{u_sym}_neg"]
+        assert max(pos, neg) == pytest.approx(0.0)
+        assert min(pos, neg) <= 0.0
+    # Elements that are not built from the absolute deviations are left alone.
+    assert fixed.optimal_objectives["VARIANCE_f_1"] == pytest.approx(true_var)
+    assert fixed.optimal_objectives["robust_f_1"] == pytest.approx(25.0)
+
+
+@pytest.mark.cumulus
+@pytest.mark.scenario
+def test_fix_absolute_deviation_epigraphs_keeps_tight_values(scenario_combined_with_mad):
+    """Already tight bounds give the same MAD before and after tightening."""
+    combined, probs = scenario_combined_with_mad
+    values, true_mad, _ = _mad_values(probs, absdev=0.0)
+    for leaf in _MAD_LEAF_F1:
+        values[f"_absdev_{leaf}_f_1"] = abs(values[f"_dev_{leaf}_f_1"])
+    # The evaluator matches DataFrame columns to variables by position.
+    result = _evaluate_to_solver_results(combined, {v.symbol: values[v.symbol] for v in combined.variables})
+
+    fixed = _fix_absolute_deviation_epigraphs(result, combined)
+
+    assert result.optimal_objectives["MAD_f_1"] == pytest.approx(true_mad)
+    assert fixed.optimal_objectives["MAD_f_1"] == pytest.approx(true_mad)
+
+
+@pytest.mark.cumulus
+@pytest.mark.scenario
+def test_fix_absolute_deviation_epigraphs_warns_on_missing_deviation(scenario_combined_with_mad):
+    """A missing deviation value leaves the bound untightened and warns."""
+    combined, probs = scenario_combined_with_mad
+    values, _, _ = _mad_values(probs, absdev=100.0)
+    # The evaluator matches DataFrame columns to variables by position.
+    result = _evaluate_to_solver_results(combined, {v.symbol: values[v.symbol] for v in combined.variables})
+    result = result.model_copy(
+        update={"optimal_variables": {k: v for k, v in result.optimal_variables.items() if k != "_dev_s_1_f_1"}}
+    )
+
+    with pytest.warns(UserWarning, match="Could not tighten the absolute-deviation variables"):
+        fixed = _fix_absolute_deviation_epigraphs(result, combined)
+
+    assert fixed.optimal_variables["_absdev_s_1_f_1"] == pytest.approx(100.0)

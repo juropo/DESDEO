@@ -110,6 +110,8 @@ _MEASURE_PREFIXES = {
     "robust_": "worst_case_robust",
     "CVAR_": "conditional_value_at_risk",
     "weighted_": "weighted_scenarios",
+    "VARIANCE_": "variance",
+    "MAD_": "mean_absolute_deviation",
 }
 
 

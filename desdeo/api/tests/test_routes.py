@@ -2021,9 +2021,7 @@ def test_cumulus_modify_problem_does_not_claim_convexity_it_cannot_show(client: 
     assert constraint.is_twice_differentiable is True
 
 
-def test_cumulus_objective_constraint_derives_soft_constraint_properties(
-    client: TestClient, session_and_user: dict
-):
+def test_cumulus_objective_constraint_derives_soft_constraint_properties(client: TestClient, session_and_user: dict):
     """Soft constraints get their properties derived too.
 
     They are stored detached from the problem, but later solves hand them to
@@ -2565,9 +2563,7 @@ def test_cumulus_scenario_availability_after_combined_problem(client: TestClient
     combined_problem_id = init_response.json()["problem_id"]
     assert combined_problem_id != problem_id
 
-    response = get_json(
-        client, f"/method/cumulus/scenario-availability?problem_id={combined_problem_id}", access_token
-    )
+    response = get_json(client, f"/method/cumulus/scenario-availability?problem_id={combined_problem_id}", access_token)
 
     assert response.status_code == status.HTTP_200_OK
     data = response.json()
@@ -2575,6 +2571,36 @@ def test_cumulus_scenario_availability_after_combined_problem(client: TestClient
     assert data["base_problem_id"] == problem_id
     assert data["scenario_model_id"] == sm_id
     assert data["applied_measures"] == ["expected_value"]
+
+
+def test_cumulus_dispersion_measures(client: TestClient, session_and_user: dict):
+    """Variance and MAD measures add minimized objectives with ideal/nadir and are detected as applied."""
+    access_token = login(client)
+    problem_id, sm_id = _setup_simple_scenario(session_and_user)
+
+    init_request = CumulusInitializationRequest(
+        problem_id=problem_id,
+        uncertainty_measures=[
+            {"measure_type": "expected_value", "scenario_model_id": sm_id, "symbols": ["f_3"]},
+            {"measure_type": "variance", "scenario_model_id": sm_id, "symbols": ["f_3"]},
+            {"measure_type": "mean_absolute_deviation", "scenario_model_id": sm_id, "symbols": ["f_3"]},
+        ],
+    )
+    init_response = post_json(client, "/method/cumulus/get-or-initialize", init_request.model_dump(), access_token)
+    assert init_response.status_code == status.HTTP_200_OK
+    combined_problem_id = init_response.json()["problem_id"]
+
+    combined = session_and_user["session"].get(ProblemDB, combined_problem_id)
+    for symbol in ("VARIANCE_f_3", "MAD_f_3"):
+        obj = next(obj for obj in combined.objectives if obj.symbol == symbol)
+        assert not obj.maximize
+        assert obj.ideal is not None
+        assert obj.nadir is not None
+        assert 0.0 <= obj.ideal <= obj.nadir
+
+    response = get_json(client, f"/method/cumulus/scenario-availability?problem_id={combined_problem_id}", access_token)
+    assert response.status_code == status.HTTP_200_OK
+    assert response.json()["applied_measures"] == ["expected_value", "mean_absolute_deviation", "variance"]
 
 
 def test_cumulus_apply_scenario_measures_builds_combined_problem(client: TestClient, session_and_user: dict):

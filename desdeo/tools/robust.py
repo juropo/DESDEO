@@ -18,6 +18,7 @@ if TYPE_CHECKING:
 def add_worst_case_robust(
     scenario_model: "ScenarioModel",
     symbols: list[str],
+    *,
     prefix: str = "robust_",
     combined: "Problem | None" = None,
     symbol_maps: "dict[str, dict[str, dict[str, str]]] | None" = None,
@@ -139,6 +140,7 @@ def add_single_objective_worst_case_regret(
     scenario_model: "ScenarioModel",
     symbols: list[str],
     ideals: "dict[str, dict[str, float]]",
+    *,
     prefix: str = "regret_wc_",
     combined: "Problem | None" = None,
     symbol_maps: "dict[str, dict[str, dict[str, str]]] | None" = None,
@@ -264,6 +266,7 @@ def add_weighted_scenarios(
     scenario_model: "ScenarioModel",
     symbols: list[str],
     weights: dict[str, float],
+    *,
     prefix: str = "weighted_",
     combined: "Problem | None" = None,
     symbol_maps: "dict[str, dict[str, dict[str, str]]] | None" = None,

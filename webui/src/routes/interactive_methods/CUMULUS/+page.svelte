@@ -175,7 +175,9 @@
 	const AVAILABLE_MEASURES: { value: MeasureType; label: string }[] = [
 		{ value: 'expected_value', label: 'Expected value (E_)' },
 		{ value: 'worst_case_robust', label: 'Worst-case robust (robust_)' },
-		{ value: 'conditional_value_at_risk', label: 'Conditional Value at Risk (CVaR, α = 95%)' }
+		{ value: 'conditional_value_at_risk', label: 'Conditional Value at Risk (CVaR, α = 95%)' },
+		{ value: 'variance', label: 'Variance (VARIANCE_)' },
+		{ value: 'mean_absolute_deviation', label: 'Mean absolute deviation (MAD_)' }
 	];
 	let selected_measures: MeasureType[] = $state(['expected_value']);
 	let cvar_alpha = $state(0.95);

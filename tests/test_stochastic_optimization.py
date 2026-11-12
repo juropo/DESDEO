@@ -4,14 +4,22 @@ import math
 
 import pytest
 
+from desdeo.problem import PolarsEvaluator
 from desdeo.problem.scenario import Scenario, ScenarioModel
-from desdeo.problem.schema import Constant, Objective, Problem, Variable, VariableTypeEnum
+from desdeo.problem.schema import Constant, ConstraintTypeEnum, Objective, Problem, Variable, VariableTypeEnum
 from desdeo.problem.testproblems import simple_scenario_model
 from desdeo.tools import GurobipySolver, guess_best_solver
 from desdeo.tools.robust import add_weighted_scenarios, add_worst_case_robust
 from desdeo.tools.scalarization import add_asf_diff
 from desdeo.tools.scenarios import build_combined_scenario_problem
-from desdeo.tools.stochastic import add_conditional_value_at_risk, add_expected_asf, add_expected_value
+from desdeo.tools.stochastic import (
+    add_conditional_value_at_risk,
+    add_expected_asf,
+    add_expected_value,
+    add_mean_absolute_deviation,
+    add_standard_deviation,
+    add_variance,
+)
 
 _REF = {"f_1": 0.0, "f_2": 0.0, "f_3": 0.0}
 _IDEAL = {"f_1": -100.0, "f_2": -100.0, "f_3": -100.0}
@@ -205,6 +213,169 @@ def test_cvar_objective_value_matches_tail_mean(maximize, expected):
     for leaf in ("s_1", "s_2", "s_3", "s_4"):
         assert result.optimal_variables[f"{leaf}_x"] == pytest.approx(1.0 if maximize else 0.0)
     assert result.optimal_objectives[cvar_sym] == pytest.approx(expected)
+
+
+# ---------------------------------------------------------------------------
+# add_variance / add_standard_deviation / add_mean_absolute_deviation
+# ---------------------------------------------------------------------------
+
+_DIRECTION_LEAVES = ("s_1", "s_2", "s_3", "s_4")
+_DIRECTION_PROBS = (0.1, 0.2, 0.3, 0.4)
+
+
+def _objective(problem: Problem, symbol: str):
+    return next(o for o in problem.objectives if o.symbol == symbol)
+
+
+def _add_all_dispersions(model):
+    combined, symbol_maps = build_combined_scenario_problem(model)
+    problem, var_added = add_variance(model, ["f"], combined=combined, symbol_maps=symbol_maps)
+    problem, std_added = add_standard_deviation(model, ["f"], combined=problem, symbol_maps=symbol_maps)
+    problem, mad_added = add_mean_absolute_deviation(model, ["f"], combined=problem, symbol_maps=symbol_maps)
+    return problem, (var_added, std_added, mad_added)
+
+
+@pytest.mark.scenario
+@pytest.mark.parametrize("maximize", [True, False])
+def test_dispersion_values(maximize):
+    """At x = 0 the leaf values are 1..4 with mean 3: variance and std are 1, MAD is 0.8."""
+    model = _cvar_direction_model(maximize)
+    problem, (var_added, std_added, mad_added) = _add_all_dispersions(model)
+
+    assert var_added == {"f": "VARIANCE_f"}
+    assert std_added == {"f": "STD_f"}
+    assert mad_added == {"f": "MAD_f"}
+
+    # Deviations c - 3 for c = 1..4; the absolute-deviation bounds are tight.
+    values = {v.symbol: [0.0] for v in problem.variables}
+    values["_mean_f"] = [3.0]
+    for i, leaf in enumerate(_DIRECTION_LEAVES):
+        values[f"_dev_{leaf}_f"] = [float(i + 1) - 3.0]
+        values[f"_absdev_{leaf}_f"] = [abs(float(i + 1) - 3.0)]
+
+    result = PolarsEvaluator(problem).evaluate(values)
+    assert result["VARIANCE_f"][0] == pytest.approx(1.0)
+    assert result["STD_f"][0] == pytest.approx(1.0)
+    assert result["MAD_f"][0] == pytest.approx(0.8)
+    for con in problem.constraints:
+        if con.cons_type == ConstraintTypeEnum.EQ:
+            assert result[con.symbol][0] == pytest.approx(0.0), con.symbol
+        else:
+            assert result[con.symbol][0] <= 1e-9, con.symbol
+
+
+@pytest.mark.scenario
+def test_dispersions_share_helper_variables():
+    """Variance, std and MAD of one symbol add a single mean and one deviation per leaf."""
+    model = _cvar_direction_model(maximize=False)
+    base_vars = {v.symbol for v in build_combined_scenario_problem(model)[0].variables}
+    problem, _ = _add_all_dispersions(model)
+    # Applying the variance again under another prefix reuses everything as well.
+    problem, _ = add_variance(
+        model, ["f"], prefix="OTHER_", combined=problem, symbol_maps=build_combined_scenario_problem(model)[1]
+    )
+
+    added_vars = sorted({v.symbol for v in problem.variables} - base_vars)
+    assert added_vars == sorted(
+        [
+            "_mean_f",
+            *(f"_dev_{leaf}_f" for leaf in _DIRECTION_LEAVES),
+            *(f"_absdev_{leaf}_f" for leaf in _DIRECTION_LEAVES),
+        ]
+    )
+    symbols = problem.get_all_symbols()
+    assert len(symbols) == len(set(symbols))
+
+
+@pytest.mark.scenario
+def test_dispersion_rejects_foreign_helper_symbol():
+    """A helper name already used by an unrelated element raises instead of being reused."""
+    model = _cvar_direction_model(maximize=False)
+    combined, symbol_maps = build_combined_scenario_problem(model)
+    combined = combined.model_copy(
+        update={
+            "variables": [
+                *combined.variables,
+                Variable(name="unrelated", symbol="_mean_f", variable_type=VariableTypeEnum.real),
+            ]
+        }
+    )
+
+    with pytest.raises(ValueError, match="already in use by other elements"):
+        add_variance(model, ["f"], combined=combined, symbol_maps=symbol_maps)
+
+
+@pytest.mark.scenario
+def test_dispersion_flags():
+    """Dispersion objectives are minimized even for maximized originals; only MAD is linear."""
+    model = _cvar_direction_model(maximize=True)
+    problem, _ = _add_all_dispersions(model)
+
+    for symbol in ("VARIANCE_f", "STD_f", "MAD_f"):
+        obj = _objective(problem, symbol)
+        assert not obj.maximize
+        assert obj.is_linear == (symbol == "MAD_f")
+        assert obj.is_convex
+        assert obj.is_twice_differentiable
+
+
+@pytest.mark.scenario
+@pytest.mark.gurobipy
+def test_mean_absolute_deviation_minimum_is_exact():
+    """Minimizing MAD with Gurobi gives a value equal to the MAD recomputed from the leaf values."""
+    model = _cvar_direction_model(maximize=False)
+    problem, added = add_mean_absolute_deviation(model, ["f"])
+    assert problem.is_linear
+
+    result = GurobipySolver(problem).solve(added["f"])
+
+    assert result.success
+    leaf_values = [result.optimal_objectives[f"{leaf}_f"] for leaf in _DIRECTION_LEAVES]
+    mean = sum(p * v for p, v in zip(_DIRECTION_PROBS, leaf_values, strict=True))
+    mad = sum(p * abs(v - mean) for p, v in zip(_DIRECTION_PROBS, leaf_values, strict=True))
+    assert result.optimal_objectives["MAD_f"] == pytest.approx(mad, abs=1e-6)
+
+
+@pytest.mark.scenario
+def test_variance_coexists_with_other_aggregates():
+    """Expected value, CVaR and the dispersions on one combined problem use distinct symbols."""
+    model = _cvar_direction_model(maximize=False)
+    problem, symbol_maps = build_combined_scenario_problem(model)
+    problem, _ = add_expected_value(model, ["f"], combined=problem, symbol_maps=symbol_maps)
+    problem, _ = add_conditional_value_at_risk(model, ["f"], alpha=0.5, combined=problem, symbol_maps=symbol_maps)
+    problem, _ = add_variance(model, ["f"], combined=problem, symbol_maps=symbol_maps)
+    problem, _ = add_standard_deviation(model, ["f"], combined=problem, symbol_maps=symbol_maps)
+    problem, _ = add_mean_absolute_deviation(model, ["f"], combined=problem, symbol_maps=symbol_maps)
+
+    symbols = problem.get_all_symbols()
+    assert {"E_f", "VAR_f", "CVAR_f", "VARIANCE_f", "STD_f", "MAD_f"} <= set(symbols)
+    assert len(symbols) == len(set(symbols))
+
+
+@pytest.mark.scenario
+def test_variance_rejects_symbol_in_use():
+    """A prefix clashing with CVaR's VaR threshold, or a repeated symbol, raises."""
+    model = _cvar_direction_model(maximize=False)
+    problem, symbol_maps = build_combined_scenario_problem(model)
+    problem, _ = add_conditional_value_at_risk(model, ["f"], alpha=0.5, combined=problem, symbol_maps=symbol_maps)
+
+    with pytest.raises(ValueError, match="already in use"):
+        add_variance(model, ["f"], prefix="VAR_", combined=problem, symbol_maps=symbol_maps)
+    with pytest.raises(ValueError, match="already in use"):
+        add_standard_deviation(model, ["f", "f"])
+
+
+@pytest.mark.scenario
+@pytest.mark.gurobipy
+def test_variance_minimum():
+    """Minimizing variance clips each leaf value to a common target 24/7: values 2, 3, 24/7, 4."""
+    model = _cvar_direction_model(maximize=False)
+    problem, added = add_variance(model, ["f"])
+
+    result = GurobipySolver(problem).solve(added["f"])
+
+    assert result.success
+    assert result.optimal_objectives["VARIANCE_f"] == pytest.approx(18.2 / 49, abs=1e-6)
 
 
 # ---------------------------------------------------------------------------

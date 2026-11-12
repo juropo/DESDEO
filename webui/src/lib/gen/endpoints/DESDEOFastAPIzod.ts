@@ -6597,7 +6597,9 @@ export const InitializeMethodCumulusInitializePostBody = zod
 									'expected_value',
 									'worst_case_robust',
 									'conditional_value_at_risk',
-									'weighted_scenarios'
+									'weighted_scenarios',
+									'variance',
+									'mean_absolute_deviation'
 								])
 								.describe('Which uncertainty aggregate to apply.'),
 							scenario_model_id: zod
@@ -6811,7 +6813,9 @@ export const GetOrInitializeMethodCumulusGetOrInitializePostBody = zod
 									'expected_value',
 									'worst_case_robust',
 									'conditional_value_at_risk',
-									'weighted_scenarios'
+									'weighted_scenarios',
+									'variance',
+									'mean_absolute_deviation'
 								])
 								.describe('Which uncertainty aggregate to apply.'),
 							scenario_model_id: zod
@@ -7184,7 +7188,9 @@ export const ApplyScenarioMeasuresMethodCumulusApplyScenarioMeasuresPostBody = z
 									'expected_value',
 									'worst_case_robust',
 									'conditional_value_at_risk',
-									'weighted_scenarios'
+									'weighted_scenarios',
+									'variance',
+									'mean_absolute_deviation'
 								])
 								.describe('Which uncertainty aggregate to apply.'),
 							scenario_model_id: zod
@@ -7679,7 +7685,9 @@ export const ModifyProblemMethodCumulusModifyProblemPostBody = zod
 											'expected_value',
 											'worst_case_robust',
 											'conditional_value_at_risk',
-											'weighted_scenarios'
+											'weighted_scenarios',
+											'variance',
+											'mean_absolute_deviation'
 										])
 										.describe('Which uncertainty aggregate to apply.'),
 									scenario_model_id: zod

@@ -542,6 +542,104 @@ def _fix_worst_case_epigraphs(
     )
 
 
+def _func_symbols(func) -> set[str]:
+    """Collect the symbols in a MathJSON expression; operators are the heads of lists."""
+    if isinstance(func, str):
+        return {func}
+    if isinstance(func, list) and func:
+        return {sym for arg in func[1:] for sym in _func_symbols(arg)}
+    return set()
+
+
+def _eval_weighted_sum(func, values: dict[str, float]) -> float:
+    """Evaluate a MathJSON expression built only from ``Add``, ``Multiply``, numbers and symbols."""
+    if isinstance(func, (int, float)):
+        return float(func)
+    if isinstance(func, str):
+        return float(values[func])
+    op, *args = func
+    if op == "Add":
+        return sum(_eval_weighted_sum(a, values) for a in args)
+    if op == "Multiply":
+        product = 1.0
+        for a in args:
+            product *= _eval_weighted_sum(a, values)
+        return product
+    msg = f"Unexpected operator '{op}' in a mean-absolute-deviation aggregate."
+    raise ValueError(msg)
+
+
+def _fix_absolute_deviation_epigraphs(result: SolverResults, problem: Problem) -> SolverResults:
+    """Tighten mean-absolute-deviation epigraph variables to the true absolute deviations.
+
+    `add_mean_absolute_deviation` bounds each per-leaf deviation ``d_s`` from above by
+    ``u_s >= |d_s|`` (``_absdev_{leaf}_{sym}``), which is exact only where the solver is
+    pushed to lower ``u_s``.  This sets every ``u_s`` to ``|d_s|``, read from the matching
+    ``_dev_{leaf}_{sym}`` variable, updates its two bound constraints, and recomputes every
+    aggregate whose expression references only these variables.
+
+    Args:
+        result: the solver results to tighten.
+        problem: the combined problem the results belong to.
+
+    Returns:
+        SolverResults: a copy with every absolute-deviation variable, and the aggregates
+            built from them, set to their true values.
+    """
+    new_vars = dict(result.optimal_variables)
+    new_cons = dict(result.constraint_values or {})
+    tightened: set[str] = set()
+    untightened: list[str] = []
+
+    for var in problem.variables:
+        u_sym = var.symbol
+        if not u_sym.startswith("_absdev_") or not var.name.startswith("Absolute deviation of "):
+            continue
+        dev_sym = f"_dev_{u_sym[len('_absdev_') :]}"
+        if u_sym not in new_vars or dev_sym not in new_vars:
+            untightened.append(u_sym)
+            continue
+        d_val = float(new_vars[dev_sym])
+        u_val = abs(d_val)
+        new_vars[u_sym] = u_val
+        if f"{u_sym}_pos" in new_cons:
+            new_cons[f"{u_sym}_pos"] = d_val - u_val
+        if f"{u_sym}_neg" in new_cons:
+            new_cons[f"{u_sym}_neg"] = -d_val - u_val
+        tightened.add(u_sym)
+
+    if untightened:
+        warnings.warn(
+            f"Could not tighten the absolute-deviation variables {sorted(untightened)}: their "
+            "values or the matching deviation variables are missing from the solver results. "
+            "The mean absolute deviations reported for them may be larger than the solution attains.",
+            stacklevel=2,
+        )
+
+    updated: dict[str, dict] = {}
+    for kind, solved in (
+        ("objectives", result.optimal_objectives),
+        ("extra_funcs", result.extra_func_values),
+        ("scalarization_funcs", result.scalarization_values),
+    ):
+        values = dict(solved or {})
+        for elem in getattr(problem, kind) or []:
+            referenced = _func_symbols(elem.func)
+            if elem.symbol in values and referenced and referenced <= tightened:
+                values[elem.symbol] = _eval_weighted_sum(elem.func, new_vars)
+        updated[kind] = values
+
+    return result.model_copy(
+        update={
+            "optimal_variables": new_vars,
+            "constraint_values": new_cons or None,
+            "optimal_objectives": updated["objectives"],
+            "extra_func_values": updated["extra_funcs"] or None,
+            "scalarization_values": updated["scalarization_funcs"] or None,
+        }
+    )
+
+
 def solve_sub_problems(
     problem: Problem,
     current_objectives: dict[str, float],
@@ -651,7 +749,11 @@ def solve_sub_problems(
 
     if _symbol_maps is not None:
         results = {
-            sf: _fix_worst_case_epigraphs(r, problem, scenario_model.leaf_scenarios) if r is not None else None
+            sf: _fix_absolute_deviation_epigraphs(
+                _fix_worst_case_epigraphs(r, problem, scenario_model.leaf_scenarios), problem
+            )
+            if r is not None
+            else None
             for sf, r in results.items()
         }
     return results
@@ -724,5 +826,6 @@ def generate_starting_point(
 
     if scenario_model is not None and result.success:
         result = _fix_worst_case_epigraphs(result, problem, scenario_model.leaf_scenarios)
+        result = _fix_absolute_deviation_epigraphs(result, problem)
 
     return result

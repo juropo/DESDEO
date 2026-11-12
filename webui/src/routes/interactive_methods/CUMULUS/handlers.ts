@@ -375,7 +375,9 @@ export type MeasureType =
 	| 'expected_value'
 	| 'worst_case_robust'
 	| 'conditional_value_at_risk'
-	| 'weighted_scenarios';
+	| 'weighted_scenarios'
+	| 'variance'
+	| 'mean_absolute_deviation';
 
 export interface MeasureOptions {
 	cvar_alpha?: number;

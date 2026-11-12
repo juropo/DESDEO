@@ -56,7 +56,12 @@ from desdeo.problem.utils import ProblemUtilsError, add_soft_constraint, determi
 from desdeo.tools import SolverResults, guess_best_solver
 from desdeo.tools.robust import add_weighted_scenarios, add_worst_case_robust
 from desdeo.tools.scenarios import build_combined_scenario_problem
-from desdeo.tools.stochastic import add_conditional_value_at_risk, add_expected_value
+from desdeo.tools.stochastic import (
+    add_conditional_value_at_risk,
+    add_expected_value,
+    add_mean_absolute_deviation,
+    add_variance,
+)
 from desdeo.tools.utils import payoff_table_method
 
 
@@ -221,6 +226,22 @@ def _apply_uncertainty_measures(problem: Problem, mods: ProblemModification, db_
                     spec.symbols,
                     alpha=spec.alpha,
                     cvar_prefix=spec.prefix or "CVAR_",
+                    combined=combined,
+                    symbol_maps=symbol_maps,
+                )
+            elif spec.measure_type == "variance":
+                combined, _ = add_variance(
+                    scenario_model,
+                    spec.symbols,
+                    prefix=spec.prefix or "VARIANCE_",
+                    combined=combined,
+                    symbol_maps=symbol_maps,
+                )
+            elif spec.measure_type == "mean_absolute_deviation":
+                combined, _ = add_mean_absolute_deviation(
+                    scenario_model,
+                    spec.symbols,
+                    prefix=spec.prefix or "MAD_",
                     combined=combined,
                     symbol_maps=symbol_maps,
                 )
