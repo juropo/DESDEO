@@ -18,6 +18,7 @@ from desdeo.tools.utils import (
     find_compatible_solvers,
     guess_best_solver,
     is_heuristic_solver,
+    pareto_payoff_table_method,
     payoff_table_method,
 )
 
@@ -89,8 +90,9 @@ def test_payoff_dtlz2():
 
 @pytest.mark.utils
 @pytest.mark.githubskip(reason="Solver behaviour on unbounded problems differs on GitHub runners")
+@pytest.mark.parametrize("method", [payoff_table_method, pareto_payoff_table_method])
 @pytest.mark.parametrize("solver", [None, PyomoIpoptSolver, ScipyMinimizeSolver])
-def test_payoff_require_success_rejects_an_unbounded_objective(solver):
+def test_payoff_require_success_rejects_an_unbounded_objective(solver, method):
     """Without `require_success` an unbounded objective yields made-up ideal and nadir values."""
     linear = {"is_linear": True, "is_convex": True, "is_twice_differentiable": True}
     problem = Problem(
@@ -109,7 +111,7 @@ def test_payoff_require_success_rejects_an_unbounded_objective(solver):
     )
 
     with pytest.raises(ValueError, match="f_1"):
-        payoff_table_method(problem, solver, require_success=True)
+        method(problem, solver, require_success=True)
 
 
 @pytest.mark.utils
@@ -125,3 +127,56 @@ def test_is_heuristic_solver():
     assert not is_heuristic_solver(PyomoIpoptSolver)
     assert not is_heuristic_solver(ScipyMinimizeSolver)
     assert not is_heuristic_solver(None)
+
+
+def _tied_problem(*, maximize_f_1: bool) -> Problem:
+    """f_1 = x leaves y free at its optimum; only y = 1 is Pareto optimal, giving nadir (1, 1).
+
+    A solver that leaves y at its lower bound gets the dominated f_2 = 2 instead.
+
+    With ``maximize_f_1`` f_1 is written as the maximized 1 - x, whose nadir is 0.
+    """
+    linear = {"is_linear": True, "is_convex": True, "is_twice_differentiable": True}
+    return Problem(
+        name="tied",
+        description="Minimizing f_1 alone does not determine y.",
+        variables=[
+            Variable(name="x", symbol="x", variable_type=VariableTypeEnum.real, lowerbound=0, upperbound=1),
+            Variable(name="y", symbol="y", variable_type=VariableTypeEnum.real, lowerbound=0, upperbound=1),
+        ],
+        objectives=[
+            Objective(name="f_1", symbol="f_1", func="1 - x" if maximize_f_1 else "x", maximize=maximize_f_1, **linear),
+            Objective(name="f_2", symbol="f_2", func="2 - x - y", **linear),
+        ],
+    )
+
+
+@pytest.mark.utils
+@pytest.mark.parametrize(("maximize_f_1", "f_1_ideal", "f_1_nadir"), [(False, 0.0, 1.0), (True, 1.0, 0.0)])
+def test_pareto_payoff_rows_are_pareto_optimal(maximize_f_1, f_1_ideal, f_1_nadir):
+    """Re-optimizing each row with the others weighted gives the true nadir despite the tie in f_1."""
+    problem = _tied_problem(maximize_f_1=maximize_f_1)
+
+    ideal, nadir = pareto_payoff_table_method(problem)
+
+    assert ideal == pytest.approx({"f_1": f_1_ideal, "f_2": 0.0}, abs=1e-5)
+    assert nadir == pytest.approx({"f_1": f_1_nadir, "f_2": 1.0}, abs=1e-5)
+
+
+@pytest.mark.utils
+def test_pareto_payoff_falls_back_to_single_objective_rows():
+    """When every re-optimization fails, the rows and hence the estimate are the plain payoff table's."""
+    problem = _tied_problem(maximize_f_1=False)
+    base = guess_best_solver(problem)
+
+    class FailingSecondPass(base):
+        def solve(self, target):
+            result = super().solve(target)
+            return result.model_copy(update={"success": False}) if target == "_payoff_ws" else result
+
+    with pytest.warns(UserWarning, match="f_1"):
+        ideal, nadir = pareto_payoff_table_method(problem, FailingSecondPass)
+
+    plain_ideal, plain_nadir = payoff_table_method(problem, base)
+    assert ideal == pytest.approx(plain_ideal)
+    assert nadir == pytest.approx(plain_nadir)

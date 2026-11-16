@@ -1,12 +1,15 @@
 """General utilities related to solvers."""
 
 import shutil
+import warnings
 from collections.abc import Callable
 
 import numpy as np
 import polars as pl
 
 from desdeo.problem import (
+    Constraint,
+    ConstraintTypeEnum,
     ObjectiveTypeEnum,
     Problem,
     VariableDimensionEnum,
@@ -408,6 +411,138 @@ def payoff_table_method(
             nadir.append(np.min(po_table.T[i]))
         else:
             nadir.append(np.max(po_table.T[i]))
+    return numpy_array_to_objective_dict(problem, ideal), numpy_array_to_objective_dict(problem, nadir)
+
+
+def _payoff_row(res, problem: Problem) -> list:
+    return [res.optimal_objectives.get(obj.symbol) for obj in problem.objectives]
+
+
+def _as_floats(values: list) -> list[float]:
+    return [float(v) if isinstance(v, int | float) else np.nan for v in values]
+
+
+def _is_finite_row(res, values: list) -> bool:
+    return res.success and all(isinstance(v, int | float) and np.isfinite(v) for v in values)
+
+
+def pareto_payoff_table_method(
+    problem: Problem,
+    solver: BaseSolver = None,
+    *,
+    require_success: bool = False,
+    abs_tol: float = 1e-6,
+    rel_tol: float = 1e-6,
+) -> tuple[dict[str, float], dict[str, float]]:
+    """Estimate the ideal and nadir points from a payoff table of Pareto optimal solutions.
+
+    Like :func:`payoff_table_method`, but each row is made Pareto optimal. The single-objective
+    optimum of ``f_i`` is often not unique, and the plain payoff table reads the other objectives
+    from whichever optimum the solver returns, which may be dominated. Here each row is solved
+    twice:
+
+    1. Minimize ``f_i`` (in its minimization form) to get ``f_i*``.
+    2. Keep ``f_i`` within ``delta_i = max(abs_tol, rel_tol * |f_i*|)`` of ``f_i*`` and minimize
+       a weighted sum of all objectives, weighted by the reciprocal of each objective's range in
+       the table from step 1. All weights are positive, so the row is Pareto optimal (up to
+       ``delta_i``). It also pushes every epigraph-style aggregate down to its true value.
+
+    The nadir is still only an estimate: payoff tables can misjudge it. The method costs ``2k``
+    solves and ``k + 1`` solver builds for ``k`` objectives.
+
+    Args:
+        problem (Problem): The problem for which the ideal and nadir are solved.
+        solver (BaseSolver): The solver to be used in solving the points. Defaults to None.
+        require_success (bool): raise instead of using the result when a step-1 solve is
+            unsuccessful or yields non-finite objective values, e.g. because an objective is
+            unbounded. Defaults to False.
+        abs_tol (float): absolute tolerance for keeping ``f_i`` at its optimum in step 2.
+        rel_tol (float): relative tolerance for keeping ``f_i`` at its optimum in step 2.
+
+    Raises:
+        ValueError: `require_success` is set and a step-1 solve failed.
+
+    Warns:
+        UserWarning: when a step-2 solve fails; that row falls back to its step-1 solution.
+
+    Returns:
+        tuple[dict[str, float], dict[str, float]]: The estimated ideal and nadir points.
+    """
+    # scalarization imports this module, so it is imported here.
+    from desdeo.tools.scalarization import add_weighted_sums  # noqa: PLC0415
+
+    solver = solver if solver is not None else guess_best_solver(problem)
+    objectives = problem.objectives
+    k = len(objectives)
+    sign = np.array([-1.0 if obj.maximize else 1.0 for obj in objectives])
+
+    first_solver = solver(problem)
+    first_pass = np.zeros((k, k))
+    optima = np.zeros(k)
+    solved_first = np.zeros(k, dtype=bool)
+    for i, obj in enumerate(objectives):
+        res = first_solver.solve(f"{obj.symbol}_min")
+        values = _payoff_row(res, problem)
+        solved_first[i] = _is_finite_row(res, values)
+        if require_success and not solved_first[i]:
+            msg = f"Optimizing objective '{obj.symbol}' failed ({res.message}); it may be unbounded."
+            raise ValueError(msg)
+        first_pass[i] = _as_floats(values)
+        optima[i] = sign[i] * first_pass[i][i]
+
+    # Weights from the ranges of the step-1 table; failed rows are left out.
+    finite = np.where(np.isfinite(first_pass), first_pass, np.nan)
+    with warnings.catch_warnings(), np.errstate(invalid="ignore"):
+        warnings.simplefilter("ignore", RuntimeWarning)
+        ranges = np.nanmax(finite, axis=0) - np.nanmin(finite, axis=0)
+    ranges = np.where(np.isfinite(ranges) & (ranges > 0), ranges, 1.0)
+    weights = (1.0 / ranges) / np.sum(1.0 / ranges)
+    weights_by_symbol = {obj.symbol: float(w) for obj, w in zip(objectives, weights, strict=True)}
+
+    po_table = first_pass.copy()
+    fallback_rows: list[str] = []
+    for i, obj in enumerate(objectives):
+        if not solved_first[i]:
+            # Without an optimum there is nothing to keep; the row stays as solved.
+            continue
+        delta = max(abs_tol, rel_tol * abs(optima[i]))
+        # f_i_min <= f_i* + delta, written on the objective itself.
+        bound_func = (
+            ["Add", ["Negate", obj.symbol], -(optima[i] + delta)]
+            if obj.maximize
+            else ["Add", obj.symbol, -(optima[i] + delta)]
+        )
+        bounded = problem.add_constraints(
+            [
+                Constraint(
+                    name=f"Keep {obj.name} at its optimum",
+                    symbol=f"{obj.symbol}_payoff_bound",
+                    func=bound_func,
+                    cons_type=ConstraintTypeEnum.LTE,
+                    is_linear=obj.is_linear,
+                    is_convex=obj.is_convex,
+                    is_twice_differentiable=obj.is_twice_differentiable,
+                )
+            ]
+        )
+        bounded, ws_symbol = add_weighted_sums(bounded, "_payoff_ws", weights_by_symbol)
+
+        res = solver(bounded).solve(ws_symbol)
+        values = _payoff_row(res, problem)
+        if _is_finite_row(res, values):
+            po_table[i] = _as_floats(values)
+        else:
+            fallback_rows.append(obj.symbol)
+
+    if fallback_rows:
+        warnings.warn(
+            f"Re-optimizing the payoff table rows of {fallback_rows} failed; those rows use their "
+            "single-objective solutions, which may not be Pareto optimal.",
+            stacklevel=2,
+        )
+
+    ideal = np.diag(po_table)
+    nadir = [np.min(po_table.T[i]) if obj.maximize else np.max(po_table.T[i]) for i, obj in enumerate(objectives)]
     return numpy_array_to_objective_dict(problem, ideal), numpy_array_to_objective_dict(problem, nadir)
 
 

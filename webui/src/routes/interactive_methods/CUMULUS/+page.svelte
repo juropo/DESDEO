@@ -1128,6 +1128,15 @@
 						/>
 					</div>
 				{/if}
+				{#if selected_measures.includes('variance')}
+					<p
+						class="rounded border border-amber-300 bg-amber-50 px-2 py-1 text-sm text-amber-900 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-200"
+						role="note"
+					>
+						Variance makes the problem quadratic, so building the combined problem and solving it
+						can take much longer. Mean absolute deviation is a faster alternative.
+					</p>
+				{/if}
 			</div>
 			<Dialog.Footer>
 				<Button variant="outline" onclick={cancel_scenario_setup}>

@@ -68,6 +68,7 @@ __all__ = [
     "get_corrected_ideal_and_nadir",
     "guess_best_solver",
     "is_heuristic_solver",
+    "pareto_payoff_table_method",
     "payoff_table_method",
     "solve_all_scenarios",
     "solve_scenario",
@@ -148,5 +149,6 @@ from desdeo.tools.utils import (
     get_corrected_ideal_and_nadir,
     guess_best_solver,
     is_heuristic_solver,
+    pareto_payoff_table_method,
     payoff_table_method,
 )

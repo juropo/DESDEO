@@ -63,7 +63,7 @@ from desdeo.problem import PolarsEvaluator, Problem, ScenarioModel
 from desdeo.problem.json_parser import FormatEnum, MathParser
 from desdeo.problem.schema import Constraint, ConstraintTypeEnum, TensorVariable
 from desdeo.tools import SolverResults, guess_best_solver, is_heuristic_solver
-from desdeo.tools.utils import payoff_table_method
+from desdeo.tools.utils import pareto_payoff_table_method
 
 from .utils import (
     ContextField,
@@ -168,7 +168,7 @@ def _build_combined_problem_and_initialize(
     # Estimate ideal/nadir via payoff table so scalarizations are well-scaled.
     solver = check_solver(problem_db=base_problem_db)
     try:
-        estimated_ideal, estimated_nadir = payoff_table_method(combined_problem, solver)
+        estimated_ideal, estimated_nadir = pareto_payoff_table_method(combined_problem, solver, require_success=True)
         combined_problem = combined_problem.update_ideal_and_nadir(estimated_ideal, estimated_nadir)
     except Exception:  # noqa: S110
         pass  # proceed without ideal/nadir if payoff table fails
@@ -1254,7 +1254,7 @@ def _run_modification_checks_background(
                 return
 
             try:
-                estimated_ideal, estimated_nadir = payoff_table_method(
+                estimated_ideal, estimated_nadir = pareto_payoff_table_method(
                     problem, solver=effective_solver, require_success=True
                 )
             except Exception as e:

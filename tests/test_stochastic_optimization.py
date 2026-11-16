@@ -8,7 +8,7 @@ from desdeo.problem import PolarsEvaluator
 from desdeo.problem.scenario import Scenario, ScenarioModel
 from desdeo.problem.schema import Constant, ConstraintTypeEnum, Objective, Problem, Variable, VariableTypeEnum
 from desdeo.problem.testproblems import simple_scenario_model
-from desdeo.tools import GurobipySolver, guess_best_solver
+from desdeo.tools import GurobipySolver, guess_best_solver, pareto_payoff_table_method
 from desdeo.tools.robust import add_weighted_scenarios, add_worst_case_robust
 from desdeo.tools.scalarization import add_asf_diff
 from desdeo.tools.scenarios import build_combined_scenario_problem
@@ -376,6 +376,40 @@ def test_variance_minimum():
 
     assert result.success
     assert result.optimal_objectives["VARIANCE_f"] == pytest.approx(18.2 / 49, abs=1e-6)
+
+
+@pytest.mark.scenario
+@pytest.mark.gurobipy
+def test_pareto_payoff_table_tightens_epigraph_aggregates():
+    """Every row of the Pareto payoff table has the true worst case and MAD, so their nadirs are exact."""
+    model = _cvar_direction_model(maximize=False)
+    problem, symbol_maps = build_combined_scenario_problem(model)
+    problem, _ = add_expected_value(model, ["f"], combined=problem, symbol_maps=symbol_maps)
+    problem, _ = add_worst_case_robust(model, ["f"], combined=problem, symbol_maps=symbol_maps)
+    problem, _ = add_mean_absolute_deviation(model, ["f"], combined=problem, symbol_maps=symbol_maps)
+
+    rows = []
+
+    class RecordingSolver(GurobipySolver):
+        def solve(self, target):
+            result = super().solve(target)
+            if target == "_payoff_ws":
+                rows.append(result.optimal_objectives)
+            return result
+
+    _, nadir = pareto_payoff_table_method(problem, RecordingSolver)
+
+    assert len(rows) == len(problem.objectives)
+    true_worst, true_mad = [], []
+    for row in rows:
+        leaf_values = [row[f"{leaf}_f"] for leaf in _DIRECTION_LEAVES]
+        mean = sum(p * v for p, v in zip(_DIRECTION_PROBS, leaf_values, strict=True))
+        true_worst.append(max(leaf_values))
+        true_mad.append(sum(p * abs(v - mean) for p, v in zip(_DIRECTION_PROBS, leaf_values, strict=True)))
+        assert row["robust_f"] == pytest.approx(true_worst[-1], abs=1e-6)
+        assert row["MAD_f"] == pytest.approx(true_mad[-1], abs=1e-6)
+    assert nadir["robust_f"] == pytest.approx(max(true_worst), abs=1e-6)
+    assert nadir["MAD_f"] == pytest.approx(max(true_mad), abs=1e-6)
 
 
 # ---------------------------------------------------------------------------
